@@ -19,9 +19,9 @@ documented reasoning matter as much as features.
 ## Milestone ladder
 
 - **M0** — Build skeleton: CMake/Ninja/Clang, presets, vcpkg manifest, format/tidy, CI.
-  `core/`: logging, assert, handle/GUID, job stub. No graphics. ← current
+  `core/`: logging, assert, handle/GUID, job stub. No graphics.
 - **M1** — Device bring-up: instance, validation, device selection w/ explicit required
-  features, VMA, swapchain, timeline-semaphore frame pacing. Output: cleared screen.
+  features, VMA, swapchain, timeline-semaphore frame pacing. Output: cleared screen. ← current
 - **M2** — Triangle: dynamic rendering, Slang→SPIR-V at build time, pipeline cache,
   one bindless set (`UPDATE_AFTER_BIND`), push constants carrying indices + BDA pointers.
 - **M3** — Geometry registry: single suballocated vertex/index buffer, transfer-queue
