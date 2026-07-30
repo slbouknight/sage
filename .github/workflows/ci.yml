@@ -6,7 +6,7 @@ on:
   pull_request:
 
 env:
-  VCPKG_BINARY_SOURCES: "clean;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
 
 jobs:
   build:
