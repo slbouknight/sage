@@ -1,0 +1,23 @@
+{
+    "name": "sage (gdb)",
+    "type": "cppdbg",
+    "request": "launch",
+    "program": "${command:cmake.launchTargetPath}",
+    "MIMode": "gdb",
+    "miDebuggerPath": "/usr/bin/gdb",
+    "setupCommands": [
+        {
+            "text": "-enable-pretty-printing",
+            "ignoreFailures": true
+        },
+        {
+            "text": "set print static-members off"
+        }
+    ],
+    "environment": [
+        {
+            "name": "VK_LOADER_DEBUG",
+            "value": "warn"
+        }
+    ]
+}

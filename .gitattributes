@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.dds -text
+*.ktx2 -text
+*.spv -text

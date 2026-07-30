@@ -1,0 +1,12 @@
+CompileFlags:
+  CompilationDatabase: build/debug
+
+Diagnostics:
+  ClangTidy:
+    Add: [bugprone-*, modernize-*, performance-*, readability-*]
+    Remove: [modernize-use-trailing-return-type]
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true

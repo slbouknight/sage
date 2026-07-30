@@ -1,0 +1,19 @@
+# Build output
+build/
+out/
+
+# vcpkg
+vcpkg_installed/
+.vcpkg-cache/
+
+# CMake
+CMakeUserPresets.json
+compile_commands.json
+
+# Editors
+*.swp
+*.swo
+.idea/
+
+# OS
+.DS_Store

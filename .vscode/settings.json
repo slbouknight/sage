@@ -1,0 +1,13 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "clangd.arguments": [
+    "--background-index",
+    "--clang-tidy",
+    "--header-insertion=iwyu",
+    "--compile-commands-dir=build/debug"
+  ],
+  "editor.formatOnSave": true,
+  "files.associations": { "*.slang": "slang" }
+}

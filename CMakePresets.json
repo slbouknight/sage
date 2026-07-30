@@ -1,0 +1,35 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      }
+    },
+    { "name": "debug",  "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "relwithdebinfo", "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" } },
+    {
+      "name": "asan",
+      "inherits": "debug",
+      "cacheVariables": { "SAGE_SANITIZE": "address,undefined" }
+    },
+    {
+      "name": "gcc-debug",
+      "inherits": "debug",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "gcc-debug", "configurePreset": "gcc-debug" }
+  ]
+}

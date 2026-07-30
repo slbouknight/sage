@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  VCPKG_BINARY_SOURCES: "clean;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, gcc-debug]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ matrix.preset }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ matrix.preset }}-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          files=$(find src tests -type f \( -name '*.hpp' -o -name '*.cpp' \))
+          clang-format --dry-run --Werror $files
