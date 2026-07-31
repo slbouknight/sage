@@ -41,3 +41,9 @@ target_link_libraries(sage_gpu
 # behavior toggle, not a warning/debug-info flag, so it deliberately lives
 # here rather than in SageCompileOptions.cmake.
 target_compile_definitions(sage_gpu PRIVATE $<$<CONFIG:Debug>:SAGE_VULKAN_VALIDATION>)
+
+# glfw3.h includes <GL/gl.h> unless told otherwise. This is a Vulkan-only
+# renderer, so that header is both wrong to pull in and not guaranteed to
+# exist -- machines with Mesa dev packages have it, bare CI runners do not.
+# Set on the target so a future .cpp including GLFW cannot forget it.
+target_compile_definitions(sage_gpu PRIVATE GLFW_INCLUDE_NONE)
