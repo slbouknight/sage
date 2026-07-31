@@ -13,6 +13,7 @@ option(SAGE_BUILD_TESTS "Build unit tests" ON)
 include(cmake/SageCompileOptions.cmake)
 
 add_subdirectory(src/core)
+add_subdirectory(src/gpu)
 add_subdirectory(src/app)
 if(SAGE_BUILD_TESTS)
     enable_testing()

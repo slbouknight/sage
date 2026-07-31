@@ -1,7 +1,10 @@
 #include <sage/core/log.hpp>
 
+#include "application.hpp"
+
 int main() {
     sage::core::log::init();
-    SAGE_LOG_INFO("sage starting (M0 skeleton, no graphics yet)");
+    sage::app::Application app;
+    app.run();
     return 0;
 }
