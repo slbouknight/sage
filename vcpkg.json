@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "builtin-baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
   "dependencies": [
+    "glfw3",
     "spdlog",
+    "vulkan-memory-allocator",
     {
       "name": "catch2",
       "version>=": "3.7.0"

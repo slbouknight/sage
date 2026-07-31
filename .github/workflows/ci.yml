@@ -18,8 +18,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # Vulkan headers/loader for find_package(Vulkan); xorg + wayland dev
+      # packages are what vcpkg's glfw3 port builds against. CI builds and
+      # runs unit tests only -- the windowed app needs a GPU and a display,
+      # which hosted runners do not have.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build \
+            libvulkan-dev \
+            libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxext-dev libx11-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols \
+            pkg-config
 
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
