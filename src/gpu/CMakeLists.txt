@@ -16,6 +16,9 @@ add_library(sage_gpu STATIC
     src/frame_pacer.cpp
     src/instance.cpp
     src/physical_device.cpp
+    src/pipeline.cpp
+    src/pipeline_cache.cpp
+    src/shader_module.cpp
     src/surface.cpp
     src/swapchain.cpp
     src/vk_check.cpp

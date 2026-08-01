@@ -1,7 +1,11 @@
 #include "application.hpp"
 
 #include <sage/core/log.hpp>
+#include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vk_check.hpp>
+
+#include <cstdlib>
+#include <filesystem>
 
 namespace sage::app {
 
@@ -15,6 +19,19 @@ constexpr VkClearColorValue k_clear_color{{0.05F, 0.05F, 0.07F, 1.0F}};
 constexpr VkImageSubresourceRange k_color_range{
     VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
 
+// The cache belongs in the user's cache dir, not the build tree: it must
+// survive `--clean`, and it is machine-specific so it should never be
+// committed or copied between machines.
+std::filesystem::path pipeline_cache_path() {
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && *xdg != '\0') {
+        return std::filesystem::path(xdg) / "sage" / "pipeline_cache.bin";
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        return std::filesystem::path(home) / ".cache" / "sage" / "pipeline_cache.bin";
+    }
+    return std::filesystem::path(".sage-pipeline-cache.bin");
+}
+
 }  // namespace
 
 Application::Application()
@@ -25,6 +42,9 @@ Application::Application()
       device_(physical_device_),
       allocator_(instance_, device_),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
+      pipeline_cache_(device_, pipeline_cache_path()),
+      pipeline_(device_, std::filesystem::path(SAGE_SHADER_DIR) / "triangle.spv",
+                swapchain_.format(), pipeline_cache_.handle()),
       frame_pacer_(device_) {}
 
 Application::~Application() {
@@ -32,38 +52,73 @@ Application::~Application() {
     device_.wait_idle();
 }
 
-void Application::record_clear(VkCommandBuffer command_buffer, VkImage image) const {
-    // The image contents from the previous present are not needed, so the
-    // transition uses UNDEFINED as the old layout and discards them.
-    VkImageMemoryBarrier2 to_transfer{};
-    to_transfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_transfer.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    to_transfer.srcAccessMask = VK_ACCESS_2_NONE;
-    to_transfer.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-    to_transfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    to_transfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer.image = image;
-    to_transfer.subresourceRange = k_color_range;
+void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
+                                  VkImageView image_view, VkExtent2D extent) const {
+    VkImageMemoryBarrier2 to_color{};
+    to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_color.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    to_color.srcAccessMask = VK_ACCESS_2_NONE;
+    to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_color.image = image;
+    to_color.subresourceRange = k_color_range;
 
-    VkDependencyInfo to_transfer_dependency{};
-    to_transfer_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_transfer_dependency.imageMemoryBarrierCount = 1;
-    to_transfer_dependency.pImageMemoryBarriers = &to_transfer;
-    vkCmdPipelineBarrier2(command_buffer, &to_transfer_dependency);
+    VkDependencyInfo to_color_dependency{};
+    to_color_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    to_color_dependency.imageMemoryBarrierCount = 1;
+    to_color_dependency.pImageMemoryBarriers = &to_color;
+    vkCmdPipelineBarrier2(command_buffer, &to_color_dependency);
 
-    vkCmdClearColorImage(command_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         &k_clear_color, 1, &k_color_range);
+    // loadOp CLEAR is what replaces M1's vkCmdClearColorImage.
+    VkRenderingAttachmentInfo color_attachment{};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color_attachment.clearValue.color = k_clear_color;
+
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.offset = {0, 0};
+    rendering.renderArea.extent = extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color_attachment;
+
+    vkCmdBeginRendering(command_buffer, &rendering);
+
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle());
+
+    VkViewport viewport{};
+    viewport.x = 0.0F;
+    viewport.y = 0.0F;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = extent;
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+
+    vkCmdEndRendering(command_buffer);
 
     VkImageMemoryBarrier2 to_present{};
     to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_present.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-    to_present.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_present.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_present.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     to_present.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
     to_present.dstAccessMask = VK_ACCESS_2_NONE;
-    to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -118,7 +173,8 @@ void Application::run() {
             continue;
         }
 
-        record_clear(frame.command_buffer, acquired.image);
+        record_triangle(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
+                        swapchain_.extent());
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
@@ -131,6 +187,7 @@ void Application::run() {
     }
 
     frame_pacer_.wait_all();
+    pipeline_cache_.save();
     SAGE_LOG_INFO("Main loop exited");
 }
 

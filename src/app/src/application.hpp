@@ -4,6 +4,8 @@
 #include <sage/gpu/device.hpp>
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/instance.hpp>
+#include <sage/gpu/pipeline.hpp>
+#include <sage/gpu/pipeline_cache.hpp>
 #include <sage/gpu/surface.hpp>
 #include <sage/gpu/swapchain.hpp>
 #include <sage/gpu/window.hpp>
@@ -26,7 +28,8 @@ private:
     // Returns false when the window is minimized and the frame should be
     // skipped entirely.
     bool recreate_swapchain();
-    void record_clear(VkCommandBuffer command_buffer, VkImage image) const;
+    void record_triangle(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
+                         VkExtent2D extent) const;
 
     gpu::Window window_;
     gpu::Instance instance_;
@@ -35,6 +38,8 @@ private:
     gpu::Device device_;
     gpu::Allocator allocator_;
     gpu::Swapchain swapchain_;
+    gpu::PipelineCache pipeline_cache_;
+    gpu::GraphicsPipeline pipeline_;
     gpu::FramePacer frame_pacer_;
 };
 
