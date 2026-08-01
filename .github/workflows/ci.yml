@@ -66,3 +66,46 @@ jobs:
         run: |
           files=$(find src tests -type f \( -name '*.hpp' -o -name '*.cpp' \))
           clang-format --dry-run --Werror $files
+
+  # Advisory only for now -- continue-on-error keeps it off the critical path
+  # while the accumulated M0/M1 findings get triaged. Flip that off to make it
+  # a real gate. Needs a full configure (not just checkout) because clang-tidy
+  # reads compile_commands.json.
+  tidy:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build \
+            clang-tidy \
+            libvulkan-dev \
+            libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxext-dev libx11-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols \
+            pkg-config
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-debug-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-debug-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+
+      - name: Configure
+        run: cmake --preset debug
+
+      - name: Run clang-tidy
+        run: |
+          git ls-files '*.cpp' | while read -r file; do
+            clang-tidy -p build/debug --quiet "$file" 2>/dev/null || true
+          done

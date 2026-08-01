@@ -55,4 +55,33 @@ for preset in "${presets[@]}"; do
     ctest --test-dir "build/$preset" --output-on-failure
 done
 
+# Advisory for now, not a gate: this is the first sustained run against
+# accumulated M0/M1 code, and the findings need triaging before any of them
+# become build-breaking. Runs after the loop so build/debug/compile_commands.json
+# is guaranteed to exist.
+if command -v clang-tidy >/dev/null; then
+    mapfile -t tidy_sources < <(git ls-files '*.cpp')
+    sage_info "Running clang-tidy on ${#tidy_sources[@]} files (advisory, non-blocking)"
+
+    tidy_log="$(mktemp)"
+    trap 'rm -f "$tidy_log"' EXIT
+
+    # Serial rather than xargs -P: parallel invocations interleave their
+    # multi-line diagnostics into unreadable output, and the point of this
+    # step is to be read.
+    for source in "${tidy_sources[@]}"; do
+        clang-tidy -p build/debug --quiet "$source" 2>/dev/null >>"$tidy_log" || true
+    done
+
+    if grep -qE "warning:|error:" "$tidy_log"; then
+        grep -E "warning:|error:" "$tidy_log" | sed 's/^/    /'
+        printf '\n\033[33mclang-tidy: %s diagnostic(s) above (advisory).\033[0m\n' \
+            "$(grep -cE 'warning:|error:' "$tidy_log")"
+    else
+        sage_info "clang-tidy: clean"
+    fi
+else
+    sage_info "clang-tidy not found; skipping (advisory step)"
+fi
+
 printf '\n\033[32mAll checks passed.\033[0m\n'

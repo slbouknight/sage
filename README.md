@@ -33,6 +33,10 @@ source ~/vulkansdk/<version>/setup-env.sh
 Add that to your shell profile to avoid repeating it. Configure fails with an
 explicit message if `VULKAN_SDK` is unset.
 
+[ccache](https://ccache.dev/) is used automatically for every preset when it is
+installed, and silently skipped when it is not — it is a speedup, not a
+requirement.
+
 ```bash
 cmake --preset debug && cmake --build --preset debug
 ctest --test-dir build/debug --output-on-failure
