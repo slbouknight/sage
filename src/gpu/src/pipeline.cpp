@@ -10,12 +10,20 @@
 namespace sage::gpu {
 
 GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::path& spirv_path,
-                                   VkFormat color_format, VkPipelineCache cache)
+                                   VkFormat color_format, VkDescriptorSetLayout set_layout,
+                                   VkPipelineCache cache)
     : device_(device) {
-    // Empty for now: no descriptor sets, no push constants. Both arrive with
-    // the bindless work in M2 stage 2
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_ALL;
+    push_range.offset = 0;
+    push_range.size = k_push_constant_size;
+
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
     VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layout_info, nullptr, &layout_));
 
     // One module, two entry points -- selected by pName, not by loading twice
@@ -103,8 +111,8 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::
     pipeline_info.renderPass = VK_NULL_HANDLE;
     pipeline_info.subpass = 0;
 
-    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), cache, 1, &pipeline_info, nullptr,
-                                       &pipeline_));
+    VK_CHECK(
+        vkCreateGraphicsPipelines(device_.handle(), cache, 1, &pipeline_info, nullptr, &pipeline_));
 
     SAGE_LOG_INFO("Graphics pipeline created");
 }

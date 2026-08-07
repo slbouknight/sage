@@ -4,12 +4,36 @@
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vk_check.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 
 namespace sage::app {
 
 namespace {
+
+// Must match shaders/triangle.slang's PushConstants exactly. The static_asserts
+// below turn a layout mismatch into a build failure instead of a GPU fault.
+struct PushConstants {
+    VkDeviceAddress vertex_address = 0;
+    std::uint32_t color_index = 0;
+};
+
+static_assert(offsetof(PushConstants, vertex_address) == 0);
+static_assert(offsetof(PushConstants, color_index) == 8);
+static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
+
+constexpr std::uint32_t k_color_buffer_index = 0;
+
+// float2 per vertex, matching Vertex in the shader (ArrayStride 8)
+constexpr std::array<float, 6> k_vertex_positions{0.0F, -0.5F, 0.5F, 0.5F, -0.5F, 0.5F};
+
+// float4 per vertex: std430 gives a 3-component vector 16-byte alignment
+// fourth component costs nothing and keeps the layout explicit.
+constexpr std::array<float, 12> k_vertex_colors{
+    1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 1.0F,
+};
 
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
@@ -41,11 +65,21 @@ Application::Application()
       physical_device_(gpu::select_physical_device(instance_.handle(), surface_.handle())),
       device_(physical_device_),
       allocator_(instance_, device_),
+      bindless_set_(device_),
+      vertex_buffer_(allocator_, device_, sizeof(k_vertex_positions),
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
+      color_buffer_(allocator_, device_, sizeof(k_vertex_colors),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
       pipeline_(device_, std::filesystem::path(SAGE_SHADER_DIR) / "triangle.spv",
-                swapchain_.format(), pipeline_cache_.handle()),
-      frame_pacer_(device_) {}
+                swapchain_.format(), bindless_set_.layout(), pipeline_cache_.handle()),
+      frame_pacer_(device_) {
+    vertex_buffer_.write(k_vertex_positions.data(), sizeof(k_vertex_positions));
+    color_buffer_.write(k_vertex_colors.data(), sizeof(k_vertex_colors));
+    bindless_set_.write_storage_buffer(k_color_buffer_index, color_buffer_.handle(),
+                                       color_buffer_.size());
+}
 
 Application::~Application() {
     // Everything below must outlive in-flight GPU work.
@@ -93,6 +127,16 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     vkCmdBeginRendering(command_buffer, &rendering);
 
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle());
+
+    const VkDescriptorSet descriptor_set = bindless_set_.handle();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.layout(), 0,
+                            1, &descriptor_set, 0, nullptr);
+
+    PushConstants push{};
+    push.vertex_address = vertex_buffer_.device_address();
+    push.color_index = k_color_buffer_index;
+    vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
+                       &push);
 
     VkViewport viewport{};
     viewport.x = 0.0F;

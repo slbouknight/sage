@@ -1,15 +1,14 @@
-#include <sage/gpu/pipeline_cache.hpp>
-
 #include <sage/core/log.hpp>
 #include <sage/gpu/device.hpp>
+#include <sage/gpu/pipeline_cache.hpp>
 #include <sage/gpu/vk_check.hpp>
 
+#include <cstddef>
 #include <cstring>
 #include <fstream>
+#include <system_error>
 #include <utility>
 #include <vector>
-#include <cstddef>
-#include <system_error>
 
 namespace sage::gpu {
 
@@ -121,4 +120,4 @@ PipelineCache::~PipelineCache() {
     }
 }
 
-} // namespace sage::gpu
+}  // namespace sage::gpu

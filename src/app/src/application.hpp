@@ -1,6 +1,8 @@
 #pragma once
 
 #include <sage/gpu/allocator.hpp>
+#include <sage/gpu/bindless_set.hpp>
+#include <sage/gpu/buffer.hpp>
 #include <sage/gpu/device.hpp>
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/instance.hpp>
@@ -37,6 +39,9 @@ private:
     gpu::PhysicalDeviceInfo physical_device_;
     gpu::Device device_;
     gpu::Allocator allocator_;
+    gpu::BindlessSet bindless_set_;
+    gpu::Buffer vertex_buffer_;
+    gpu::Buffer color_buffer_;
     gpu::Swapchain swapchain_;
     gpu::PipelineCache pipeline_cache_;
     gpu::GraphicsPipeline pipeline_;
