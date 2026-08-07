@@ -55,9 +55,16 @@ Device::Device(const PhysicalDeviceInfo& info) : physical_device_(info.handle) {
     features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
     features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
 
+    // Slang lowers SV_VertexID to (VertexIndex - BaseVertex) to match HLSL
+    // semantics, and reading BaseVertex needs the DrawParameters capability.
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.pNext = &features12;
+    features11.shaderDrawParameters = VK_TRUE;
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &features12;
+    features2.pNext = &features11;
     features2.features.shaderInt64 = VK_TRUE;
 
     const std::vector<const char*> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};

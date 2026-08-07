@@ -25,6 +25,9 @@ endif()
 
 include(cmake/SageCompileOptions.cmake)
 
+set(SAGE_SHADER_BINARY_DIR "${CMAKE_BINARY_DIR}/shaders")
+
+add_subdirectory(shaders)
 add_subdirectory(src/core)
 add_subdirectory(src/gpu)
 add_subdirectory(src/app)

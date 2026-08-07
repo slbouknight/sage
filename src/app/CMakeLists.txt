@@ -9,3 +9,9 @@ target_link_libraries(sage_app PRIVATE
     sage::core
     sage::gpu
 )
+
+add_dependencies(sage_app sage_shaders)
+
+target_compile_definitions(sage_app PRIVATE
+    SAGE_SHADER_DIR="${SAGE_SHADER_BINARY_DIR}"
+)

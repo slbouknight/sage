@@ -34,4 +34,35 @@ Allocator::~Allocator() {
     }
 }
 
+BufferAllocation Allocator::create_mapped_buffer(VkDeviceSize size,
+                                                 VkBufferUsageFlags usage) const {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_info.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    BufferAllocation result;
+    VmaAllocationInfo info{};
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &result.buffer,
+                             &result.allocation, &info));
+    result.mapped = info.pMappedData;
+    return result;
+}
+
+void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size) const {
+    VK_CHECK(vmaFlushAllocation(allocator_, allocation.allocation, 0, size));
+}
+
+void Allocator::destroy_buffer(const BufferAllocation& allocation) const {
+    if (allocation.buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator_, allocation.buffer, allocation.allocation);
+    }
+}
+
 }  // namespace sage::gpu

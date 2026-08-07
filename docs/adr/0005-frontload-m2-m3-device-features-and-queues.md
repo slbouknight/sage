@@ -19,3 +19,14 @@ transfer-only family for M3's staging uploads. Features no milestone justifies
 lacking any of it is rejected earlier than strictly necessary. Both are cheap:
 the features are inert until used, and the target class of hardware supports
 them universally.
+
+**Amended in M2:** `shaderDrawParameters` (Vulkan 1.1) was added when the first
+real shader failed to load. Slang lowers HLSL's `SV_VertexID` to
+`VertexIndex - BaseVertex`, and reading `BaseVertex` requires the SPIR-V
+`DrawParameters` capability. This was not predictable from the milestone ladder
+— it is an artifact of the shader compiler's semantics, discoverable only by
+compiling a shader — so front-loading could not have covered it. The safeguard
+worked as intended: validation named the missing feature exactly, at the first
+`vkCreateShaderModule`. Note that `spirv-val` does not catch this class of
+problem, since SPIR-V can be entirely valid while still demanding features the
+device was not created with.

@@ -12,10 +12,15 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 
 add_library(sage_gpu STATIC
     src/allocator.cpp
+    src/bindless_set.cpp
+    src/buffer.cpp
     src/device.cpp
     src/frame_pacer.cpp
     src/instance.cpp
     src/physical_device.cpp
+    src/pipeline.cpp
+    src/pipeline_cache.cpp
+    src/shader_module.cpp
     src/surface.cpp
     src/swapchain.cpp
     src/vk_check.cpp

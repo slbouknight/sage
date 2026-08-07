@@ -37,9 +37,13 @@ bool supports_required_features(VkPhysicalDevice device, std::string& missing) {
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features12.pNext = &features13;
 
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.pNext = &features12;
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &features12;
+    features2.pNext = &features11;
 
     vkGetPhysicalDeviceFeatures2(device, &features2);
 
@@ -70,6 +74,7 @@ bool supports_required_features(VkPhysicalDevice device, std::string& missing) {
             "descriptorBindingStorageBufferUpdateAfterBind");
     require(features12.descriptorBindingUpdateUnusedWhilePending,
             "descriptorBindingUpdateUnusedWhilePending");
+    require(features11.shaderDrawParameters, "shaderDrawParameters");
 
     return missing.empty();
 }

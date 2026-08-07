@@ -15,8 +15,8 @@ struct AcquiredImage {
     VkImage image = VK_NULL_HANDLE;
 };
 
-// No VkImageViews here: vkCmdClearColorImage works on the image directly, and
-// views are attachment plumbing that arrives with M2's dynamic rendering.
+// One view per swapchain image: dynamic rendering binds color attachments as
+// views, not raw images.
 class Swapchain {
 public:
     Swapchain(const Device& device, VkSurfaceKHR surface, VkExtent2D extent);
@@ -38,6 +38,8 @@ public:
         return render_finished_[image_index];
     }
 
+    [[nodiscard]] VkImageView image_view(std::uint32_t index) const { return image_views_[index]; }
+
     [[nodiscard]] VkExtent2D extent() const { return extent_; }
     [[nodiscard]] VkFormat format() const { return format_; }
 
@@ -50,6 +52,7 @@ private:
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> images_;
+    std::vector<VkImageView> image_views_;
     // One per swapchain image, not per frame-in-flight: the presentation
     // engine may still be consuming an older frame's semaphore when a
     // frame-in-flight slot is reused. See ADR 0006.

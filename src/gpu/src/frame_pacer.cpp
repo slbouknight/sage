@@ -91,7 +91,7 @@ void FramePacer::submit(VkQueue queue, const FrameContext& frame, VkSemaphore re
     VkSemaphoreSubmitInfo wait_info{};
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     wait_info.semaphore = frame.image_available;
-    wait_info.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    wait_info.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 
     VkCommandBufferSubmitInfo command_info{};
     command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
