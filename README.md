@@ -37,6 +37,11 @@ explicit message if `VULKAN_SDK` is unset.
 installed, and silently skipped when it is not — it is a speedup, not a
 requirement.
 
+Shaders are compiled by `slangc`, which local builds take from the Vulkan SDK.
+CI installs a pinned [standalone Slang release](https://github.com/shader-slang/slang/releases)
+instead, since the SDK is not packaged for apt and CI needs only the compiler.
+Either is found via `PATH`.
+
 ```bash
 cmake --preset debug && cmake --build --preset debug
 ctest --test-dir build/debug --output-on-failure
