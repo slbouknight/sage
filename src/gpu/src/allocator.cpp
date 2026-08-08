@@ -65,4 +65,22 @@ void Allocator::destroy_buffer(const BufferAllocation& allocation) const {
     }
 }
 
+ImageAllocation Allocator::create_device_local_image(const VkImageCreateInfo& info) const {
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    // A full-screen render target is large and long-lived, so a dedicated
+    // allocation is preferable to carving it out of a shared block.
+    alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+
+    ImageAllocation result;
+    VK_CHECK(vmaCreateImage(allocator_, &info, &alloc_info, &result.image, &result.allocation, nullptr));
+    return result;
+}
+
+void Allocator::destroy_image(const ImageAllocation& allocation) const {
+    if (allocation.image != VK_NULL_HANDLE) {
+        vmaDestroyImage(allocator_, allocation.image, allocation.allocation);
+    }
+}
+
 }  // namespace sage::gpu

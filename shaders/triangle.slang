@@ -7,6 +7,7 @@ struct PushConstants
 {
     Vertex* vertices;
     uint color_index;
+    float4x4 view_proj;
 };
 
 [vk::push_constant]
@@ -27,7 +28,13 @@ struct VertexOutput
 VertexOutput vertex_main(uint vertex_id : SV_VertexID)
 {
     VertexOutput output;
-    output.position = float4(pc.vertices[vertex_id].position, 0.0, 1.0);
+
+    // mul(matrix, vector) matches glm's column-major data pushed unmodified.
+    // Slang decorates the member RowMajor and lowers this to
+    // OpVectorTimesMatrix; the two cancel. Verified empirically -- do not
+    // swap the operand order without re-testing.
+    output.position = mul(pc.view_proj, float4(pc.vertices[vertex_id].position, 0.0, 1.0));
+    output.position = mul(pc.view_proj, float4(pc.vertices[vertex_id].position, 0.0, 1.0));
     output.color = colors[pc.color_index][vertex_id].rgb;
     return output;
 }

@@ -1,6 +1,7 @@
 #include "application.hpp"
 
 #include <sage/core/log.hpp>
+#include <sage/core/math.hpp>
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vk_check.hpp>
 
@@ -18,10 +19,12 @@ namespace {
 struct PushConstants {
     VkDeviceAddress vertex_address = 0;
     std::uint32_t color_index = 0;
+    alignas(16) glm::mat4 view_proj{1.0F};
 };
 
 static_assert(offsetof(PushConstants, vertex_address) == 0);
 static_assert(offsetof(PushConstants, color_index) == 8);
+static_assert(offsetof(PushConstants, view_proj) == 16);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 constexpr std::uint32_t k_color_buffer_index = 0;
@@ -42,6 +45,9 @@ constexpr VkClearColorValue k_clear_color{{0.05F, 0.05F, 0.07F, 1.0F}};
 
 constexpr VkImageSubresourceRange k_color_range{
     VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+
+constexpr VkImageSubresourceRange k_depth_range{
+    VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
 
 // The cache belongs in the user's cache dir, not the build tree: it must
 // survive `--clean`, and it is machine-specific so it should never be
@@ -71,9 +77,16 @@ Application::Application()
       color_buffer_(allocator_, device_, sizeof(k_vertex_colors),
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
+      depth_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
-      pipeline_(device_, std::filesystem::path(SAGE_SHADER_DIR) / "triangle.spv",
-                swapchain_.format(), bindless_set_.layout(), pipeline_cache_.handle()),
+      pipeline_(device_,
+                gpu::GraphicsPipelineDesc{
+                    .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "triangle.spv",
+                    .color_format = swapchain_.format(),
+                    .depth_format = depth_buffer_.format(),
+                    .set_layout = bindless_set_.layout(),
+                    .cache = pipeline_cache_.handle(),
+                }),
       frame_pacer_(device_) {
     vertex_buffer_.write(k_vertex_positions.data(), sizeof(k_vertex_positions));
     color_buffer_.write(k_vertex_colors.data(), sizeof(k_vertex_colors));
@@ -101,11 +114,27 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     to_color.image = image;
     to_color.subresourceRange = k_color_range;
 
-    VkDependencyInfo to_color_dependency{};
-    to_color_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_color_dependency.imageMemoryBarrierCount = 1;
-    to_color_dependency.pImageMemoryBarriers = &to_color;
-    vkCmdPipelineBarrier2(command_buffer, &to_color_dependency);
+    VkImageMemoryBarrier2 to_depth{};
+    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_depth.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    to_depth.srcAccessMask = VK_ACCESS_2_NONE;
+    to_depth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_depth.image = depth_buffer_.image();
+    to_depth.subresourceRange = k_depth_range;
+    
+    const std::array<VkImageMemoryBarrier2, 2> begin_barriers{to_color, to_depth};
+
+    VkDependencyInfo begin_dependency{};
+    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    begin_dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(begin_barriers.size());
+    begin_dependency.pImageMemoryBarriers = begin_barriers.data();
+    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
 
     // loadOp CLEAR is what replaces M1's vkCmdClearColorImage.
     VkRenderingAttachmentInfo color_attachment{};
@@ -116,6 +145,14 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color_attachment.clearValue.color = k_clear_color;
 
+    VkRenderingAttachmentInfo depth_attachment{};
+    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth_attachment.imageView = depth_buffer_.view();
+    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth_attachment.clearValue.depthStencil = {1.0F, 0};
+
     VkRenderingInfo rendering{};
     rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering.renderArea.offset = {0, 0};
@@ -123,6 +160,7 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     rendering.layerCount = 1;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &color_attachment;
+    rendering.pDepthAttachment = &depth_attachment;
 
     vkCmdBeginRendering(command_buffer, &rendering);
 
@@ -131,10 +169,17 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     const VkDescriptorSet descriptor_set = bindless_set_.handle();
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.layout(), 0,
                             1, &descriptor_set, 0, nullptr);
+    
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    const glm::mat4 projection = core::perspective_vk(glm::radians(60.0F), aspect, 0.1F, 100.0F);
+    const glm::mat4 view = glm::lookAt(glm::vec3(0.0F, 0.0F, 2.0F),     // eye
+                                       glm::vec3(0.0F, 0.0F, 0.0F),     // target
+                                       glm::vec3(0.0F, 1.0F, 0.0F));    // up
 
     PushConstants push{};
     push.vertex_address = vertex_buffer_.device_address();
     push.color_index = k_color_buffer_index;
+    push.view_proj = projection * view;
     vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                        &push);
 
@@ -182,6 +227,7 @@ bool Application::recreate_swapchain() {
         return false;
     }
     swapchain_.recreate(extent);
+    depth_buffer_.recreate(swapchain_.extent());
     return true;
 }
 

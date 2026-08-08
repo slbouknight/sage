@@ -15,6 +15,12 @@ struct BufferAllocation {
     void* mapped = nullptr;
 };
 
+// An image plus the allocation backing it.
+struct ImageAllocation {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation_T* allocation = nullptr;
+};
+
 namespace sage::gpu {
 
 class Device;
@@ -40,6 +46,11 @@ public:
                                                         VkBufferUsageFlags usage) const;
     void flush(const BufferAllocation& allocation, VkDeviceSize size) const;
     void destroy_buffer(const BufferAllocation& allocation) const;
+
+    // Device-local, for render-targets. The caller describes the image so
+    // allocator stays generic; only the memory strategy is decided here.
+    [[nodiscard]] ImageAllocation create_device_local_image(const VkImageCreateInfo& info) const;
+    void destroy_image(const ImageAllocation& allocation) const;
 
 private:
     VmaAllocator_T* allocator_ = nullptr;

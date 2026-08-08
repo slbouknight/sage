@@ -9,9 +9,7 @@
 
 namespace sage::gpu {
 
-GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::path& spirv_path,
-                                   VkFormat color_format, VkDescriptorSetLayout set_layout,
-                                   VkPipelineCache cache)
+GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineDesc& desc)
     : device_(device) {
     VkPushConstantRange push_range{};
     push_range.stageFlags = VK_SHADER_STAGE_ALL;
@@ -21,13 +19,13 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layout_info.setLayoutCount = 1;
-    layout_info.pSetLayouts = &set_layout;
+    layout_info.pSetLayouts = &desc.set_layout;
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &push_range;
     VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layout_info, nullptr, &layout_));
 
     // One module, two entry points -- selected by pName, not by loading twice
-    const ShaderModule shader(device_, spirv_path);
+    const ShaderModule shader(device_, desc.spirv_path);
 
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -71,6 +69,16 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     multisample.sampleShadingEnable = VK_FALSE;
 
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depth_stencil.depthBoundsTestEnable = VK_FALSE;
+    depth_stencil.stencilTestEnable = VK_FALSE;
+    depth_stencil.minDepthBounds = 0.0F;
+    depth_stencil.maxDepthBounds = 1.0F;
+
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.blendEnable = VK_FALSE;
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -93,7 +101,8 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::
     VkPipelineRenderingCreateInfo rendering_info{};
     rendering_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     rendering_info.colorAttachmentCount = 1;
-    rendering_info.pColorAttachmentFormats = &color_format;
+    rendering_info.pColorAttachmentFormats = &desc.color_format;
+    rendering_info.depthAttachmentFormat = desc.depth_format;
 
     VkGraphicsPipelineCreateInfo pipeline_info{};
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -110,9 +119,10 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const std::filesystem::
     pipeline_info.layout = layout_;
     pipeline_info.renderPass = VK_NULL_HANDLE;
     pipeline_info.subpass = 0;
+    pipeline_info.pDepthStencilState = &depth_stencil;
 
     VK_CHECK(
-        vkCreateGraphicsPipelines(device_.handle(), cache, 1, &pipeline_info, nullptr, &pipeline_));
+        vkCreateGraphicsPipelines(device_.handle(), desc.cache, 1, &pipeline_info, nullptr, &pipeline_));
 
     SAGE_LOG_INFO("Graphics pipeline created");
 }
