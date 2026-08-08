@@ -17,6 +17,7 @@ add_library(sage_gpu STATIC
     src/depth_buffer.cpp
     src/device.cpp
     src/frame_pacer.cpp
+    src/geometry_registry.cpp
     src/instance.cpp
     src/physical_device.cpp
     src/pipeline.cpp
@@ -24,6 +25,7 @@ add_library(sage_gpu STATIC
     src/shader_module.cpp
     src/surface.cpp
     src/swapchain.cpp
+    src/uploader.cpp
     src/vk_check.cpp
     src/window.cpp
 )

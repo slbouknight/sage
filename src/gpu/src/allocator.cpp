@@ -55,6 +55,22 @@ BufferAllocation Allocator::create_mapped_buffer(VkDeviceSize size,
     return result;
 }
 
+BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size, VkBufferUsageFlags usage) const
+{
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+
+    BufferAllocation result;
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &result.buffer, &result.allocation, nullptr));
+    return result;
+}
+
 void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size) const {
     VK_CHECK(vmaFlushAllocation(allocator_, allocation.allocation, 0, size));
 }
