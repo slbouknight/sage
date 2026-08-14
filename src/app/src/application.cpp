@@ -1,11 +1,13 @@
 #include "application.hpp"
 
+#include <sage/gpu/geometry_registry.hpp>
 #include <sage/core/log.hpp>
 #include <sage/core/math.hpp>
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vk_check.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -18,24 +20,67 @@ namespace {
 // below turn a layout mismatch into a build failure instead of a GPU fault.
 struct PushConstants {
     VkDeviceAddress vertex_address = 0;
-    std::uint32_t color_index = 0;
-    alignas(16) glm::mat4 view_proj{1.0F};
+    alignas(16) glm::mat4 mvp{1.0F};
 };
-
 static_assert(offsetof(PushConstants, vertex_address) == 0);
-static_assert(offsetof(PushConstants, color_index) == 8);
-static_assert(offsetof(PushConstants, view_proj) == 16);
+static_assert(offsetof(PushConstants, mvp) == 16);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
-constexpr std::uint32_t k_color_buffer_index = 0;
+// Must match Vertex in shaders/triangle.slang. Slang's "natural" layout for
+// BDA-accessed structs is C-like packing, no std430 padding, which is exactly
+// what glm::vec3's give: ArrayStride 24, offsets 0 and 12.
+struct Vertex
+{
+    glm::vec3 position;
+    glm::vec3 color;
+};
+static_assert(sizeof(Vertex) == 24);
+static_assert(offsetof(Vertex, position) == 0);
+static_assert(offsetof(Vertex, color) == 12);
 
-// float2 per vertex, matching Vertex in the shader (ArrayStride 8)
-constexpr std::array<float, 6> k_vertex_positions{0.0F, -0.5F, 0.5F, 0.5F, -0.5F, 0.5F};
+// 24 vertices, not 8: each face needs its own color, so corners are
+// duplicated per face. Winding is CCW viewed from outside.
+const std::array<Vertex, 24> k_cube_vertices{{
+    // +Z front, red
+    {{-0.5F, -0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
+    {{0.5F, -0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
+    {{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
+    {{-0.5F, 0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
+    // -Z back, cyan
+    {{0.5F, -0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
+    {{-0.5F, -0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
+    {{-0.5F, 0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
+    {{0.5F, 0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
+    // +X right, green
+    {{0.5F, -0.5F, 0.5F}, {0.0F, 1.0F, 0.0F}},
+    {{0.5F, -0.5F, -0.5F}, {0.0F, 1.0F, 0.0F}},
+    {{0.5F, 0.5F, -0.5F}, {0.0F, 1.0F, 0.0F}},
+    {{0.5F, 0.5F, 0.5F}, {0.0F, 1.0F, 0.0F}},
+    // -X left, magenta
+    {{-0.5F, -0.5F, -0.5F}, {1.0F, 0.0F, 1.0F}},
+    {{-0.5F, -0.5F, 0.5F}, {1.0F, 0.0F, 1.0F}},
+    {{-0.5F, 0.5F, 0.5F}, {1.0F, 0.0F, 1.0F}},
+    {{-0.5F, 0.5F, -0.5F}, {1.0F, 0.0F, 1.0F}},
+    // +Y top, blue
+    {{-0.5F, 0.5F, 0.5F}, {0.0F, 0.0F, 1.0F}},
+    {{0.5F, 0.5F, 0.5F}, {0.0F, 0.0F, 1.0F}},
+    {{0.5F, 0.5F, -0.5F}, {0.0F, 0.0F, 1.0F}},
+    {{-0.5F, 0.5F, -0.5F}, {0.0F, 0.0F, 1.0F}},
+    // -Y bottom, yellow
+    {{-0.5F, -0.5F, -0.5F}, {1.0F, 1.0F, 0.0F}},
+    {{0.5F, -0.5F, -0.5F}, {1.0F, 1.0F, 0.0F}},
+    {{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F, 0.0F}},
+    {{-0.5F, -0.5F, 0.5F}, {1.0F, 1.0F, 0.0F}},
+}};
 
-// float4 per vertex: std430 gives a 3-component vector 16-byte alignment
-// fourth component costs nothing and keeps the layout explicit.
-constexpr std::array<float, 12> k_vertex_colors{
-    1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 1.0F,
+// Two triangles per face, from each face's four consecutive vertices.
+const std::array<std::uint32_t, 36> k_cube_indices{
+    0,  1,  2,  0,  2,  3,   // +Z
+    4,  5,  6,  4,  6,  7,   // -Z
+    8,  9,  10, 8,  10, 11,  // +X
+    12, 13, 14, 12, 14, 15,  // -X
+    16, 17, 18, 16, 18, 19,  // +Y
+    20, 21, 22, 20, 22, 23,  // -Y
 };
 
 constexpr std::uint32_t k_initial_width = 1280;
@@ -62,6 +107,8 @@ std::filesystem::path pipeline_cache_path() {
     return std::filesystem::path(".sage-pipeline-cache.bin");
 }
 
+// 4MiB: far more than a cube needs, and a round number to revisit when adding real meshes later
+constexpr VkDeviceSize k_geometry_capacity = 4ULL * 1024 * 1024;
 }  // namespace
 
 Application::Application()
@@ -72,10 +119,8 @@ Application::Application()
       device_(physical_device_),
       allocator_(instance_, device_),
       bindless_set_(device_),
-      vertex_buffer_(allocator_, device_, sizeof(k_vertex_positions),
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
-      color_buffer_(allocator_, device_, sizeof(k_vertex_colors),
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+      uploader_(allocator_, device_),
+      geometry_registry_(allocator_, device_, uploader_, k_geometry_capacity),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       depth_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
@@ -87,20 +132,21 @@ Application::Application()
                     .set_layout = bindless_set_.layout(),
                     .cache = pipeline_cache_.handle(),
                 }),
-      frame_pacer_(device_) {
-    vertex_buffer_.write(k_vertex_positions.data(), sizeof(k_vertex_positions));
-    color_buffer_.write(k_vertex_colors.data(), sizeof(k_vertex_colors));
-    bindless_set_.write_storage_buffer(k_color_buffer_index, color_buffer_.handle(),
-                                       color_buffer_.size());
-}
+      frame_pacer_(device_)
+      {
+        cube_ = geometry_registry_.add_mesh(k_cube_vertices.data(),
+                                            sizeof(Vertex) * k_cube_vertices.size(),
+                                            k_cube_indices.data(),
+                                            static_cast<std::uint32_t>(k_cube_indices.size()));
+       }
 
 Application::~Application() {
     // Everything below must outlive in-flight GPU work.
     device_.wait_idle();
 }
 
-void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
-                                  VkImageView image_view, VkExtent2D extent) const {
+void Application::record_cube(VkCommandBuffer command_buffer, VkImage image,
+                              VkImageView image_view, VkExtent2D extent, float time_seconds) const {
     VkImageMemoryBarrier2 to_color{};
     to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     to_color.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -172,14 +218,15 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     const glm::mat4 projection = core::perspective_vk(glm::radians(60.0F), aspect, 0.1F, 100.0F);
-    const glm::mat4 view = glm::lookAt(glm::vec3(0.0F, 0.0F, 2.0F),     // eye
-                                       glm::vec3(0.0F, 0.0F, 0.0F),     // target
-                                       glm::vec3(0.0F, 1.0F, 0.0F));    // up
+    const glm::mat4 view = glm::lookAt(glm::vec3(2.0F, 1.5F, 3.0F),   // eye
+                                       glm::vec3(0.0F, 0.0F, 0.0F),   // target
+                                       glm::vec3(0.0F, 1.0F, 0.0F));  // up
+    const glm::mat4 model = glm::rotate(glm::mat4(1.0F), time_seconds * 0.5F,
+                                        glm::vec3(0.0F, 1.0F, 0.0F));
 
     PushConstants push{};
-    push.vertex_address = vertex_buffer_.device_address();
-    push.color_index = k_color_buffer_index;
-    push.view_proj = projection * view;
+    push.vertex_address = cube_.vertex_address;
+    push.mvp = projection * view * model;
     vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                        &push);
 
@@ -196,6 +243,10 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     scissor.offset = {0, 0};
     scissor.extent = extent;
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(),
+                         cube_.index_offset, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(command_buffer, cube_.index_count, 1, 0, 0, 0);
 
     vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
@@ -234,6 +285,8 @@ bool Application::recreate_swapchain() {
 void Application::run() {
     SAGE_LOG_INFO("Entering main loop");
 
+    const auto start_time = std::chrono::steady_clock::now();
+
     while (!window_.should_close()) {
         gpu::Window::poll_events();
 
@@ -263,8 +316,12 @@ void Application::run() {
             continue;
         }
 
-        record_triangle(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
-                        swapchain_.extent());
+        const float time_seconds = 
+        std::chrono::duration<float>(std::chrono::steady_clock::now() -
+        start_time).count();
+        
+        record_cube(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
+                        swapchain_.extent(), time_seconds);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));

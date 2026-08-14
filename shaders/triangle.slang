@@ -1,22 +1,17 @@
 struct Vertex
 {
-    float2 position;
+    float3 position;
+    float3 color;
 };
 
 struct PushConstants
 {
     Vertex* vertices;
-    uint color_index;
-    float4x4 view_proj;
+    float4x4 mvp;
 };
 
 [vk::push_constant]
 PushConstants pc;
-
-// Unbounded array: the size comes from the descriptor set layout, not here.
-// Set 0 is one bindless set; binding 0 is its storage-buffer array.
-[[vk::binding(0, 0)]]
-StructuredBuffer<float4> colors[];
 
 struct VertexOutput
 {
@@ -27,15 +22,15 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vertex_main(uint vertex_id : SV_VertexID)
 {
+    const Vertex vertex = pc.vertices[vertex_id];
+
     VertexOutput output;
 
     // mul(matrix, vector) matches glm's column-major data pushed unmodified.
     // Slang decorates the member RowMajor and lowers this to
-    // OpVectorTimesMatrix; the two cancel. Verified empirically -- do not
-    // swap the operand order without re-testing.
-    output.position = mul(pc.view_proj, float4(pc.vertices[vertex_id].position, 0.0, 1.0));
-    output.position = mul(pc.view_proj, float4(pc.vertices[vertex_id].position, 0.0, 1.0));
-    output.color = colors[pc.color_index][vertex_id].rgb;
+    // OpVectorTimesMatrix; the two cancel. Don't swap operand order without retesting
+    output.position = mul(pc.mvp, float4(vertex.position, 1.0));
+    output.color = vertex.color;
     return output;
 }
 
