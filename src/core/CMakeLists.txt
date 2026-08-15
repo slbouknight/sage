@@ -2,6 +2,7 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 
 add_library(sage_core STATIC
+    src/camera.cpp
     src/log.cpp
     src/job.cpp
     include/sage/core/math.hpp

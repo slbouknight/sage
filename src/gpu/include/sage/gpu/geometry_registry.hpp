@@ -6,8 +6,7 @@
 
 #include <cstdint>
 
-namespace sage::gpu
-{
+namespace sage::gpu {
 
 class Device;
 class Uploader;
@@ -18,12 +17,10 @@ class Uploader;
 //
 // Bump allocation only -- there is no free. M3's geometry is static, and a
 // free list would be machinery without a user.
-class GeometryRegistry
-{
+class GeometryRegistry {
 public:
     // Everything needed to draw one mesh.
-    struct MeshView
-    {
+    struct MeshView {
         VkDeviceAddress vertex_address = 0;
         VkDeviceSize index_offset = 0;
         std::uint32_t index_count = 0;
@@ -40,8 +37,8 @@ public:
 
     // Blocks until the mesh is resident and owned by the graphics family.
     // Vertex layout is the caller's concern; the registry only moves bytes.
-    MeshView add_mesh(const void* vertices, VkDeviceSize vertex_bytes,
-                      const std::uint32_t* indices, std::uint32_t index_count);
+    MeshView add_mesh(const void* vertices, VkDeviceSize vertex_bytes, const std::uint32_t* indices,
+                      std::uint32_t index_count);
 
     [[nodiscard]] VkBuffer buffer() const { return allocation_.buffer; }
 
@@ -56,4 +53,4 @@ private:
     VkDeviceAddress base_address_ = 0;
 };
 
-} // namespace sage::gpu
+}  // namespace sage::gpu

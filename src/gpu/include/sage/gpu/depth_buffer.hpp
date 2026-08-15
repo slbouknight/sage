@@ -39,4 +39,4 @@ private:
     VkImageView view_ = VK_NULL_HANDLE;
 };
 
-} // namespace sage::gpu
+}  // namespace sage::gpu

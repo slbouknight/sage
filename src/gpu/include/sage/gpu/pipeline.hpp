@@ -9,13 +9,12 @@ namespace sage::gpu {
 
 class Device;
 
-struct GraphicsPipelineDesc
-{
+struct GraphicsPipelineDesc {
     std::filesystem::path spirv_path;
     VkFormat color_format = VK_FORMAT_UNDEFINED;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
-    VkPipelineCache cache =VK_NULL_HANDLE;
+    VkPipelineCache cache = VK_NULL_HANDLE;
 };
 
 // Dynamic rendering only: no VkRenderPass, no VkFramebuffer. The color

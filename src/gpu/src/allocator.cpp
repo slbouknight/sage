@@ -55,8 +55,8 @@ BufferAllocation Allocator::create_mapped_buffer(VkDeviceSize size,
     return result;
 }
 
-BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size, VkBufferUsageFlags usage) const
-{
+BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size,
+                                                       VkBufferUsageFlags usage) const {
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = size;
@@ -67,7 +67,8 @@ BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size, VkBuff
     alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
 
     BufferAllocation result;
-    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &result.buffer, &result.allocation, nullptr));
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &result.buffer,
+                             &result.allocation, nullptr));
     return result;
 }
 
@@ -89,7 +90,8 @@ ImageAllocation Allocator::create_device_local_image(const VkImageCreateInfo& in
     alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
     ImageAllocation result;
-    VK_CHECK(vmaCreateImage(allocator_, &info, &alloc_info, &result.image, &result.allocation, nullptr));
+    VK_CHECK(
+        vmaCreateImage(allocator_, &info, &alloc_info, &result.image, &result.allocation, nullptr));
     return result;
 }
 

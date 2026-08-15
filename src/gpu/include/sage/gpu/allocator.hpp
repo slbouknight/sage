@@ -47,7 +47,8 @@ public:
 
     // Device-local: no host access, so VMA is free to pick the fastest memory.
     // Populate it through the Uploader.
-    [[nodiscard]] BufferAllocation create_device_local_buffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
+    [[nodiscard]] BufferAllocation create_device_local_buffer(VkDeviceSize size,
+                                                              VkBufferUsageFlags usage) const;
 
     void flush(const BufferAllocation& allocation, VkDeviceSize size) const;
     void destroy_buffer(const BufferAllocation& allocation) const;

@@ -119,8 +119,8 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     pipeline_info.subpass = 0;
     pipeline_info.pDepthStencilState = &depth_stencil;
 
-    VK_CHECK(
-        vkCreateGraphicsPipelines(device_.handle(), desc.cache, 1, &pipeline_info, nullptr, &pipeline_));
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), desc.cache, 1, &pipeline_info, nullptr,
+                                       &pipeline_));
 
     SAGE_LOG_INFO("Graphics pipeline created");
 }

@@ -1,15 +1,12 @@
-#include <sage/gpu/geometry_registry.hpp>
-
 #include <sage/core/assert.hpp>
 #include <sage/core/log.hpp>
 #include <sage/gpu/device.hpp>
+#include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/uploader.hpp>
 
-namespace sage::gpu
-{
+namespace sage::gpu {
 
-namespace
-{
+namespace {
 // Conservative: a BDA- addressed vertex struct may contain members that want
 // 16 byte alignment, and over-aligning the region start costs a few bytes once.
 constexpr VkDeviceSize k_vertex_alignment = 16;
@@ -17,15 +14,15 @@ constexpr VkDeviceSize k_vertex_alignment = 16;
 // vkCmdBindIndexBuffer requires the offset be a multiple of the index size.
 constexpr VkDeviceSize k_index_alignment = sizeof(std::uint32_t);
 
-} // namespace
+}  // namespace
 
 GeometryRegistry::GeometryRegistry(const Allocator& allocator, const Device& device,
-const Uploader& uploader, VkDeviceSize capacity) : allocator_(allocator), uploader_(uploader), capacity_(capacity)
-{
+                                   const Uploader& uploader, VkDeviceSize capacity)
+    : allocator_(allocator), uploader_(uploader), capacity_(capacity) {
     allocation_ = allocator_.create_device_local_buffer(
         capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            
+
     VkBufferDeviceAddressInfo address_info{};
     address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
     address_info.buffer = allocation_.buffer;
@@ -34,8 +31,7 @@ const Uploader& uploader, VkDeviceSize capacity) : allocator_(allocator), upload
     SAGE_LOG_INFO("Geometry registry: {} KiB device-local", capacity / 1024);
 }
 
-VkDeviceSize GeometryRegistry::allocate(VkDeviceSize size, VkDeviceSize alignment) 
-{
+VkDeviceSize GeometryRegistry::allocate(VkDeviceSize size, VkDeviceSize alignment) {
     SAGE_VERIFY((alignment & (alignment - 1)) == 0, "Alignment must be a power of two");
 
     const VkDeviceSize aligned = (head_ + alignment - 1) & ~(alignment - 1);
@@ -48,8 +44,7 @@ VkDeviceSize GeometryRegistry::allocate(VkDeviceSize size, VkDeviceSize alignmen
 GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
                                                       VkDeviceSize vertex_bytes,
                                                       const std::uint32_t* indices,
-                                                      std::uint32_t index_count) 
-{
+                                                      std::uint32_t index_count) {
     SAGE_VERIFY(vertices != nullptr && indices != nullptr, "GeometryRegistry: null mesh data");
     SAGE_VERIFY(vertex_bytes > 0 && index_count > 0, "GeometryRegistry: empty mesh");
 
@@ -73,6 +68,8 @@ GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
     return view;
 }
 
-GeometryRegistry::~GeometryRegistry() { allocator_.destroy_buffer(allocation_); }
+GeometryRegistry::~GeometryRegistry() {
+    allocator_.destroy_buffer(allocation_);
+}
 
-} // namespace sage::gpu
+}  // namespace sage::gpu

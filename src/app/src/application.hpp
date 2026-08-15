@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sage/core/camera.hpp>
 #include <sage/gpu/allocator.hpp>
 #include <sage/gpu/bindless_set.hpp>
 #include <sage/gpu/depth_buffer.hpp>
@@ -33,8 +34,9 @@ private:
     // skipped entirely.
     bool recreate_swapchain();
     void record_cube(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
-                     VkExtent2D extent, float time_seconds) const;
+                     VkExtent2D extent) const;
 
+    core::Camera camera_;
     gpu::Window window_;
     gpu::Instance instance_;
     gpu::Surface surface_;

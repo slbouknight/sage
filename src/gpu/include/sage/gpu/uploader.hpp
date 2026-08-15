@@ -2,8 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
-namespace sage::gpu
-{
+namespace sage::gpu {
 
 class Allocator;
 class Device;
@@ -44,4 +43,4 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
 };
 
-} // namespace sage::gpu
+}  // namespace sage::gpu
