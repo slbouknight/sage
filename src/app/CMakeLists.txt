@@ -14,4 +14,5 @@ add_dependencies(sage_app sage_shaders)
 
 target_compile_definitions(sage_app PRIVATE
     SAGE_SHADER_DIR="${SAGE_SHADER_BINARY_DIR}"
+    SAGE_ASSET_DIR="${SAGE_ASSET_DIR}"
 )

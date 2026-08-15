@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(SAGE_ENABLE_USD "Build the OpenUSD scene importer" OFF)
 option(SAGE_ENABLE_CUDA "Build CUDA compute passes" ON)
 option(SAGE_BUILD_TESTS "Build unit tests" ON)
 
@@ -26,6 +25,7 @@ endif()
 include(cmake/SageCompileOptions.cmake)
 
 set(SAGE_SHADER_BINARY_DIR "${CMAKE_BINARY_DIR}/shaders")
+set(SAGE_ASSET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
 
 add_subdirectory(shaders)
 add_subdirectory(src/core)

@@ -7,6 +7,7 @@ if(NOT Vulkan_FOUND)
         "Vulkan not found. Source the LunarG SDK's setup-env.sh before configuring, e.g.\n"
         "    source ~/vulkansdk/<version>/setup-env.sh")
 endif()
+find_package(fastgltf CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 
@@ -18,6 +19,7 @@ add_library(sage_gpu STATIC
     src/device.cpp
     src/frame_pacer.cpp
     src/geometry_registry.cpp
+    src/gltf_loader.cpp
     src/instance.cpp
     src/physical_device.cpp
     src/pipeline.cpp
@@ -38,11 +40,12 @@ target_include_directories(sage_gpu PUBLIC
 target_link_libraries(sage_gpu
     PRIVATE
         sage::compile_options
-        sage::core
         glfw
         GPUOpen::VulkanMemoryAllocator
+        fastgltf::fastgltf
     PUBLIC
         Vulkan::Vulkan
+        sage::core
 )
 
 # Validation layers and VK_EXT_debug_utils are Debug-only. This is a runtime

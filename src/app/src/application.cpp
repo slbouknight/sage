@@ -4,10 +4,12 @@
 #include <sage/core/math.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/shader_module.hpp>
+#include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -20,6 +22,7 @@ namespace {
 const glm::vec3 k_initial_camera_position{2.0F, 1.5F, 3.0F};
 constexpr float k_initial_camera_yaw = -2.16F;    // radians
 constexpr float k_initial_camera_pitch = -0.39F;  // radians
+constexpr float k_field_of_view_degrees = 60.0F;
 
 // Radians per pixel of the mouse movement.
 constexpr float k_mouse_sensitivity = 0.003F;
@@ -44,7 +47,7 @@ core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
     return camera_input;
 }
 
-// Must match shaders/triangle.slang's PushConstants exactly. The static_asserts
+// Must match shaders/mesh.slang's PushConstants exactly. The static_asserts
 // below turn a layout mismatch into a build failure instead of a GPU fault.
 struct PushConstants {
     VkDeviceAddress vertex_address = 0;
@@ -53,62 +56,6 @@ struct PushConstants {
 static_assert(offsetof(PushConstants, vertex_address) == 0);
 static_assert(offsetof(PushConstants, mvp) == 16);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match Vertex in shaders/triangle.slang. Slang's "natural" layout for
-// BDA-accessed structs is C-like packing, no std430 padding, which is exactly
-// what glm::vec3's give: ArrayStride 24, offsets 0 and 12.
-struct Vertex {
-    glm::vec3 position;
-    glm::vec3 color;
-};
-static_assert(sizeof(Vertex) == 24);
-static_assert(offsetof(Vertex, position) == 0);
-static_assert(offsetof(Vertex, color) == 12);
-
-// 24 vertices, not 8: each face needs its own color, so corners are
-// duplicated per face. Winding is CCW viewed from outside.
-const std::array<Vertex, 24> k_cube_vertices{{
-    // +Z front, red
-    {{-0.5F, -0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
-    {{0.5F, -0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
-    {{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
-    {{-0.5F, 0.5F, 0.5F}, {1.0F, 0.0F, 0.0F}},
-    // -Z back, cyan
-    {{0.5F, -0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
-    {{-0.5F, -0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
-    {{-0.5F, 0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
-    {{0.5F, 0.5F, -0.5F}, {0.0F, 1.0F, 1.0F}},
-    // +X right, green
-    {{0.5F, -0.5F, 0.5F}, {0.0F, 1.0F, 0.0F}},
-    {{0.5F, -0.5F, -0.5F}, {0.0F, 1.0F, 0.0F}},
-    {{0.5F, 0.5F, -0.5F}, {0.0F, 1.0F, 0.0F}},
-    {{0.5F, 0.5F, 0.5F}, {0.0F, 1.0F, 0.0F}},
-    // -X left, magenta
-    {{-0.5F, -0.5F, -0.5F}, {1.0F, 0.0F, 1.0F}},
-    {{-0.5F, -0.5F, 0.5F}, {1.0F, 0.0F, 1.0F}},
-    {{-0.5F, 0.5F, 0.5F}, {1.0F, 0.0F, 1.0F}},
-    {{-0.5F, 0.5F, -0.5F}, {1.0F, 0.0F, 1.0F}},
-    // +Y top, blue
-    {{-0.5F, 0.5F, 0.5F}, {0.0F, 0.0F, 1.0F}},
-    {{0.5F, 0.5F, 0.5F}, {0.0F, 0.0F, 1.0F}},
-    {{0.5F, 0.5F, -0.5F}, {0.0F, 0.0F, 1.0F}},
-    {{-0.5F, 0.5F, -0.5F}, {0.0F, 0.0F, 1.0F}},
-    // -Y bottom, yellow
-    {{-0.5F, -0.5F, -0.5F}, {1.0F, 1.0F, 0.0F}},
-    {{0.5F, -0.5F, -0.5F}, {1.0F, 1.0F, 0.0F}},
-    {{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F, 0.0F}},
-    {{-0.5F, -0.5F, 0.5F}, {1.0F, 1.0F, 0.0F}},
-}};
-
-// Two triangles per face, from each face's four consecutive vertices.
-const std::array<std::uint32_t, 36> k_cube_indices{
-    0,  1,  2,  0,  2,  3,   // +Z
-    4,  5,  6,  4,  6,  7,   // -Z
-    8,  9,  10, 8,  10, 11,  // +X
-    12, 13, 14, 12, 14, 15,  // -X
-    16, 17, 18, 16, 18, 19,  // +Y
-    20, 21, 22, 20, 22, 23,  // -Y
-};
 
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
@@ -138,7 +85,7 @@ std::filesystem::path pipeline_cache_path() {
 constexpr VkDeviceSize k_geometry_capacity = 4ULL * 1024 * 1024;
 }  // namespace
 
-Application::Application()
+Application::Application(const std::filesystem::path& model_path)
     : camera_(k_initial_camera_position, k_initial_camera_yaw, k_initial_camera_pitch),
       window_(k_initial_width, k_initial_height, "sage"),
       instance_("sage", gpu::Window::required_instance_extensions()),
@@ -154,16 +101,15 @@ Application::Application()
       pipeline_cache_(device_, pipeline_cache_path()),
       pipeline_(device_,
                 gpu::GraphicsPipelineDesc{
-                    .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "triangle.spv",
+                    .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
                     .color_format = swapchain_.format(),
                     .depth_format = depth_buffer_.format(),
                     .set_layout = bindless_set_.layout(),
                     .cache = pipeline_cache_.handle(),
                 }),
       frame_pacer_(device_) {
-    cube_ = geometry_registry_.add_mesh(
-        k_cube_vertices.data(), sizeof(Vertex) * k_cube_vertices.size(), k_cube_indices.data(),
-        static_cast<std::uint32_t>(k_cube_indices.size()));
+    scene_ = gpu::load_gltf(model_path, geometry_registry_);
+    frame_camera_on(scene_.bounds_min, scene_.bounds_max);
 }
 
 Application::~Application() {
@@ -171,8 +117,8 @@ Application::~Application() {
     device_.wait_idle();
 }
 
-void Application::record_cube(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
-                              VkExtent2D extent) const {
+void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
+                               VkImageView image_view, VkExtent2D extent) const {
     VkImageMemoryBarrier2 to_color{};
     to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -243,15 +189,6 @@ void Application::record_cube(VkCommandBuffer command_buffer, VkImage image, VkI
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.layout(), 0,
                             1, &descriptor_set, 0, nullptr);
 
-    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    const glm::mat4 projection = core::perspective_vk(glm::radians(60.0F), aspect, 0.1F, 100.0F);
-
-    PushConstants push{};
-    push.vertex_address = cube_.vertex_address;
-    push.mvp = projection * camera_.view_matrix();
-    vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
-                       &push);
-
     VkViewport viewport{};
     viewport.x = 0.0F;
     viewport.y = 0.0F;
@@ -266,9 +203,22 @@ void Application::record_cube(VkCommandBuffer command_buffer, VkImage image, VkI
     scissor.extent = extent;
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
-    vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), cube_.index_offset,
-                         VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(command_buffer, cube_.index_count, 1, 0, 0, 0);
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    const glm::mat4 projection =
+        core::perspective_vk(glm::radians(k_field_of_view_degrees), aspect, 0.1F, 1000.0F);
+    const glm::mat4 view_projection = projection * camera_.view_matrix();
+
+    for (const gpu::SceneNode& node : scene_.nodes) {
+        PushConstants push{};
+        push.vertex_address = node.mesh.vertex_address;
+        push.mvp = view_projection * node.transform;
+        vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
+                           &push);
+
+        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
+                             VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
+    }
 
     vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
@@ -302,6 +252,30 @@ bool Application::recreate_swapchain() {
     swapchain_.recreate(extent);
     depth_buffer_.recreate(swapchain_.extent());
     return true;
+}
+
+void Application::frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max) {
+    const glm::vec3 center = (bounds_min + bounds_max) * 0.5F;
+    const float radius = glm::length(bounds_max - bounds_min) * 0.5F;
+
+    // Distance at which a sphere of `radius` fills the vertical FOV
+    // with margin so the model does not touch the edges of the window.
+    const float distance = (radius / std::tan(glm::radians(k_field_of_view_degrees) * 0.5F)) * 1.5F;
+
+    // Offset diagonally so three faces of anything box-like are visible, rather
+    // than looking straight down an axis at a flat silhouette.
+    const glm::vec3 direction = glm::normalize(glm::vec3(0.6F, 0.4F, 1.0F));
+    const glm::vec3 position = center + direction * distance;
+
+    const glm::vec3 to_center = glm::normalize(center - position);
+    const float yaw = std::atan2(to_center.z, to_center.x);
+    const float pitch = std::asin(to_center.y);
+
+    camera_ = core::Camera(position, yaw, pitch);
+    camera_.adjust_speed(std::log(std::max(radius, 0.1F)) / std::log(1.15F));
+
+    SAGE_LOG_INFO("Framed camera at ({:.2f}, {:.2f}, {:.2f}), scene radius {:.2f}", position.x,
+                  position.y, position.z, radius);
 }
 
 void Application::run() {
@@ -349,8 +323,8 @@ void Application::run() {
             continue;
         }
 
-        record_cube(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
-                    swapchain_.extent());
+        record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
+                     swapchain_.extent());
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));

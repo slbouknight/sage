@@ -7,6 +7,7 @@
 #include <sage/gpu/device.hpp>
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/geometry_registry.hpp>
+#include <sage/gpu/gltf_loader.hpp>
 #include <sage/gpu/instance.hpp>
 #include <sage/gpu/pipeline.hpp>
 #include <sage/gpu/pipeline_cache.hpp>
@@ -15,11 +16,13 @@
 #include <sage/gpu/uploader.hpp>
 #include <sage/gpu/window.hpp>
 
+#include <filesystem>
+
 namespace sage::app {
 
 class Application {
 public:
-    Application();
+    explicit Application(const std::filesystem::path& model_path);
     ~Application();
 
     Application(const Application&) = delete;
@@ -33,8 +36,9 @@ private:
     // Returns false when the window is minimized and the frame should be
     // skipped entirely.
     bool recreate_swapchain();
-    void record_cube(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
-                     VkExtent2D extent) const;
+    void record_scene(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
+                      VkExtent2D extent) const;
+    void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
     core::Camera camera_;
     gpu::Window window_;
@@ -46,7 +50,7 @@ private:
     gpu::BindlessSet bindless_set_;
     gpu::Uploader uploader_;
     gpu::GeometryRegistry geometry_registry_;
-    gpu::GeometryRegistry::MeshView cube_;
+    gpu::Scene scene_;
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;
     gpu::PipelineCache pipeline_cache_;
