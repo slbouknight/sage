@@ -9,14 +9,20 @@ namespace sage::gpu {
 
 class Device;
 
+struct GraphicsPipelineDesc {
+    std::filesystem::path spirv_path;
+    VkFormat color_format = VK_FORMAT_UNDEFINED;
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineCache cache = VK_NULL_HANDLE;
+};
+
 // Dynamic rendering only: no VkRenderPass, no VkFramebuffer. The color
 // attachment format is baked in at creation via VkPipelineRenderingCreateInfo;
 // the actual image view is named later by vkCmdBeginRendering.
 class GraphicsPipeline {
 public:
-    GraphicsPipeline(const Device& device, const std::filesystem::path& spirv_path,
-                     VkFormat color_format, VkDescriptorSetLayout set_layout,
-                     VkPipelineCache cache);
+    GraphicsPipeline(const Device& device, const GraphicsPipelineDesc& desc);
     ~GraphicsPipeline();
 
     GraphicsPipeline(const GraphicsPipeline&) = delete;

@@ -55,6 +55,23 @@ BufferAllocation Allocator::create_mapped_buffer(VkDeviceSize size,
     return result;
 }
 
+BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size,
+                                                       VkBufferUsageFlags usage) const {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+
+    BufferAllocation result;
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &result.buffer,
+                             &result.allocation, nullptr));
+    return result;
+}
+
 void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size) const {
     VK_CHECK(vmaFlushAllocation(allocator_, allocation.allocation, 0, size));
 }
@@ -62,6 +79,25 @@ void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size) con
 void Allocator::destroy_buffer(const BufferAllocation& allocation) const {
     if (allocation.buffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(allocator_, allocation.buffer, allocation.allocation);
+    }
+}
+
+ImageAllocation Allocator::create_device_local_image(const VkImageCreateInfo& info) const {
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    // A full-screen render target is large and long-lived, so a dedicated
+    // allocation is preferable to carving it out of a shared block.
+    alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+
+    ImageAllocation result;
+    VK_CHECK(
+        vmaCreateImage(allocator_, &info, &alloc_info, &result.image, &result.allocation, nullptr));
+    return result;
+}
+
+void Allocator::destroy_image(const ImageAllocation& allocation) const {
+    if (allocation.image != VK_NULL_HANDLE) {
+        vmaDestroyImage(allocator_, allocation.image, allocation.allocation);
     }
 }
 

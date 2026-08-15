@@ -1,10 +1,15 @@
 #include "application.hpp"
 
 #include <sage/core/log.hpp>
+#include <sage/core/math.hpp>
+#include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/shader_module.hpp>
+#include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
 
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -13,27 +18,44 @@ namespace sage::app {
 
 namespace {
 
-// Must match shaders/triangle.slang's PushConstants exactly. The static_asserts
+// Camera setup
+const glm::vec3 k_initial_camera_position{2.0F, 1.5F, 3.0F};
+constexpr float k_initial_camera_yaw = -2.16F;    // radians
+constexpr float k_initial_camera_pitch = -0.39F;  // radians
+constexpr float k_field_of_view_degrees = 60.0F;
+
+// Radians per pixel of the mouse movement.
+constexpr float k_mouse_sensitivity = 0.003F;
+
+core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
+    core::CameraInput camera_input;
+
+    // Only moves the camera while the right button is held; WASD does nothing on its own
+    // Returning early keeps that rule in one place/
+    if (!input.look_active) {
+        return camera_input;
+    }
+
+    camera_input.forward = (input.forward ? 1.0F : 0.0F) - (input.back ? 1.0F : 0.0F);
+    camera_input.right = (input.right ? 1.0F : 0.0F) - (input.left ? 1.0F : 0.0F);
+    camera_input.up = (input.up ? 1.0F : 0.0F) - (input.down ? 1.0F : 0.0F);
+
+    camera_input.yaw_delta = input.cursor_delta_x * k_mouse_sensitivity;
+    // Screen Y grows downward; moving the mouse up should pitch  up.
+    camera_input.pitch_delta = -input.cursor_delta_y * k_mouse_sensitivity;
+
+    return camera_input;
+}
+
+// Must match shaders/mesh.slang's PushConstants exactly. The static_asserts
 // below turn a layout mismatch into a build failure instead of a GPU fault.
 struct PushConstants {
     VkDeviceAddress vertex_address = 0;
-    std::uint32_t color_index = 0;
+    alignas(16) glm::mat4 mvp{1.0F};
 };
-
 static_assert(offsetof(PushConstants, vertex_address) == 0);
-static_assert(offsetof(PushConstants, color_index) == 8);
+static_assert(offsetof(PushConstants, mvp) == 16);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-constexpr std::uint32_t k_color_buffer_index = 0;
-
-// float2 per vertex, matching Vertex in the shader (ArrayStride 8)
-constexpr std::array<float, 6> k_vertex_positions{0.0F, -0.5F, 0.5F, 0.5F, -0.5F, 0.5F};
-
-// float4 per vertex: std430 gives a 3-component vector 16-byte alignment
-// fourth component costs nothing and keeps the layout explicit.
-constexpr std::array<float, 12> k_vertex_colors{
-    1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 1.0F,
-};
 
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
@@ -42,6 +64,9 @@ constexpr VkClearColorValue k_clear_color{{0.05F, 0.05F, 0.07F, 1.0F}};
 
 constexpr VkImageSubresourceRange k_color_range{
     VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+
+constexpr VkImageSubresourceRange k_depth_range{
+    VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
 
 // The cache belongs in the user's cache dir, not the build tree: it must
 // survive `--clean`, and it is machine-specific so it should never be
@@ -56,29 +81,35 @@ std::filesystem::path pipeline_cache_path() {
     return std::filesystem::path(".sage-pipeline-cache.bin");
 }
 
+// 4MiB: far more than a cube needs, and a round number to revisit when adding real meshes later
+constexpr VkDeviceSize k_geometry_capacity = 4ULL * 1024 * 1024;
 }  // namespace
 
-Application::Application()
-    : window_(k_initial_width, k_initial_height, "sage"),
+Application::Application(const std::filesystem::path& model_path)
+    : camera_(k_initial_camera_position, k_initial_camera_yaw, k_initial_camera_pitch),
+      window_(k_initial_width, k_initial_height, "sage"),
       instance_("sage", gpu::Window::required_instance_extensions()),
       surface_(instance_, window_),
       physical_device_(gpu::select_physical_device(instance_.handle(), surface_.handle())),
       device_(physical_device_),
       allocator_(instance_, device_),
       bindless_set_(device_),
-      vertex_buffer_(allocator_, device_, sizeof(k_vertex_positions),
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
-      color_buffer_(allocator_, device_, sizeof(k_vertex_colors),
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+      uploader_(allocator_, device_),
+      geometry_registry_(allocator_, device_, uploader_, k_geometry_capacity),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
+      depth_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
-      pipeline_(device_, std::filesystem::path(SAGE_SHADER_DIR) / "triangle.spv",
-                swapchain_.format(), bindless_set_.layout(), pipeline_cache_.handle()),
+      pipeline_(device_,
+                gpu::GraphicsPipelineDesc{
+                    .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
+                    .color_format = swapchain_.format(),
+                    .depth_format = depth_buffer_.format(),
+                    .set_layout = bindless_set_.layout(),
+                    .cache = pipeline_cache_.handle(),
+                }),
       frame_pacer_(device_) {
-    vertex_buffer_.write(k_vertex_positions.data(), sizeof(k_vertex_positions));
-    color_buffer_.write(k_vertex_colors.data(), sizeof(k_vertex_colors));
-    bindless_set_.write_storage_buffer(k_color_buffer_index, color_buffer_.handle(),
-                                       color_buffer_.size());
+    scene_ = gpu::load_gltf(model_path, geometry_registry_);
+    frame_camera_on(scene_.bounds_min, scene_.bounds_max);
 }
 
 Application::~Application() {
@@ -86,11 +117,11 @@ Application::~Application() {
     device_.wait_idle();
 }
 
-void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
-                                  VkImageView image_view, VkExtent2D extent) const {
+void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
+                               VkImageView image_view, VkExtent2D extent) const {
     VkImageMemoryBarrier2 to_color{};
     to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_color.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     to_color.srcAccessMask = VK_ACCESS_2_NONE;
     to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -101,11 +132,28 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     to_color.image = image;
     to_color.subresourceRange = k_color_range;
 
-    VkDependencyInfo to_color_dependency{};
-    to_color_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_color_dependency.imageMemoryBarrierCount = 1;
-    to_color_dependency.pImageMemoryBarriers = &to_color;
-    vkCmdPipelineBarrier2(command_buffer, &to_color_dependency);
+    VkImageMemoryBarrier2 to_depth{};
+    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_depth.srcStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    to_depth.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    to_depth.dstStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_depth.image = depth_buffer_.image();
+    to_depth.subresourceRange = k_depth_range;
+
+    const std::array<VkImageMemoryBarrier2, 2> begin_barriers{to_color, to_depth};
+
+    VkDependencyInfo begin_dependency{};
+    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    begin_dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(begin_barriers.size());
+    begin_dependency.pImageMemoryBarriers = begin_barriers.data();
+    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
 
     // loadOp CLEAR is what replaces M1's vkCmdClearColorImage.
     VkRenderingAttachmentInfo color_attachment{};
@@ -116,6 +164,14 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color_attachment.clearValue.color = k_clear_color;
 
+    VkRenderingAttachmentInfo depth_attachment{};
+    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth_attachment.imageView = depth_buffer_.view();
+    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth_attachment.clearValue.depthStencil = {1.0F, 0};
+
     VkRenderingInfo rendering{};
     rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering.renderArea.offset = {0, 0};
@@ -123,6 +179,7 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     rendering.layerCount = 1;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &color_attachment;
+    rendering.pDepthAttachment = &depth_attachment;
 
     vkCmdBeginRendering(command_buffer, &rendering);
 
@@ -131,12 +188,6 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     const VkDescriptorSet descriptor_set = bindless_set_.handle();
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.layout(), 0,
                             1, &descriptor_set, 0, nullptr);
-
-    PushConstants push{};
-    push.vertex_address = vertex_buffer_.device_address();
-    push.color_index = k_color_buffer_index;
-    vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
-                       &push);
 
     VkViewport viewport{};
     viewport.x = 0.0F;
@@ -151,6 +202,23 @@ void Application::record_triangle(VkCommandBuffer command_buffer, VkImage image,
     scissor.offset = {0, 0};
     scissor.extent = extent;
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    const glm::mat4 projection =
+        core::perspective_vk(glm::radians(k_field_of_view_degrees), aspect, 0.1F, 1000.0F);
+    const glm::mat4 view_projection = projection * camera_.view_matrix();
+
+    for (const gpu::SceneNode& node : scene_.nodes) {
+        PushConstants push{};
+        push.vertex_address = node.mesh.vertex_address;
+        push.mvp = view_projection * node.transform;
+        vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
+                           &push);
+
+        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
+                             VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
+    }
 
     vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
@@ -182,14 +250,52 @@ bool Application::recreate_swapchain() {
         return false;
     }
     swapchain_.recreate(extent);
+    depth_buffer_.recreate(swapchain_.extent());
     return true;
+}
+
+void Application::frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max) {
+    const glm::vec3 center = (bounds_min + bounds_max) * 0.5F;
+    const float radius = glm::length(bounds_max - bounds_min) * 0.5F;
+
+    // Distance at which a sphere of `radius` fills the vertical FOV
+    // with margin so the model does not touch the edges of the window.
+    const float distance = (radius / std::tan(glm::radians(k_field_of_view_degrees) * 0.5F)) * 1.5F;
+
+    // Offset diagonally so three faces of anything box-like are visible, rather
+    // than looking straight down an axis at a flat silhouette.
+    const glm::vec3 direction = glm::normalize(glm::vec3(0.6F, 0.4F, 1.0F));
+    const glm::vec3 position = center + direction * distance;
+
+    const glm::vec3 to_center = glm::normalize(center - position);
+    const float yaw = std::atan2(to_center.z, to_center.x);
+    const float pitch = std::asin(to_center.y);
+
+    camera_ = core::Camera(position, yaw, pitch);
+    camera_.adjust_speed(std::log(std::max(radius, 0.1F)) / std::log(1.15F));
+
+    SAGE_LOG_INFO("Framed camera at ({:.2f}, {:.2f}, {:.2f}), scene radius {:.2f}", position.x,
+                  position.y, position.z, radius);
 }
 
 void Application::run() {
     SAGE_LOG_INFO("Entering main loop");
 
+    auto last_frame_time = std::chrono::steady_clock::now();
+    SAGE_LOG_INFO("Camera: hold RMB to look, WASD to move, E/Q up/down, scroll to change speed");
+
     while (!window_.should_close()) {
         gpu::Window::poll_events();
+
+        const auto now = std::chrono::steady_clock::now();
+        const float delta_seconds = std::chrono::duration<float>(now - last_frame_time).count();
+        last_frame_time = now;
+
+        const gpu::Window::InputState input = window_.sample_input();
+        if (input.look_active && input.scroll_delta != 0.0F) {
+            camera_.adjust_speed(input.scroll_delta);
+        }
+        camera_.update(to_camera_input(input), delta_seconds);
 
         const VkExtent2D extent = window_.framebuffer_extent();
         if (extent.width == 0 || extent.height == 0) {
@@ -217,8 +323,8 @@ void Application::run() {
             continue;
         }
 
-        record_triangle(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
-                        swapchain_.extent());
+        record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
+                     swapchain_.extent());
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));

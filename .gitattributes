@@ -6,3 +6,5 @@
 *.dds -text
 *.ktx2 -text
 *.spv -text
+*.bin -text
+*.glb -text

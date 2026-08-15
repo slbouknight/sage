@@ -10,7 +10,7 @@ endif()
 file(MAKE_DIRECTORY "${SAGE_SHADER_BINARY_DIR}")
 
 # Listed explicitly, never globbed (see CLAUDE.md).
-set(shaders triangle)
+set(shaders mesh)
 
 set(spv_outputs)
 foreach(shader IN LISTS shaders)

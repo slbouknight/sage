@@ -54,6 +54,10 @@ Device::Device(const PhysicalDeviceInfo& info) : physical_device_(info.handle) {
     features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     features12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
     features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    // Slang's "natural" layout for BDA-accessed structs  packs members C-style,
+    // so a float3 can land at offset 12 and straddle a 16-byte boundary.
+    // Standard block layout forbids that; scalar layout permits it.
+    features12.scalarBlockLayout = VK_TRUE;
 
     // Slang lowers SV_VertexID to (VertexIndex - BaseVertex) to match HLSL
     // semantics, and reading BaseVertex needs the DrawParameters capability.

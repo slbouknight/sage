@@ -15,6 +15,12 @@ struct BufferAllocation {
     void* mapped = nullptr;
 };
 
+// An image plus the allocation backing it.
+struct ImageAllocation {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation_T* allocation = nullptr;
+};
+
 namespace sage::gpu {
 
 class Device;
@@ -38,8 +44,19 @@ public:
     // allocations fed by transfer-queue staging uploads.
     [[nodiscard]] BufferAllocation create_mapped_buffer(VkDeviceSize size,
                                                         VkBufferUsageFlags usage) const;
+
+    // Device-local: no host access, so VMA is free to pick the fastest memory.
+    // Populate it through the Uploader.
+    [[nodiscard]] BufferAllocation create_device_local_buffer(VkDeviceSize size,
+                                                              VkBufferUsageFlags usage) const;
+
     void flush(const BufferAllocation& allocation, VkDeviceSize size) const;
     void destroy_buffer(const BufferAllocation& allocation) const;
+
+    // Device-local, for render-targets. The caller describes the image so
+    // allocator stays generic; only the memory strategy is decided here.
+    [[nodiscard]] ImageAllocation create_device_local_image(const VkImageCreateInfo& info) const;
+    void destroy_image(const ImageAllocation& allocation) const;
 
 private:
     VmaAllocator_T* allocator_ = nullptr;

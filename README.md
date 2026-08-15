@@ -7,13 +7,43 @@ passes. Linux-only, C++20, Clang-first.
 
 ## Status
 
-**M1 — device bring-up.** Vulkan instance with validation, physical-device
-selection against an explicit required-feature set, logical device with
-graphics/present/transfer queues, VMA allocator, swapchain, and
-timeline-semaphore frame pacing. Output is a cleared window. `core/` provides
-logging, assertions, handles/GUIDs, and a single-threaded job stub. See
-[`CLAUDE.md`](CLAUDE.md) for the full milestone ladder and hard project
-constraints.
+**M3 — geometry registry and glTF loading.** Loads a glTF scene and renders it
+with a fly camera.
+
+Built so far:
+
+- **Device** — instance with validation, physical-device selection against an
+  explicit required-feature set, graphics/present/transfer queues, VMA,
+  swapchain, timeline-semaphore frame pacing.
+- **Rendering** — dynamic rendering only (no `VkRenderPass` or
+  `VkFramebuffer`), Slang compiled to SPIR-V at build time, a pipeline cache
+  persisted across runs, depth buffering.
+- **Resources** — one bindless descriptor set (`UPDATE_AFTER_BIND`), vertex
+  data reached by buffer device address, per-draw state in push constants.
+- **Geometry** — a single device-local suballocated vertex/index buffer fed by
+  transfer-queue staging uploads with queue-family ownership transfer; glTF
+  parsed via fastgltf, node hierarchy flattened at load time.
+
+Materials, textures and animation are not loaded yet. See
+[`CLAUDE.md`](CLAUDE.md) for the milestone ladder and hard project constraints,
+and [`docs/adr/`](docs/adr/) for the reasoning behind non-obvious decisions.
+
+## Running
+
+```bash
+scripts/build.sh debug --run
+```
+
+That loads the vendored [Lantern](assets/README.md) sample. Point it at any
+other glTF or GLB with a path argument:
+
+```bash
+./build/debug/src/app/sage path/to/model.gltf
+```
+
+The camera frames itself on whatever it loads. Controls follow Unreal's
+viewport: **hold right mouse** to look, **WASD** to fly, **E**/**Q** for
+up/down, **scroll** to change speed.
 
 ## Building
 

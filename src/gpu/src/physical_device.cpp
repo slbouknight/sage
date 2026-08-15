@@ -75,6 +75,7 @@ bool supports_required_features(VkPhysicalDevice device, std::string& missing) {
     require(features12.descriptorBindingUpdateUnusedWhilePending,
             "descriptorBindingUpdateUnusedWhilePending");
     require(features11.shaderDrawParameters, "shaderDrawParameters");
+    require(features12.scalarBlockLayout, "scalarBlockLayout");
 
     return missing.empty();
 }

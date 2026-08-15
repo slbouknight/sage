@@ -30,3 +30,17 @@ worked as intended: validation named the missing feature exactly, at the first
 `vkCreateShaderModule`. Note that `spirv-val` does not catch this class of
 problem, since SPIR-V can be entirely valid while still demanding features the
 device was not created with.
+
+**Amended in M3:** `scalarBlockLayout` (Vulkan 1.2) was added for the same
+reason. Slang's "natural" layout for BDA-accessed structs packs members C-style,
+so `struct Vertex { float3 position; float3 color; }` places `color` at offset
+12, straddling a 16-byte boundary. Standard block layout forbids that; scalar
+layout permits it. The alternative — padding vertex structs to satisfy std430 —
+would distort every mesh layout to suit a rule the feature simply removes.
+
+Two features in two milestones, both discovered by compiling a real shader
+rather than predicted from the ladder, suggests the honest limit of this ADR's
+approach: front-loading covers what the milestone descriptions imply, not what
+a specific shader compiler's lowering happens to require. That is a reason to
+expect further amendments here, not a reason to abandon the approach — the cost
+of each is one line plus a matching `require()` in `physical_device.cpp`.
