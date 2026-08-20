@@ -2,6 +2,7 @@ struct Vertex
 {
     float3 position;
     float3 normal;
+    float2 uv;
 };
 
 struct PushConstants
@@ -13,10 +14,21 @@ struct PushConstants
 [vk::push_constant]
 PushConstants pc;
 
+// Binding 1 of set 0 is BindlessSet's combined image-sampler array.
+// Slang's Sampler2D lowers to OpTypeSampledImage, which is exactly what
+// VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER provides.
+[vk::binding(1, 0)]
+Sampler2D textures[];
+
+// Slot 0 while there is one texture; becomes a push-constant index later.
+static const uint k_base_color_slot = 0;
+
+
 struct VertexOutput
 {
     float4 position : SV_Position;
     float3 normal : NORMAL;
+    float2 uv: TEXCOORD0;
 };
 
 [shader("vertex")]
@@ -35,24 +47,15 @@ VertexOutput vertex_main(uint vertex_id : SV_VertexID)
     // constants there is nothing to transform by. Fine while the light is defined in the same
     // space; revisit if a model matrix is ever split out.
     output.normal = vertex.normal;
+    output.uv = vertex.uv;
+
     return output;
 }
 
 [shader("fragment")]
 float4 fragment_main(VertexOutput input) : SV_Target
 {
-    const float3 light_direction = normalize(float3(0.5, 1.0, 0.8));
-
-    // Interpolated normals are not unit length, interpolating between two
-    // unit vectors shortens the result, so renormalize per fragment.
-    const float3 normal = normalize(input.normal);
-
-    // Half-Lambert: remaps N.L from [-1, 1] to [0, 1] instead of clamping, so
-    // faces turned away stay visible rather than going black. Not physically
-    // correct; it is a readability choice for a viewer with a single light.
-    const float diffuse = saturate(dot(normal, light_direction)) * 0.5 + 0.5;
-
-    const float3 base_color = float3(0.8, 0.8, 0.85);
-
-    return float4(base_color * diffuse, 1.0);
+    // Unlit on purpose: this isolates the texture path. Bringing shading back
+    // later once camera buffer is set up
+    return textures[k_base_color_slot].Sample(input.uv);
 }

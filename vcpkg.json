@@ -8,6 +8,7 @@
     "glfw3",
     "glm",
     "spdlog",
+    "stb",
     "vulkan-memory-allocator",
     {
       "name": "catch2",

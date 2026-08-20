@@ -60,7 +60,7 @@ static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_si
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
 
-constexpr VkClearColorValue k_clear_color{{0.05F, 0.05F, 0.07F, 1.0F}};
+constexpr VkClearColorValue k_clear_color{{0.0036F, 0.0036F, 0.0036F, 1.0F}};
 
 constexpr VkImageSubresourceRange k_color_range{
     VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
@@ -83,6 +83,15 @@ std::filesystem::path pipeline_cache_path() {
 
 // 4MiB: far more than a cube needs, and a round number to revisit when adding real meshes later
 constexpr VkDeviceSize k_geometry_capacity = 4ULL * 1024 * 1024;
+
+// Hardcoded while there is exactly one texture. A per-draw index in push
+// constants replaces this when materials land.
+constexpr std::uint32_t k_base_color_slot = 0;
+
+std::filesystem::path texture_path() {
+    return std::filesystem::path(SAGE_ASSET_DIR) / "uv_grid.png";
+}
+
 }  // namespace
 
 Application::Application(const std::filesystem::path& model_path)
@@ -96,6 +105,8 @@ Application::Application(const std::filesystem::path& model_path)
       bindless_set_(device_),
       uploader_(allocator_, device_),
       geometry_registry_(allocator_, device_, uploader_, k_geometry_capacity),
+      sampler_(device_),
+      texture_(allocator_, device_, uploader_, texture_path()),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       depth_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
@@ -109,6 +120,7 @@ Application::Application(const std::filesystem::path& model_path)
                 }),
       frame_pacer_(device_) {
     scene_ = gpu::load_gltf(model_path, geometry_registry_);
+    bindless_set_.write_sampled_image(k_base_color_slot, texture_.view(), sampler_.handle());
     frame_camera_on(scene_.bounds_min, scene_.bounds_max);
 }
 
@@ -219,8 +231,6 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
                              VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
     }
-
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
     vkCmdEndRendering(command_buffer);
 

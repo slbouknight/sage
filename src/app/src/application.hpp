@@ -11,8 +11,10 @@
 #include <sage/gpu/instance.hpp>
 #include <sage/gpu/pipeline.hpp>
 #include <sage/gpu/pipeline_cache.hpp>
+#include <sage/gpu/sampler.hpp>
 #include <sage/gpu/surface.hpp>
 #include <sage/gpu/swapchain.hpp>
+#include <sage/gpu/texture.hpp>
 #include <sage/gpu/uploader.hpp>
 #include <sage/gpu/window.hpp>
 
@@ -50,6 +52,8 @@ private:
     gpu::BindlessSet bindless_set_;
     gpu::Uploader uploader_;
     gpu::GeometryRegistry geometry_registry_;
+    gpu::Sampler sampler_;
+    gpu::Texture texture_;
     gpu::Scene scene_;
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;

@@ -10,6 +10,9 @@ endif()
 find_package(fastgltf CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+# stb ships no imported target -- the port exports only Stb_INCLUDE_DIR, so
+# this is an include directory rather than a target_link_libraries entry.
+find_package(Stb REQUIRED)
 
 add_library(sage_gpu STATIC
     src/allocator.cpp
@@ -24,9 +27,11 @@ add_library(sage_gpu STATIC
     src/physical_device.cpp
     src/pipeline.cpp
     src/pipeline_cache.cpp
+    src/sampler.cpp
     src/shader_module.cpp
     src/surface.cpp
     src/swapchain.cpp
+    src/texture.cpp
     src/uploader.cpp
     src/vk_check.cpp
     src/window.cpp
@@ -36,6 +41,13 @@ add_library(sage::gpu ALIAS sage_gpu)
 target_include_directories(sage_gpu PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+# PRIVATE: stb_image.h is included by texture.cpp alone, which is also the
+# single translation unit defining STB_IMAGE_IMPLEMENTATION.
+# SYSTEM: stb is public-domain C, and its implementation trips -Wold-style-cast,
+# -Wconversion and friends by the dozen. -isystem silences warnings originating
+# inside the header without weakening any flag for our own code.
+target_include_directories(sage_gpu SYSTEM PRIVATE "${Stb_INCLUDE_DIR}")
 
 target_link_libraries(sage_gpu
     PRIVATE

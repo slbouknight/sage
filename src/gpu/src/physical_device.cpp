@@ -61,6 +61,7 @@ bool supports_required_features(VkPhysicalDevice device, std::string& missing) {
     require(features13.dynamicRendering, "dynamicRendering");
     require(features12.bufferDeviceAddress, "bufferDeviceAddress");
     require(features2.features.shaderInt64, "shaderInt64");
+    require(features2.features.samplerAnisotropy, "samplerAnisotropy");
     require(features12.descriptorIndexing, "descriptorIndexing");
     require(features12.shaderSampledImageArrayNonUniformIndexing,
             "shaderSampledImageArrayNonUniformIndexing");

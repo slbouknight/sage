@@ -2,6 +2,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstdint>
+
 namespace sage::gpu {
 
 class Allocator;
@@ -33,6 +35,17 @@ public:
     void upload_to_buffer(VkBuffer dst, VkDeviceSize dst_offset, const void* data,
                           VkDeviceSize size, VkPipelineStageFlags2 dst_stage,
                           VkAccessFlags2 dst_access) const;
+
+    // Uploads 'data' into mip level 0 of 'image', then fills the remaining levels
+    // by successive halving blits. Returns with every level in SHADER_READ_ONLY_OPTIMAL,
+    // ready for a descriptor write.
+    //
+    // Unlike upload_to_buffer this runs entirely on the graphics queue:
+    // vkCmdBlitImage is a graphics-only command, so the transfer queue cannot
+    // build the mip chain. One queue touches the image, so no ownership
+    // transfer is needed either.
+    void upload_to_image(VkImage image, VkExtent2D extent, std::uint32_t mip_levels,
+                         const void* data, VkDeviceSize size) const;
 
 private:
     const Allocator& allocator_;

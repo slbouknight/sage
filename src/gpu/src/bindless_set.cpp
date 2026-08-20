@@ -95,6 +95,27 @@ void BindlessSet::write_storage_buffer(std::uint32_t index, VkBuffer buffer,
     vkUpdateDescriptorSets(device_.handle(), 1, &write, 0, nullptr);
 }
 
+void BindlessSet::write_sampled_image(std::uint32_t index, VkImageView view,
+                                      VkSampler sampler) const {
+    SAGE_VERIFY(index < k_max_sampled_images, "Bindless sampled-image index out of range");
+
+    VkDescriptorImageInfo image_info{};
+    image_info.sampler = sampler;
+    image_info.imageView = view;
+    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_;
+    write.dstBinding = k_sampled_image_binding;
+    write.dstArrayElement = index;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_info;
+
+    vkUpdateDescriptorSets(device_.handle(), 1, &write, 0, nullptr);
+}
+
 BindlessSet::~BindlessSet() {
     // Destroying the pool frees every set allocated from it. The set must not
     // be freed separately. The pool was not created with FREE_DESCRIPTOR_SET_BIT

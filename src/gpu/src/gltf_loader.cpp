@@ -57,6 +57,7 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry) {
     std::vector<std::uint32_t> indices;
     std::vector<glm::vec3> positions;
     std::vector<glm::vec3> normals;
+    std::vector<glm::vec2> uvs;
 
     const std::size_t scene_index = asset.defaultScene.value_or(0);
 
@@ -101,10 +102,22 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry) {
                     SAGE_LOG_WARN("Primitive has no NORMAL attribute; shading will be flat");
                 }
 
+                // TEXCOORD_0 is optional in glTF. Zeroed UVs sample a single
+                // texel rather than failing to load. Wrong, but visibly wrong.
+                uvs.assign(vertex_count, glm::vec2(0.0F));
+                if (const auto* uv_attribute = primitive.findAttribute("TEXCOORD_0");
+                    uv_attribute != primitive.attributes.end()) {
+                    fastgltf::copyFromAccessor<glm::vec2>(
+                        asset, asset.accessors[uv_attribute->accessorIndex], uvs.data());
+                } else {
+                    SAGE_LOG_WARN("Primitive has no TEXCOORD_0; textures will not map");
+                }
+
                 vertices.resize(vertex_count);
                 for (std::size_t i = 0; i < vertex_count; ++i) {
                     vertices[i].position = positions[i];
                     vertices[i].normal = normals[i];
+                    vertices[i].uv = uvs[i];
 
                     const glm::vec3 world_position =
                         glm::vec3(transform * glm::vec4(positions[i], 1.0F));
