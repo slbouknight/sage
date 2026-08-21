@@ -28,8 +28,11 @@ mandatory rather than convenient: `R8G8B8_SRGB` reports *no* optimal-tiling
 features on any of the three drivers present on the development machine, so
 three-channel images are not sampleable at all. The reported
 `channels_in_file` therefore says 3 for this asset while the data in memory is
-RGBA — the two are unrelated numbers. A grid is not a base-colour map, so the
-glTF material path still has nothing real to load; restoring Lantern's own
-textures, or vendoring a smaller textured asset, is a decision deferred to the
-materials work. stb decodes PNG and JPEG only, so KTX2 or basis-compressed
-textures would need a different library.
+RGBA — the two are unrelated numbers. stb decodes PNG and JPEG only, so KTX2 or
+basis-compressed textures would need a different library.
+
+**Amended in M4:** the deferred question of what the glTF material path would
+actually load has been settled — Lantern's own maps are now vendored, see
+[ADR 0014](0014-vendor-a-cc0-test-asset.md). `uv_grid.png` stays regardless: a
+diagnostic pattern isolates UV and mip-selection bugs in a way photographic art
+cannot, and it costs 4.3 KB to keep.

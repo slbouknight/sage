@@ -17,8 +17,15 @@ class Uploader;
 // one sampler is shared by every texture (see Sampler).
 class Texture {
 public:
+    // Decodes an image file from disk.
     Texture(const Allocator& allocator, const Device& device, const Uploader& uploader,
             const std::filesystem::path& path);
+
+    // Wraps pixels already in memory: RGBA8, tightly packed, extent texels.
+    // Used for the 1x1 fallback, which has no file to decode.
+    Texture(const Allocator& allocator, const Device& device, const Uploader& uploader,
+            const std::uint8_t* pixels, VkExtent2D extent);
+
     ~Texture();
 
     Texture(const Texture&) = delete;
@@ -30,6 +37,8 @@ public:
     [[nodiscard]] std::uint32_t mip_levels() const { return mip_levels_; }
 
 private:
+    // Everything both constructors share, once the pixels exist either way.
+    void create(const Uploader& uploader, const std::uint8_t* pixels, VkExtent2D extent);
     const Allocator& allocator_;
     const Device& device_;
     ImageAllocation allocation_;

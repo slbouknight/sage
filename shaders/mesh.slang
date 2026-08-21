@@ -11,11 +11,27 @@ struct FrameData
     float3 camera_position;
 };
 
+struct Material
+{
+    float4 base_color_factor;
+    uint base_color_texture;
+    float metallic;
+    float roughness;
+};
+
+// Binding 0 of set 0 is BindlessSet's storage-buffer array. The outer index
+// names the material table; the inner one names a material within it.
+[vk::binding(0, 0)]
+StructuredBuffer<Material> materials[];
+
+static const uint k_material_buffer_slot = 0;
+
 struct PushConstants
 {
     Vertex* vertices;
     FrameData* frame;
     float4x4 model;
+    uint material_index;
 };
 
 [vk::push_constant]
@@ -61,6 +77,8 @@ VertexOutput vertex_main(uint vertex_id : SV_VertexID)
 [shader("fragment")]
 float4 fragment_main(VertexOutput input) : SV_Target
 {
+    const Material material = materials[k_material_buffer_slot][pc.material_index];
+
     // World space, so this direction means the same thing for every object
     // regardless of how its node is rotated.
     const float3 light_direction = normalize(float3(0.5, 1.0, 0.8));
@@ -73,6 +91,6 @@ float4 fragment_main(VertexOutput input) : SV_Target
     // would pin every back face to the same value and erase the falloff.
     const float diffuse = dot(normal, light_direction) * 0.5 + 0.5;
 
-    const float4 base_color = textures[k_base_color_slot].Sample(input.uv);
+    const float4 base_color = textures[material.base_color_texture].Sample(input.uv) * material.base_color_factor;
     return float4(base_color.rgb * diffuse, base_color.a);
 }

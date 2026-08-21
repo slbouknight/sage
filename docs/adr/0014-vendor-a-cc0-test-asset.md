@@ -25,3 +25,11 @@ provenance for vendored third-party data is worth doing regardless. The omitted
 textures mean the glTF's `images` entries resolve to nothing, which is only safe
 because the loader never requests image loading — restoring materials later
 means re-vendoring the textures or switching to the `.glb`.
+
+**Amended in M4:** the "textures deliberately omitted" decision above held only
+while materials were out of scope, and it is now reversed. All four maps are
+vendored unmodified at their source 2048x2048, taking the asset from 237 KB to
+roughly 9 MB. Downscaling was considered and rejected: once the ladder grew a
+BRDF and IBL milestone, every map became load-bearing rather than decorative,
+and a derived file would have to be justified and reproduced where an unmodified
+one need only be attributed. The `images` entries now all resolve.

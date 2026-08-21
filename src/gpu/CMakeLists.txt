@@ -24,6 +24,7 @@ add_library(sage_gpu STATIC
     src/geometry_registry.cpp
     src/gltf_loader.cpp
     src/instance.cpp
+    src/material_registry.cpp
     src/physical_device.cpp
     src/pipeline.cpp
     src/pipeline_cache.cpp
@@ -32,6 +33,7 @@ add_library(sage_gpu STATIC
     src/surface.cpp
     src/swapchain.cpp
     src/texture.cpp
+    src/texture_registry.cpp
     src/uploader.cpp
     src/vk_check.cpp
     src/window.cpp

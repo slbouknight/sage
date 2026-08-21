@@ -66,16 +66,22 @@ static_assert(sizeof(FrameData) == 80);
 // N's address is simply base + N * sizeof(FrameData) with no padding.
 static_assert(sizeof(FrameData) % 16 == 0);
 
+// Room for a few hundred materials; a real scene revisits this alongside
+// k_geometry_capacity, which has the same fixed-size problem.
+constexpr std::uint32_t k_max_materials = 256;
+
 // Must match shaders/mesh.slang's PushConstants exactly. The static_asserts
 // below turn a layout mismatch into a build failure instead of a GPU fault.
 struct PushConstants {
     VkDeviceAddress vertex_address = 0;
     VkDeviceAddress frame_address = 0;
     alignas(16) glm::mat4 model{1.0F};
+    std::uint32_t material_index = 0;
 };
 static_assert(offsetof(PushConstants, vertex_address) == 0);
 static_assert(offsetof(PushConstants, frame_address) == 8);
 static_assert(offsetof(PushConstants, model) == 16);
+static_assert(offsetof(PushConstants, material_index) == 80);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 constexpr std::uint32_t k_initial_width = 1280;
@@ -105,14 +111,6 @@ std::filesystem::path pipeline_cache_path() {
 // 4MiB: far more than a cube needs, and a round number to revisit when adding real meshes later
 constexpr VkDeviceSize k_geometry_capacity = 4ULL * 1024 * 1024;
 
-// Hardcoded while there is exactly one texture. A per-draw index in push
-// constants replaces this when materials land.
-constexpr std::uint32_t k_base_color_slot = 0;
-
-std::filesystem::path texture_path() {
-    return std::filesystem::path(SAGE_ASSET_DIR) / "uv_grid.png";
-}
-
 }  // namespace
 
 Application::Application(const std::filesystem::path& model_path)
@@ -127,7 +125,8 @@ Application::Application(const std::filesystem::path& model_path)
       uploader_(allocator_, device_),
       geometry_registry_(allocator_, device_, uploader_, k_geometry_capacity),
       sampler_(device_),
-      texture_(allocator_, device_, uploader_, texture_path()),
+      texture_registry_(allocator_, device_, uploader_, bindless_set_, sampler_),
+      material_registry_(allocator_, uploader_, bindless_set_, k_max_materials),
       frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
@@ -142,8 +141,9 @@ Application::Application(const std::filesystem::path& model_path)
                     .cache = pipeline_cache_.handle(),
                 }),
       frame_pacer_(device_) {
-    scene_ = gpu::load_gltf(model_path, geometry_registry_);
-    bindless_set_.write_sampled_image(k_base_color_slot, texture_.view(), sampler_.handle());
+    scene_ = gpu::load_gltf(model_path, geometry_registry_, texture_registry_);
+    material_registry_.upload(scene_.materials);
+
     frame_camera_on(scene_.bounds_min, scene_.bounds_max);
 }
 
@@ -259,27 +259,13 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
         push.vertex_address = node.mesh.vertex_address;
         push.frame_address = frame_address;
         push.model = node.transform;
+        push.material_index = node.material_index;
         vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                            &push);
         vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
                              VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
     }
-
-    // const glm::mat4 view_projection = projection * camera_.view_matrix();
-
-    // for (const gpu::SceneNode& node : scene_.nodes) {
-    //     PushConstants push{};
-    //     push.vertex_address = node.mesh.vertex_address;
-    //     push.mvp = view_projection * node.transform;
-    //     vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-    //     sizeof(push),
-    //                        &push);
-
-    //     vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
-    //                          VK_INDEX_TYPE_UINT32);
-    //     vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
-    // }
 
     vkCmdEndRendering(command_buffer);
 

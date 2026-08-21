@@ -40,15 +40,33 @@ documented reasoning matter as much as features.
   per-frame camera buffer addressed by BDA so lighting works in world space.
   Inserted ahead of the editor because the sampled-image half of the bindless set
   has never been exercised, and object-space normals break the moment two objects
-  rotate independently. One directional light; no BRDF or IBL yet. ← current
-- **M5** — ImGui/ImGuizmo editor shell: docking, hierarchy panel, gizmo→transform
-  writeback. Needs a persistent, mutable scene graph — M3's flattened `Scene` is
-  load-time output, not something to edit in place.
+  rotate independently. One directional light, base colour only; the BRDF is M5's
+  job and IBL is M7's. ← current
+- **M5** — BRDF and lights: Cook-Torrance GGX on the metallic-roughness workflow,
+  normal mapping off `TANGENT`, the remaining three Lantern maps wired through
+  the material table, and a `Light` type — directional and point, with
+  attenuation — living in a storage buffer rather than as shader constants.
+  The two ship together because a BRDF is evaluated per light: splitting them
+  means writing the loop body with the loop removed, then re-adding it later.
+  Watch the format split — base colour and emissive are sRGB, normal and
+  metallic-roughness are UNORM, and getting that wrong looks almost right.
+  Still no IBL: the only ambient term is a constant.
 - **M6** — CUDA interop: `ComputePass` interface, exportable VMA pool, shared timeline
   semaphore. First target: tonemap or blur on the HDR image.
-- **M7** — CUDA simulation on the M6 interop path: N-body, cloth, or SPH. The
+- **M7** — IBL: HDR environment load, equirectangular→cubemap, diffuse irradiance
+  convolution, prefiltered specular mip chain, BRDF integration LUT. Deliberately
+  *after* M6: prefiltering is a compute workload, so it becomes `ComputePass`'s
+  second real consumer instead of hand-rolled render-to-cubemap-face that compute
+  would supersede one milestone later. Brings cubemap images, which `Texture`
+  does not do — 6 array layers, `CUBE_COMPATIBLE`, `VIEW_TYPE_CUBE`.
+- **M8** — CUDA simulation on the M6 interop path: N-body, cloth, or SPH. The
   simulation writes geometry the renderer already knows how to draw, so it
   exercises interop under real load rather than a single post-process.
+- **M9** — ImGui/ImGuizmo editor shell: docking, hierarchy panel, gizmo→transform
+  writeback. Needs a persistent, mutable scene graph — M3's flattened `Scene` is
+  load-time output, not something to edit in place. Last because it is tooling
+  rather than GPU work; see [ADR 0020](docs/adr/0020-brdf-and-ibl-milestones.md)
+  for the caveat about parameter tuning before then.
 
 Work the current milestone only. Flag scope creep instead of accommodating it.
 
