@@ -47,14 +47,35 @@ core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
     return camera_input;
 }
 
+// Must match FrameData in shaders/mesh.slang. Written once per frame and read
+// by every draw which is exactly why it is a buffer and not a push constant.
+//
+// glm's mat4 has alignment 4, not 16, so the alignas is what puts camera_position
+// at 64 rather than wherever the compiler feels like. Note the SPIR-V ArrayStride for
+// the struct is 76 under scalar layout while sizeof here is 80: the two disagree, which is
+// harmless only because a single element is ever dereferenced. Never index a FrameData* as an
+// array.
+struct FrameData {
+    alignas(16) glm::mat4 view_projection{1.0F};
+    alignas(16) glm::vec3 camera_position{0.0F};
+};
+static_assert(offsetof(FrameData, view_projection) == 0);
+static_assert(offsetof(FrameData, camera_position) == 64);
+static_assert(sizeof(FrameData) == 80);
+// 80 is a multiple of the 16-byte alignment a device address requires, so slot
+// N's address is simply base + N * sizeof(FrameData) with no padding.
+static_assert(sizeof(FrameData) % 16 == 0);
+
 // Must match shaders/mesh.slang's PushConstants exactly. The static_asserts
 // below turn a layout mismatch into a build failure instead of a GPU fault.
 struct PushConstants {
     VkDeviceAddress vertex_address = 0;
-    alignas(16) glm::mat4 mvp{1.0F};
+    VkDeviceAddress frame_address = 0;
+    alignas(16) glm::mat4 model{1.0F};
 };
 static_assert(offsetof(PushConstants, vertex_address) == 0);
-static_assert(offsetof(PushConstants, mvp) == 16);
+static_assert(offsetof(PushConstants, frame_address) == 8);
+static_assert(offsetof(PushConstants, model) == 16);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 constexpr std::uint32_t k_initial_width = 1280;
@@ -107,6 +128,8 @@ Application::Application(const std::filesystem::path& model_path)
       geometry_registry_(allocator_, device_, uploader_, k_geometry_capacity),
       sampler_(device_),
       texture_(allocator_, device_, uploader_, texture_path()),
+      frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       depth_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
@@ -130,7 +153,8 @@ Application::~Application() {
 }
 
 void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
-                               VkImageView image_view, VkExtent2D extent) const {
+                               VkImageView image_view, VkExtent2D extent,
+                               std::uint32_t frame_slot) const {
     VkImageMemoryBarrier2 to_color{};
     to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -218,19 +242,44 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     const glm::mat4 projection =
         core::perspective_vk(glm::radians(k_field_of_view_degrees), aspect, 0.1F, 1000.0F);
-    const glm::mat4 view_projection = projection * camera_.view_matrix();
+
+    // One write per frame, into this frame's own slot. Writing a single shared
+    // slot would race the GPU, which may still be reading the previous frame's
+    // copy. begin_frame() has already waited out the work that used this slot.
+    FrameData frame_data;
+    frame_data.view_projection = projection * camera_.view_matrix();
+    frame_data.camera_position = camera_.position();
+
+    const VkDeviceSize frame_offset = VkDeviceSize{frame_slot} * sizeof(FrameData);
+    frame_buffer_.write(&frame_data, sizeof(frame_data), frame_offset);
+    const VkDeviceAddress frame_address = frame_buffer_.device_address() + frame_offset;
 
     for (const gpu::SceneNode& node : scene_.nodes) {
         PushConstants push{};
         push.vertex_address = node.mesh.vertex_address;
-        push.mvp = view_projection * node.transform;
+        push.frame_address = frame_address;
+        push.model = node.transform;
         vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                            &push);
-
         vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
                              VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
     }
+
+    // const glm::mat4 view_projection = projection * camera_.view_matrix();
+
+    // for (const gpu::SceneNode& node : scene_.nodes) {
+    //     PushConstants push{};
+    //     push.vertex_address = node.mesh.vertex_address;
+    //     push.mvp = view_projection * node.transform;
+    //     vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
+    //     sizeof(push),
+    //                        &push);
+
+    //     vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
+    //                          VK_INDEX_TYPE_UINT32);
+    //     vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
+    // }
 
     vkCmdEndRendering(command_buffer);
 
@@ -334,7 +383,7 @@ void Application::run() {
         }
 
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
-                     swapchain_.extent());
+                     swapchain_.extent(), frame.slot);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));

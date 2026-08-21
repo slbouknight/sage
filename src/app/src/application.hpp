@@ -3,6 +3,7 @@
 #include <sage/core/camera.hpp>
 #include <sage/gpu/allocator.hpp>
 #include <sage/gpu/bindless_set.hpp>
+#include <sage/gpu/buffer.hpp>
 #include <sage/gpu/depth_buffer.hpp>
 #include <sage/gpu/device.hpp>
 #include <sage/gpu/frame_pacer.hpp>
@@ -39,7 +40,7 @@ private:
     // skipped entirely.
     bool recreate_swapchain();
     void record_scene(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
-                      VkExtent2D extent) const;
+                      VkExtent2D extent, std::uint32_t frame_slot) const;
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
     core::Camera camera_;
@@ -54,6 +55,7 @@ private:
     gpu::GeometryRegistry geometry_registry_;
     gpu::Sampler sampler_;
     gpu::Texture texture_;
+    gpu::Buffer frame_buffer_;
     gpu::Scene scene_;
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;

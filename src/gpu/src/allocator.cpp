@@ -72,8 +72,9 @@ BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size,
     return result;
 }
 
-void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size) const {
-    VK_CHECK(vmaFlushAllocation(allocator_, allocation.allocation, 0, size));
+void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size,
+                      VkDeviceSize offset) const {
+    VK_CHECK(vmaFlushAllocation(allocator_, allocation.allocation, offset, size));
 }
 
 void Allocator::destroy_buffer(const BufferAllocation& allocation) const {
