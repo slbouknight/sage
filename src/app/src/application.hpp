@@ -3,16 +3,20 @@
 #include <sage/core/camera.hpp>
 #include <sage/gpu/allocator.hpp>
 #include <sage/gpu/bindless_set.hpp>
+#include <sage/gpu/buffer.hpp>
 #include <sage/gpu/depth_buffer.hpp>
 #include <sage/gpu/device.hpp>
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/gltf_loader.hpp>
 #include <sage/gpu/instance.hpp>
+#include <sage/gpu/material_registry.hpp>
 #include <sage/gpu/pipeline.hpp>
 #include <sage/gpu/pipeline_cache.hpp>
+#include <sage/gpu/sampler.hpp>
 #include <sage/gpu/surface.hpp>
 #include <sage/gpu/swapchain.hpp>
+#include <sage/gpu/texture_registry.hpp>
 #include <sage/gpu/uploader.hpp>
 #include <sage/gpu/window.hpp>
 
@@ -37,7 +41,7 @@ private:
     // skipped entirely.
     bool recreate_swapchain();
     void record_scene(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
-                      VkExtent2D extent) const;
+                      VkExtent2D extent, std::uint32_t frame_slot) const;
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
     core::Camera camera_;
@@ -50,6 +54,10 @@ private:
     gpu::BindlessSet bindless_set_;
     gpu::Uploader uploader_;
     gpu::GeometryRegistry geometry_registry_;
+    gpu::Sampler sampler_;
+    gpu::TextureRegistry texture_registry_;
+    gpu::MaterialRegistry material_registry_;
+    gpu::Buffer frame_buffer_;
     gpu::Scene scene_;
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;

@@ -20,7 +20,8 @@ public:
     Buffer(Buffer&&) = delete;
     Buffer& operator=(Buffer&&) = delete;
 
-    void write(const void* data, VkDeviceSize size) const;
+    // 'offset' selects a sub-region; the default overwrites from the start.
+    void write(const void* data, VkDeviceSize size, VkDeviceSize offset = 0) const;
 
     [[nodiscard]] VkBuffer handle() const { return allocation_.buffer; }
     [[nodiscard]] VkDeviceSize size() const { return size_; }

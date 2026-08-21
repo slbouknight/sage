@@ -70,6 +70,7 @@ Device::Device(const PhysicalDeviceInfo& info) : physical_device_(info.handle) {
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &features11;
     features2.features.shaderInt64 = VK_TRUE;
+    features2.features.samplerAnisotropy = VK_TRUE;
 
     const std::vector<const char*> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 

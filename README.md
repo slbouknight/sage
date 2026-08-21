@@ -7,8 +7,8 @@ passes. Linux-only, C++20, Clang-first.
 
 ## Status
 
-**M3 — geometry registry and glTF loading.** Loads a glTF scene and renders it
-with a fly camera.
+**M4 — materials and textures.** Loads a textured glTF scene and renders it lit
+in world space, with a fly camera.
 
 Built so far:
 
@@ -23,10 +23,17 @@ Built so far:
 - **Geometry** — a single device-local suballocated vertex/index buffer fed by
   transfer-queue staging uploads with queue-family ownership transfer; glTF
   parsed via fastgltf, node hierarchy flattened at load time.
+- **Materials** — glTF base-colour maps decoded with stb, uploaded with layout
+  transitions and a blit-generated mip chain, and registered into the bindless
+  sampled-image array; material factors in a device-local storage buffer,
+  selected per draw by an index in push constants.
+- **Shading** — one analytic directional light in world space, off a per-frame
+  camera buffer addressed by device address; sRGB decoded on texture read and
+  encoded on attachment write, so lighting maths runs in linear space.
 
-Materials, textures and animation are not loaded yet. See
-[`CLAUDE.md`](CLAUDE.md) for the milestone ladder and hard project constraints,
-and [`docs/adr/`](docs/adr/) for the reasoning behind non-obvious decisions.
+No BRDF, IBL or animation yet — see [`CLAUDE.md`](CLAUDE.md) for the milestone
+ladder and hard project constraints, and [`docs/adr/`](docs/adr/) for the
+reasoning behind non-obvious decisions.
 
 ## Running
 

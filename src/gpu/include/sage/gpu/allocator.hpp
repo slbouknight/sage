@@ -50,7 +50,8 @@ public:
     [[nodiscard]] BufferAllocation create_device_local_buffer(VkDeviceSize size,
                                                               VkBufferUsageFlags usage) const;
 
-    void flush(const BufferAllocation& allocation, VkDeviceSize size) const;
+    void flush(const BufferAllocation& allocation, VkDeviceSize size,
+               VkDeviceSize offset = 0) const;
     void destroy_buffer(const BufferAllocation& allocation) const;
 
     // Device-local, for render-targets. The caller describes the image so

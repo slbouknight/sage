@@ -38,6 +38,11 @@ public:
     // while the set is bound, thanks to UPDATE_AFTER_BIND.
     void write_storage_buffer(std::uint32_t index, VkBuffer buffer, VkDeviceSize size) const;
 
+    // Registers an image at 'index' in the sampled-image array. The image must be in
+    // SHADER_READ_ONLY_OPTIMAL by the time a shader samples it. The descriptor records
+    // that layout but nothing verifies it.
+    void write_sampled_image(std::uint32_t index, VkImageView view, VkSampler sampler) const;
+
 private:
     const Device& device_;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;

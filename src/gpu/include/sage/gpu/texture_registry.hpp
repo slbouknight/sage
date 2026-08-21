@@ -1,0 +1,64 @@
+#pragma once
+
+#include <vulkan/vulkan.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <vector>
+
+namespace sage::gpu {
+
+class Allocator;
+class BindlessSet;
+class Device;
+class Sampler;
+class Texture;
+class Uploader;
+
+// Owns every sampled image in the scene and hands out bindless slots.
+//
+// Slots are allocated here rather than in BindlessSet because this is the only
+// thing that registers images; a counter on the set itself would be state with
+// one writer and no other reader.
+class TextureRegistry {
+public:
+    // Slot 0 is always a 1x1 opaque white texture. A material with no
+    // base-colour map points at it and multiplies by its factor as usual, so
+    // the shader needs no branch and never samples an unwritten descriptor --
+    // which PARTIALLY_BOUND makes legal to leave empty but undefined to read.
+    static constexpr std::uint32_t k_fallback_slot = 0;
+
+    TextureRegistry(const Allocator& allocator, const Device& device, const Uploader& uploader,
+                    const BindlessSet& bindless_set, const Sampler& sampler);
+    ~TextureRegistry();
+
+    TextureRegistry(const TextureRegistry&) = delete;
+    TextureRegistry& operator=(const TextureRegistry&) = delete;
+    TextureRegistry(TextureRegistry&&) = delete;
+    TextureRegistry& operator=(TextureRegistry&&) = delete;
+
+    // Decodes an image and registers it, returning its bindless slot. A missing
+    // file yields k_fallback_slot and a warning rather than an abort: a glTF
+    // may reference maps that were never vendored, and refusing to load the
+    // whole model over one absent texture is the wrong trade for a viewer.
+    [[nodiscard]] std::uint32_t add(const std::filesystem::path& path);
+
+    [[nodiscard]] std::uint32_t count() const { return next_slot_; }
+
+private:
+    std::uint32_t register_texture(std::unique_ptr<Texture> texture);
+
+    const Allocator& allocator_;
+    const Device& device_;
+    const Uploader& uploader_;
+    const BindlessSet& bindless_set_;
+    const Sampler& sampler_;
+
+    // unique_ptr because Texture is deliberately non-movable -- it owns raw
+    // Vulkan handles -- so a vector of values could not reallocate.
+    std::vector<std::unique_ptr<Texture>> textures_;
+    std::uint32_t next_slot_ = 0;
+};
+
+}  // namespace sage::gpu

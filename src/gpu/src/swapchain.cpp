@@ -12,8 +12,12 @@ namespace sage::gpu {
 namespace {
 
 VkSurfaceFormatKHR choose_surface_format(const std::vector<VkSurfaceFormatKHR>& available) {
+    // An sRGB attachment format makes the color write encode linear -> sRGB in
+    // fixed function. Shading in linear space and presenting the UNORM would
+    // hand linear values to a display that expects sRGB, which reads as too
+    // dark mid-tones the moment a texture is sampled.
     for (const VkSurfaceFormatKHR& format : available) {
-        if (format.format == VK_FORMAT_B8G8R8A8_UNORM &&
+        if (format.format == VK_FORMAT_B8G8R8A8_SRGB &&
             format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             return format;
         }
