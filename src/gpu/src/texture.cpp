@@ -21,15 +21,18 @@ namespace sage::gpu {
 
 namespace {
 
-// Correct for base colour and emissive only. Normal, metallic-roughness and
-// occlusion maps store measurements rather than colours and must stay UNORM,
-// which is a distinction M5 has to make when it wires those up.
-constexpr VkFormat k_format = VK_FORMAT_R8G8B8A8_SRGB;
+// The only two formats sage samples. Both were probed on this hardware for
+// SAMPLED_IMAGE_FILTER_LINEAR, BLIT_SRC and BLIT_DST; the assert in create()
+// still checks, since that is a per-driver guarantee.
+VkFormat format_for(TextureColorSpace color_space) {
+    return color_space == TextureColorSpace::srgb ? VK_FORMAT_R8G8B8A8_SRGB
+                                                  : VK_FORMAT_R8G8B8A8_UNORM;
+}
 
 }  // namespace
 
 Texture::Texture(const Allocator& allocator, const Device& device, const Uploader& uploader,
-                 const std::filesystem::path& path)
+                 const std::filesystem::path& path, TextureColorSpace color_space)
     : allocator_(allocator), device_(device) {
     int width = 0;
     int height = 0;
@@ -45,7 +48,8 @@ Texture::Texture(const Allocator& allocator, const Device& device, const Uploade
     SAGE_VERIFY(width > 0 && height > 0, "Texture has zero extent");
 
     create(uploader, pixels,
-           VkExtent2D{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)});
+           VkExtent2D{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)},
+           color_space);
 
     // Safe immediately: create() blocks until the upload has completed.
     stbi_image_free(pixels);
@@ -55,19 +59,21 @@ Texture::Texture(const Allocator& allocator, const Device& device, const Uploade
 }
 
 Texture::Texture(const Allocator& allocator, const Device& device, const Uploader& uploader,
-                 const std::uint8_t* pixels, VkExtent2D extent)
+                 const std::uint8_t* pixels, VkExtent2D extent, TextureColorSpace color_space)
     : allocator_(allocator), device_(device) {
     SAGE_VERIFY(pixels != nullptr, "Texture: null pixel data");
     SAGE_VERIFY(extent.width > 0 && extent.height > 0, "Texture has zero extent");
 
-    create(uploader, pixels, extent);
+    create(uploader, pixels, extent, color_space);
 }
 
-void Texture::create(const Uploader& uploader, const std::uint8_t* pixels, VkExtent2D extent) {
+void Texture::create(const Uploader& uploader, const std::uint8_t* pixels, VkExtent2D extent,
+                     TextureColorSpace color_space) {
+    const VkFormat format = format_for(color_space);
     // Generating mips by blit needs all three of these, and they are per-format
     // and per-driver guarantees rather than universal ones.
     VkFormatProperties format_properties{};
-    vkGetPhysicalDeviceFormatProperties(device_.physical_device(), k_format, &format_properties);
+    vkGetPhysicalDeviceFormatProperties(device_.physical_device(), format, &format_properties);
     constexpr VkFormatFeatureFlags k_required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                                 VK_FORMAT_FEATURE_BLIT_SRC_BIT |
                                                 VK_FORMAT_FEATURE_BLIT_DST_BIT;
@@ -81,7 +87,7 @@ void Texture::create(const Uploader& uploader, const std::uint8_t* pixels, VkExt
     VkImageCreateInfo image_info{};
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_info.imageType = VK_IMAGE_TYPE_2D;
-    image_info.format = k_format;
+    image_info.format = format;
     image_info.extent = {extent.width, extent.height, 1};
     image_info.mipLevels = mip_levels_;
     image_info.arrayLayers = 1;
@@ -107,7 +113,7 @@ void Texture::create(const Uploader& uploader, const std::uint8_t* pixels, VkExt
     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view_info.image = allocation_.image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = k_format;
+    view_info.format = format;
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     view_info.subresourceRange.baseMipLevel = 0;
     // Every level, or the sampler cannot select between them and maxLod is moot.

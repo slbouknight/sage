@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sage/gpu/texture.hpp>
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -13,7 +15,6 @@ class Allocator;
 class BindlessSet;
 class Device;
 class Sampler;
-class Texture;
 class Uploader;
 
 // Owns every sampled image in the scene and hands out bindless slots.
@@ -42,7 +43,8 @@ public:
     // file yields k_fallback_slot and a warning rather than an abort: a glTF
     // may reference maps that were never vendored, and refusing to load the
     // whole model over one absent texture is the wrong trade for a viewer.
-    [[nodiscard]] std::uint32_t add(const std::filesystem::path& path);
+    [[nodiscard]] std::uint32_t add(const std::filesystem::path& path,
+                                    TextureColorSpace color_space);
 
     [[nodiscard]] std::uint32_t count() const { return next_slot_; }
 

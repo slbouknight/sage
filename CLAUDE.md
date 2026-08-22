@@ -50,9 +50,15 @@ documented reasoning matter as much as features.
   means writing the loop body with the loop removed, then re-adding it later.
   Watch the format split — base colour and emissive are sRGB, normal and
   metallic-roughness are UNORM, and getting that wrong looks almost right.
-  Still no IBL: the only ambient term is a constant.
+  Still no IBL: the only ambient term is a constant. Renders straight to the
+  swapchain, so specular highlights above 1.0 clamp — a known and accepted
+  limitation until M6 introduces the HDR offscreen target it already assumes.
 - **M6** — CUDA interop: `ComputePass` interface, exportable VMA pool, shared timeline
-  semaphore. First target: tonemap or blur on the HDR image.
+  semaphore. Introduces the HDR offscreen target and a full-screen resolve pass,
+  deferred out of M5 — the same machinery a G-buffer needs later. Keep the first
+  compute payload trivial (tonemap or blur): the milestone proves synchronization,
+  and a hard algorithm on top means debugging two unproven things at once.
+  Ambitious simulation is M8's job, on an interop path already known to work.
 - **M7** — IBL: HDR environment load, equirectangular→cubemap, diffuse irradiance
   convolution, prefiltered specular mip chain, BRDF integration LUT. Deliberately
   *after* M6: prefiltering is a compute workload, so it becomes `ComputePass`'s

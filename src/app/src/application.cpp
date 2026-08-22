@@ -3,6 +3,7 @@
 #include <sage/core/log.hpp>
 #include <sage/core/math.hpp>
 #include <sage/gpu/geometry_registry.hpp>
+#include <sage/gpu/light.hpp>
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
@@ -57,11 +58,15 @@ core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
 // array.
 struct FrameData {
     alignas(16) glm::mat4 view_projection{1.0F};
-    alignas(16) glm::vec3 camera_position{0.0F};
+    glm::vec3 camera_position{0.0F};
+    std::uint32_t light_count = 0;
+    std::array<gpu::Light, gpu::k_max_lights> lights{};
 };
 static_assert(offsetof(FrameData, view_projection) == 0);
 static_assert(offsetof(FrameData, camera_position) == 64);
-static_assert(sizeof(FrameData) == 80);
+static_assert(offsetof(FrameData, light_count) == 76);
+static_assert(offsetof(FrameData, lights) == 80);
+static_assert(sizeof(FrameData) == 464);
 // 80 is a multiple of the 16-byte alignment a device address requires, so slot
 // N's address is simply base + N * sizeof(FrameData) with no padding.
 static_assert(sizeof(FrameData) % 16 == 0);
@@ -142,6 +147,13 @@ Application::Application(const std::filesystem::path& model_path)
                 }),
       frame_pacer_(device_) {
     scene_ = gpu::load_gltf(model_path, geometry_registry_, texture_registry_);
+
+    // TEMPORARY: Lantern sets neither factor so glTF defaults to 1.0.
+    // Fully metallic, fully rough, no diffuse lobe at all. Hardcoding for now
+    // to see better results.
+    scene_.materials[0].metallic = 0.1F;
+    scene_.materials[0].roughness = 0.4F;
+
     material_registry_.upload(scene_.materials);
 
     frame_camera_on(scene_.bounds_min, scene_.bounds_max);
@@ -249,6 +261,23 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     FrameData frame_data;
     frame_data.view_projection = projection * camera_.view_matrix();
     frame_data.camera_position = camera_.position();
+
+    // A scene owned light list arrives with the editor. What's important here
+    // is that the shader reads data rather than constants, so moving a light
+    // is a value change and not a recompile.
+    frame_data.light_count = 2;
+
+    frame_data.lights[0].type = gpu::LightType::directional;
+    frame_data.lights[0].direction = glm::normalize(glm::vec3(-0.5F, -1.0F, -0.8F));
+    frame_data.lights[0].color = glm::vec3(1.0F, 0.96F, 0.9F);
+    frame_data.lights[0].intensity = 2.0F;
+
+    // Parked near the lantern head so the falloff is visible against the post.
+    frame_data.lights[1].type = gpu::LightType::point;
+    frame_data.lights[1].position = glm::vec3(9.6F, 18.0F, 0.0F);
+    frame_data.lights[1].color = glm::vec3(1.0F, 0.7F, 0.35F);
+    frame_data.lights[1].intensity = 60.0F;
+    frame_data.lights[1].range = 12.0F;
 
     const VkDeviceSize frame_offset = VkDeviceSize{frame_slot} * sizeof(FrameData);
     frame_buffer_.write(&frame_data, sizeof(frame_data), frame_offset);
