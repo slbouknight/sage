@@ -13,3 +13,10 @@ renumbering; originally written as M5).
 
 **Consequences:** Faster to build the milestones before it; risk of Vulkan-specific assumptions
 leaking into call sites that will need to move behind the eventual seam.
+
+**Amended after M5:** CUDA was cut from the project entirely — see
+[ADR 0024](0024-vulkan-only-cuda-cut.md). The trigger this ADR named for
+revisiting the abstraction therefore never arrives, which turns "not yet" into
+"not at all": there is no second backend, so there is no seam to find, and the
+`rhi/` layer should not be built. The decision above stands; only its expiry
+condition is void.

@@ -1,9 +1,9 @@
 # sage
 
-Standalone Vulkan/CUDA renderer, built as a from-scratch exploration of modern
-GPU and simulation engineering: dynamic rendering (VK 1.3), bindless
-resources, buffer-device-address-driven data, and CUDA interop for compute
-passes. Linux-only, C++20, Clang-first.
+Standalone Vulkan renderer, built as a from-scratch exploration of modern GPU
+engineering: dynamic rendering (VK 1.3), bindless resources,
+buffer-device-address-driven data, and a physically based forward shading path.
+Linux-only, C++20, Clang-first.
 
 ## Status
 
@@ -35,9 +35,12 @@ Built so far:
   falloff, read from a per-frame buffer addressed by device address rather than
   baked into the shader.
 
-No IBL, HDR target or animation yet — see [`CLAUDE.md`](CLAUDE.md) for the milestone
-ladder and hard project constraints, and [`docs/adr/`](docs/adr/) for the
-reasoning behind non-obvious decisions.
+No shadows, IBL, HDR target or editor yet — v1.0 is an editor shell with
+selection, gizmos and runtime glTF loading. See [`CLAUDE.md`](CLAUDE.md) for
+the milestone ladder and hard project constraints, and [`docs/adr/`](docs/adr/)
+for the reasoning behind non-obvious decisions — including
+[ADR 0024](docs/adr/0024-vulkan-only-cuda-cut.md), which records why CUDA interop
+was scoped, seriously considered, and then cut.
 
 ## Running
 

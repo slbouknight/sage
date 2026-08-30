@@ -57,3 +57,13 @@ rather than softening it: a dynamic light system that cannot be moved
 interactively is only marginally better than a hardcoded one, since the
 positions merely migrate from shader constants to C++ constants. Expect the
 debug-panel decision to arrive partway through M5, not after it.
+
+**Amended after M5:** CUDA was cut — see
+[ADR 0024](0024-vulkan-only-cuda-cut.md). The ordering argument above rests
+substantially on protecting CUDA interop from delay, and that argument is now
+void: there is nothing downstream to protect. What survives is the part that
+stood on its own. BRDF before IBL still holds, because prefiltering is a compute
+workload and IBL is several times the work; and the tooling caveat did not merely
+survive but was proven — moving a light in M5 meant a rebuild, which is why the
+debug panel is now M6 rather than an optional aside. IBL moved from M7 to M8, and
+the editor from M9 to an explicitly optional item past v1.0.
