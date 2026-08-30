@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sage/gpu/texture.hpp>
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -13,7 +15,6 @@ class Allocator;
 class BindlessSet;
 class Device;
 class Sampler;
-class Texture;
 class Uploader;
 
 // Owns every sampled image in the scene and hands out bindless slots.
@@ -29,6 +30,12 @@ public:
     // which PARTIALLY_BOUND makes legal to leave empty but undefined to read.
     static constexpr std::uint32_t k_fallback_slot = 0;
 
+    // Slot 1 is a 1x1 flat normal.  The white fallback above is the right
+    // identity for base color, emissive, and metallic roughness (white times
+    // a factor is that factor). But a normal map's identity is (0, 0, 1) and
+    // white would decode to a normal tilted 5 deg off the surface.
+    static constexpr std::uint32_t k_flat_normal_slot = 1;
+
     TextureRegistry(const Allocator& allocator, const Device& device, const Uploader& uploader,
                     const BindlessSet& bindless_set, const Sampler& sampler);
     ~TextureRegistry();
@@ -42,7 +49,8 @@ public:
     // file yields k_fallback_slot and a warning rather than an abort: a glTF
     // may reference maps that were never vendored, and refusing to load the
     // whole model over one absent texture is the wrong trade for a viewer.
-    [[nodiscard]] std::uint32_t add(const std::filesystem::path& path);
+    [[nodiscard]] std::uint32_t add(const std::filesystem::path& path,
+                                    TextureColorSpace color_space);
 
     [[nodiscard]] std::uint32_t count() const { return next_slot_; }
 

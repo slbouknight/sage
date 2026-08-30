@@ -53,8 +53,13 @@ fastgltf::Asset parse(const std::filesystem::path& path) {
 // image, and each decode is a full staging upload plus a mip chain.
 std::uint32_t resolve_image(const fastgltf::Asset& asset, std::size_t image_index,
                             const std::filesystem::path& base_directory, TextureRegistry& textures,
-                            std::unordered_map<std::size_t, std::uint32_t>& cache) {
-    if (const auto cached = cache.find(image_index); cached != cache.end()) {
+                            std::unordered_map<std::uint64_t, std::uint32_t>& cache,
+                            TextureColorSpace color_space) {
+    // Keyed on image and colour space together: one image decoded as sRGB and
+    // as linear needs two slots, because the format is baked into the view.
+    const std::uint64_t key = image_index * 2 + (color_space == TextureColorSpace::srgb ? 1 : 0);
+
+    if (const auto cached = cache.find(key); cached != cache.end()) {
         return cached->second;
     }
 
@@ -70,7 +75,7 @@ std::uint32_t resolve_image(const fastgltf::Asset& asset, std::size_t image_inde
             // a decode-from-memory path rather than a plain open.
             SAGE_LOG_WARN("Image {} has a non-zero file offset; using fallback", image_index);
         } else {
-            slot = textures.add(base_directory / uri->uri.fspath());
+            slot = textures.add(base_directory / uri->uri.fspath(), color_space);
         }
     } else {
         // GLB-embedded and base64 images arrive as BufferView or Array. Both
@@ -80,7 +85,7 @@ std::uint32_t resolve_image(const fastgltf::Asset& asset, std::size_t image_inde
                       image_index);
     }
 
-    cache.emplace(image_index, slot);
+    cache.emplace(key, slot);
     return slot;
 }
 
@@ -88,7 +93,8 @@ std::uint32_t resolve_image(const fastgltf::Asset& asset, std::size_t image_inde
 std::uint32_t resolve_texture(const fastgltf::Asset& asset, const fastgltf::TextureInfo& info,
                               const std::filesystem::path& base_directory,
                               TextureRegistry& textures,
-                              std::unordered_map<std::size_t, std::uint32_t>& cache) {
+                              std::unordered_map<std::uint64_t, std::uint32_t>& cache,
+                              TextureColorSpace color_space) {
     if (info.texCoordIndex != 0) {
         // Only TEXCOORD_0 is read into Vertex, so a second UV set would sample
         // with the wrong coordinates rather than fail loudly.
@@ -102,7 +108,7 @@ std::uint32_t resolve_texture(const fastgltf::Asset& asset, const fastgltf::Text
         return TextureRegistry::k_fallback_slot;
     }
 
-    return resolve_image(asset, *texture.imageIndex, base_directory, textures, cache);
+    return resolve_image(asset, *texture.imageIndex, base_directory, textures, cache, color_space);
 }
 
 }  // namespace
@@ -119,6 +125,7 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
     std::vector<std::uint32_t> indices;
     std::vector<glm::vec3> positions;
     std::vector<glm::vec3> normals;
+    std::vector<glm::vec4> tangents;
     std::vector<glm::vec2> uvs;
 
     const std::size_t scene_index = asset.defaultScene.value_or(0);
@@ -127,18 +134,44 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
     // materialIndex maps across untouched, plus one appended fallback carrying
     // glTF's prescribed defaults for primitives that name no material.
     scene.materials.reserve(asset.materials.size() + 1);
-    std::unordered_map<std::size_t, std::uint32_t> image_slots;
+    std::unordered_map<std::uint64_t, std::uint32_t> image_slots;
     for (const fastgltf::Material& source : asset.materials) {
         Material material;
         material.base_color_factor = glm::make_vec4(source.pbrData.baseColorFactor.data());
         material.metallic = source.pbrData.metallicFactor;
         material.roughness = source.pbrData.roughnessFactor;
-        // Falls back to the 1x1 white texture
+        // Falls back to the 1x1 white texture, which is the multiplicative
+        // identity against base_color_factor, so an untextured material needs
+        // no special case in the shader.
         material.base_color_texture =
             source.pbrData.baseColorTexture.has_value()
                 ? resolve_texture(asset, *source.pbrData.baseColorTexture, path.parent_path(),
-                                  textures, image_slots)
+                                  textures, image_slots, TextureColorSpace::srgb)
                 : TextureRegistry::k_fallback_slot;
+
+        // Linear: these carry measurements, not colour.
+        material.metallic_roughness_texture =
+            source.pbrData.metallicRoughnessTexture.has_value()
+                ? resolve_texture(asset, *source.pbrData.metallicRoughnessTexture,
+                                  path.parent_path(), textures, image_slots,
+                                  TextureColorSpace::linear)
+                : TextureRegistry::k_fallback_slot;
+
+        material.normal_texture =
+            source.normalTexture.has_value()
+                ? resolve_texture(asset, *source.normalTexture, path.parent_path(), textures,
+                                  image_slots, TextureColorSpace::linear)
+                : TextureRegistry::k_flat_normal_slot;
+
+        material.emissive_texture =
+            source.emissiveTexture.has_value()
+                ? resolve_texture(asset, *source.emissiveTexture, path.parent_path(), textures,
+                                  image_slots, TextureColorSpace::srgb)
+                : TextureRegistry::k_fallback_slot;
+
+        material.emissive_factor = glm::make_vec3(source.emissiveFactor.data());
+        material.normal_scale =
+            source.normalTexture.has_value() ? source.normalTexture->scale : 1.0F;
         scene.materials.push_back(material);
     }
     const auto default_material_index = static_cast<std::uint32_t>(scene.materials.size());
@@ -196,10 +229,21 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
                     SAGE_LOG_WARN("Primitive has no TEXCOORD_0; textures will not map");
                 }
 
+                // TANGENT is optional.
+                tangents.assign(vertex_count, glm::vec4(1.0F, 0.0F, 0.0F, 1.0F));
+                if (const auto* tangent_attribute = primitive.findAttribute("TANGENT");
+                    tangent_attribute != primitive.attributes.end()) {
+                    fastgltf::copyFromAccessor<glm::vec4>(
+                        asset, asset.accessors[tangent_attribute->accessorIndex], tangents.data());
+                } else {
+                    SAGE_LOG_WARN("Primitive has no TANGENT; normal mapping will be wrong");
+                }
+
                 vertices.resize(vertex_count);
                 for (std::size_t i = 0; i < vertex_count; ++i) {
                     vertices[i].position = positions[i];
                     vertices[i].normal = normals[i];
+                    vertices[i].tangent = tangents[i];
                     vertices[i].uv = uvs[i];
 
                     const glm::vec3 world_position =

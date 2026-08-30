@@ -7,8 +7,8 @@ passes. Linux-only, C++20, Clang-first.
 
 ## Status
 
-**M4 — materials and textures.** Loads a textured glTF scene and renders it lit
-in world space, with a fly camera.
+**M5 — BRDF and lights.** Loads a textured glTF scene and renders it with a
+Cook-Torrance BRDF under a data-driven light list, with a fly camera.
 
 Built so far:
 
@@ -27,11 +27,15 @@ Built so far:
   transitions and a blit-generated mip chain, and registered into the bindless
   sampled-image array; material factors in a device-local storage buffer,
   selected per draw by an index in push constants.
-- **Shading** — one analytic directional light in world space, off a per-frame
-  camera buffer addressed by device address; sRGB decoded on texture read and
-  encoded on attachment write, so lighting maths runs in linear space.
+- **Shading** — Cook-Torrance GGX on the metallic-roughness workflow, with
+  tangent-space normal mapping and emissive; sRGB decoded on texture read and
+  encoded on attachment write, so lighting maths runs in linear space, while
+  normal and metallic-roughness maps stay linear.
+- **Lights** — directional and point lights with windowed inverse-square
+  falloff, read from a per-frame buffer addressed by device address rather than
+  baked into the shader.
 
-No BRDF, IBL or animation yet — see [`CLAUDE.md`](CLAUDE.md) for the milestone
+No IBL, HDR target or animation yet — see [`CLAUDE.md`](CLAUDE.md) for the milestone
 ladder and hard project constraints, and [`docs/adr/`](docs/adr/) for the
 reasoning behind non-obvious decisions.
 
