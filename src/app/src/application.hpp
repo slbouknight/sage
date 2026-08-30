@@ -9,6 +9,7 @@
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/gltf_loader.hpp>
+#include <sage/gpu/imgui_layer.hpp>
 #include <sage/gpu/instance.hpp>
 #include <sage/gpu/material_registry.hpp>
 #include <sage/gpu/pipeline.hpp>
@@ -43,6 +44,10 @@ private:
     bool recreate_swapchain();
     void record_scene(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
                       VkExtent2D extent, std::uint32_t frame_slot) const;
+    // Split out of record_scene because the UI draws into the same swapchain
+    // image and must get there before it is handed to the presentation engine.
+    static void transition_to_present(VkCommandBuffer command_buffer, VkImage image);
+    void draw_ui();
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
     core::Camera camera_;
@@ -65,6 +70,9 @@ private:
     gpu::PipelineCache pipeline_cache_;
     gpu::GraphicsPipeline pipeline_;
     gpu::FramePacer frame_pacer_;
+    // Last, so it is destroyed first: its teardown frees Vulkan objects and
+    // touches the device, both of which must still be alive.
+    gpu::ImGuiLayer imgui_;
 };
 
 }  // namespace sage::app

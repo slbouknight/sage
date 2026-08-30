@@ -8,6 +8,8 @@
 #include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
 
+#include <imgui.h>
+
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -145,7 +147,8 @@ Application::Application(const std::filesystem::path& model_path)
                     .set_layout = bindless_set_.layout(),
                     .cache = pipeline_cache_.handle(),
                 }),
-      frame_pacer_(device_) {
+      frame_pacer_(device_),
+      imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
     const gpu::LoadedScene loaded =
         gpu::load_gltf(model_path, geometry_registry_, texture_registry_, scene_graph_);
 
@@ -297,7 +300,9 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     }
 
     vkCmdEndRendering(command_buffer);
+}
 
+void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage image) {
     VkImageMemoryBarrier2 to_present{};
     to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     to_present.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -316,6 +321,20 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     to_present_dependency.imageMemoryBarrierCount = 1;
     to_present_dependency.pImageMemoryBarriers = &to_present;
     vkCmdPipelineBarrier2(command_buffer, &to_present_dependency);
+}
+
+void Application::draw_ui() {
+    const ImGuiIO& io = ImGui::GetIO();
+
+    ImGui::Begin("sage");
+    ImGui::Text("%.1f fps (%.2f ms)", static_cast<double>(io.Framerate),
+                1000.0 / static_cast<double>(io.Framerate));
+    ImGui::Separator();
+    ImGui::Text("Scene: %zu nodes", scene_graph_.size());
+    const glm::vec3 position = camera_.position();
+    ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
+                static_cast<double>(position.y), static_cast<double>(position.z));
+    ImGui::End();
 }
 
 bool Application::recreate_swapchain() {
@@ -366,10 +385,14 @@ void Application::run() {
         last_frame_time = now;
 
         const gpu::Window::InputState input = window_.sample_input();
-        if (input.look_active && input.scroll_delta != 0.0F) {
+        // A panel under the pointer takes precedence, so dragging a slider does
+        // not also spin the view.
+        const bool ui_has_pointer = gpu::ImGuiLayer::wants_mouse();
+        if (!ui_has_pointer && input.look_active && input.scroll_delta != 0.0F) {
             camera_.adjust_speed(input.scroll_delta);
         }
-        camera_.update(to_camera_input(input), delta_seconds);
+        camera_.update(ui_has_pointer ? core::CameraInput{} : to_camera_input(input),
+                       delta_seconds);
 
         const VkExtent2D extent = window_.framebuffer_extent();
         if (extent.width == 0 || extent.height == 0) {
@@ -397,8 +420,17 @@ void Application::run() {
             continue;
         }
 
+        // Started only once the frame is certain to be submitted: the
+        // out-of-date path above bails without rendering, and an unterminated
+        // ImGui frame would trip the next NewFrame().
+        gpu::ImGuiLayer::begin_frame();
+        draw_ui();
+
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
                      swapchain_.extent(), frame.slot);
+        imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
+                      swapchain_.extent());
+        transition_to_present(frame.command_buffer, acquired.image);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
