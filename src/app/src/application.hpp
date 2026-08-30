@@ -22,7 +22,9 @@
 #include <sage/gpu/uploader.hpp>
 #include <sage/gpu/window.hpp>
 
+#include <cstdint>
 #include <filesystem>
+#include <vector>
 
 namespace sage::app {
 
@@ -48,7 +50,16 @@ private:
     // image and must get there before it is handed to the presentation engine.
     static void transition_to_present(VkCommandBuffer command_buffer, VkImage image);
     void draw_ui();
+    void draw_hierarchy_panel();
+    // Children per node, indexed by node index. Rebuilt each frame rather than
+    // stored; see draw_hierarchy_panel for why.
+    using ChildTable = std::vector<std::vector<std::uint32_t>>;
+    void draw_hierarchy_node(std::uint32_t index, const ChildTable& children);
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
+
+    // Viewport size when the stats panel was last anchored, so a window resize
+    // can re-pin it to the corner without overriding the user dragging it.
+    glm::vec2 last_viewport_size_{0.0F};
 
     core::Camera camera_;
     gpu::Window window_;

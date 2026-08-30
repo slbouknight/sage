@@ -16,6 +16,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <span>
+#include <vector>
 
 namespace sage::app {
 
@@ -117,6 +119,9 @@ std::filesystem::path pipeline_cache_path() {
 
 // 4MiB: far more than a cube needs, and a round number to revisit when adding real meshes later
 constexpr VkDeviceSize k_geometry_capacity = 4ULL * 1024 * 1024;
+
+// Gap between a panel and the viewport edge.
+constexpr float k_panel_margin = 10.0F;
 
 }  // namespace
 
@@ -326,6 +331,24 @@ void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage 
 void Application::draw_ui() {
     const ImGuiIO& io = ImGui::GetIO();
 
+    // Anchored to the top-right by its own top-right corner, which is what the
+    // (1, 0) pivot means -- so the window sizes itself to its contents and
+    // grows leftwards rather than off the edge.
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const glm::vec2 viewport_size{viewport->WorkSize.x, viewport->WorkSize.y};
+
+    // Re-pinned only when the viewport actually changed size. Always would
+    // defeat dragging entirely; FirstUseEver alone leaves the panel stranded
+    // mid-screen once the window is resized, because it was placed in absolute
+    // coordinates that no longer describe the corner.
+    const bool viewport_resized = viewport_size != last_viewport_size_;
+    last_viewport_size_ = viewport_size;
+
+    ImGui::SetNextWindowPos({viewport->WorkPos.x + viewport->WorkSize.x - k_panel_margin,
+                             viewport->WorkPos.y + k_panel_margin},
+                            viewport_resized ? ImGuiCond_Always : ImGuiCond_FirstUseEver,
+                            {1.0F, 0.0F});
+
     ImGui::Begin("sage");
     ImGui::Text("%.1f fps (%.2f ms)", static_cast<double>(io.Framerate),
                 1000.0 / static_cast<double>(io.Framerate));
@@ -335,6 +358,70 @@ void Application::draw_ui() {
     ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
                 static_cast<double>(position.y), static_cast<double>(position.z));
     ImGui::End();
+}
+
+void Application::draw_hierarchy_panel() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        {viewport->WorkPos.x + k_panel_margin, viewport->WorkPos.y + k_panel_margin},
+        ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({260.0F, 360.0F}, ImGuiCond_FirstUseEver);
+
+    ImGui::Begin("Hierarchy");
+
+    const std::span<const gpu::SceneNode> nodes = scene_graph_.nodes();
+
+    // SceneNode stores only its parent, and a tree widget needs the inverse.
+    // Rebuilt per frame rather than kept in the graph: a second structure there
+    // would need maintaining on every add and every removal, and would exist
+    // for this panel alone. One linear pass over a few hundred nodes is free.
+    ChildTable children(nodes.size());
+    std::vector<std::uint32_t> roots;
+    for (std::uint32_t i = 0; i < nodes.size(); ++i) {
+        if (nodes[i].parent.valid()) {
+            children[nodes[i].parent.index()].push_back(i);
+        } else {
+            roots.push_back(i);
+        }
+    }
+
+    for (const std::uint32_t root : roots) {
+        draw_hierarchy_node(root, children);
+    }
+
+    ImGui::End();
+}
+
+void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& children) {
+    const gpu::SceneNode& node = scene_graph_.nodes()[index];
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                               ImGuiTreeNodeFlags_DefaultOpen;
+    if (children[index].empty()) {
+        // A leaf gets no arrow, and NoTreePushOnOpen means it must not be
+        // popped -- which is why the TreePop below is guarded on having
+        // children rather than on `open` alone. Popping an unpushed tree node
+        // corrupts ImGui's id stack and asserts somewhere unrelated later.
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    }
+
+    // PushID scopes the label-derived id, so two nodes sharing a name stay
+    // distinct without having to build unique label strings.
+    ImGui::PushID(static_cast<int>(index));
+    const bool open = ImGui::TreeNodeEx(node.name.c_str(), flags);
+
+    if (node.has_mesh) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(mesh)");
+    }
+
+    if (open && !children[index].empty()) {
+        for (const std::uint32_t child : children[index]) {
+            draw_hierarchy_node(child, children);
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
 }
 
 bool Application::recreate_swapchain() {
@@ -425,6 +512,7 @@ void Application::run() {
         // ImGui frame would trip the next NewFrame().
         gpu::ImGuiLayer::begin_frame();
         draw_ui();
+        draw_hierarchy_panel();
 
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
                      swapchain_.extent(), frame.slot);
