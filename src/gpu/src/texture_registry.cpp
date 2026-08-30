@@ -26,7 +26,15 @@ TextureRegistry::TextureRegistry(const Allocator& allocator, const Device& devic
         allocator_, device_, uploader_, k_white.data(), VkExtent2D{1, 1}, TextureColorSpace::srgb));
     SAGE_VERIFY(slot == k_fallback_slot, "Fallback texture must land in slot 0");
 
-    SAGE_LOG_INFO("Texture registry: 1x1 white fallback at bindless image slot {}", slot);
+    // Linear, not sRGB: an sRGB decode turns 128 into 0.216 rather than 0.502,
+    // which would bias every fallback normal instead of leaving it flat.
+    constexpr std::array<std::uint8_t, 4> k_flat_normal{128, 128, 255, 255};
+    const std::uint32_t normal_slot = register_texture(
+        std::make_unique<Texture>(allocator_, device_, uploader_, k_flat_normal.data(),
+                                  VkExtent2D{1, 1}, TextureColorSpace::linear));
+    SAGE_VERIFY(normal_slot == k_flat_normal_slot, "Flat-normal texture must land in slot 1");
+    SAGE_LOG_INFO("Texture registry: white fallback at slot {}, flat normal at slot {}", slot,
+                  normal_slot);
 }
 
 std::uint32_t TextureRegistry::register_texture(std::unique_ptr<Texture> texture) {

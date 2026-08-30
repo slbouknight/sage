@@ -13,11 +13,15 @@ namespace sage::gpu {
 struct Vertex {
     glm::vec3 position;
     glm::vec3 normal;
+    // glTF's TANGENT: xyz is the tangent, w is a handedness sign of +/- 1 that
+    // orients the bitangent. It is not a padding component.
+    glm::vec4 tangent;
     glm::vec2 uv;
 };
-static_assert(sizeof(Vertex) == 32);
+static_assert(sizeof(Vertex) == 48);
 static_assert(offsetof(Vertex, position) == 0);
 static_assert(offsetof(Vertex, normal) == 12);
-static_assert(offsetof(Vertex, uv) == 24);
+static_assert(offsetof(Vertex, tangent) == 24);
+static_assert(offsetof(Vertex, uv));
 
 }  // namespace sage::gpu

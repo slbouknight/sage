@@ -2,6 +2,7 @@ struct Vertex
 {
     float3 position;
     float3 normal;
+    float4 tangent;
     float2 uv;
 };
 
@@ -75,6 +76,7 @@ struct VertexOutput
     float4 position : SV_Position;
     float3 world_position : POSITION;
     float3 world_normal : NORMAL;
+    float4 world_tangent : TANGENT;
     float2 uv: TEXCOORD0;
 };
 
@@ -95,6 +97,7 @@ VertexOutput vertex_main(uint vertex_id : SV_VertexID)
     // That matrix does not fit the push-constant budget, so it waits for a 
     // per object buffer.
     output.world_normal = mul((float3x3)pc.model, vertex.normal);
+    output.world_tangent = float4(mul((float3x3)pc.model, vertex.tangent.xyz), vertex.tangent.w);
     output.uv = vertex.uv;
     return output;
 }
@@ -168,6 +171,26 @@ float3 evaluate_brdf(float3 normal, float3 view, float3 light_dir, float3 albedo
     return (k_diffuse * albedo / k_pi + specular) * n_dot_l;
 }
 
+float3 apply_normal_map(float3 world_normal, float4 world_tangent, uint normal_texture,
+                        float normal_scale, float2 uv)
+{
+    const float3 n = normalize(world_normal);
+
+    // Gram-Schmidt. Interpolating across a triangle leaves T no longer exactly
+    // perpendicular to N, and a skewed basis tilts every mapped normal.
+    const float3 t = normalize(world_tangent.xyz - n * dot(n, world_tangent.xyz));
+    // The w sign is what makes mirrored UV islands map correctly; drop it and
+    // half of a symmetric model lights inside out.
+    const float3 b = cross(n, t) * world_tangent.w;
+
+    float3 sampled = textures[normal_texture].Sample(uv).xyz * 2.0 - 1.0;
+    sampled.xy *= normal_scale;
+
+    // Written out rather than mul(v, float3x3(t, b, n)): this is exactly that
+    // transform, but it cannot be silently transposed by a convention mismatch.
+    return normalize(sampled.x * t + sampled.y * b + sampled.z * n);
+}
+
 [shader("fragment")]
 float4 fragment_main(VertexOutput input) : SV_Target
 {
@@ -175,7 +198,9 @@ float4 fragment_main(VertexOutput input) : SV_Target
     const float4 base_color = textures[material.base_color_texture].Sample(input.uv) * material.base_color_factor;
 
     // Interpolating between two unit vectors shortens the result, so renormalize.
-    const float3 normal = normalize(input.world_normal);
+    const float3 normal = apply_normal_map(input.world_normal, input.world_tangent,
+                                           material.normal_texture, material.normal_scale,
+                                           input.uv);
     const float3 view = normalize(pc.frame.camera_position - input.world_position);
     const float3 albedo = base_color.rgb;
 

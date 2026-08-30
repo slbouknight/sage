@@ -125,6 +125,7 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
     std::vector<std::uint32_t> indices;
     std::vector<glm::vec3> positions;
     std::vector<glm::vec3> normals;
+    std::vector<glm::vec4> tangents;
     std::vector<glm::vec2> uvs;
 
     const std::size_t scene_index = asset.defaultScene.value_or(0);
@@ -160,7 +161,7 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
             source.normalTexture.has_value()
                 ? resolve_texture(asset, *source.normalTexture, path.parent_path(), textures,
                                   image_slots, TextureColorSpace::linear)
-                : TextureRegistry::k_fallback_slot;
+                : TextureRegistry::k_flat_normal_slot;
 
         material.emissive_texture =
             source.emissiveTexture.has_value()
@@ -228,10 +229,21 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
                     SAGE_LOG_WARN("Primitive has no TEXCOORD_0; textures will not map");
                 }
 
+                // TANGENT is optional.
+                tangents.assign(vertex_count, glm::vec4(1.0F, 0.0F, 0.0F, 1.0F));
+                if (const auto* tangent_attribute = primitive.findAttribute("TANGENT");
+                    tangent_attribute != primitive.attributes.end()) {
+                    fastgltf::copyFromAccessor<glm::vec4>(
+                        asset, asset.accessors[tangent_attribute->accessorIndex], tangents.data());
+                } else {
+                    SAGE_LOG_WARN("Primitive has no TANGENT; normal mapping will be wrong");
+                }
+
                 vertices.resize(vertex_count);
                 for (std::size_t i = 0; i < vertex_count; ++i) {
                     vertices[i].position = positions[i];
                     vertices[i].normal = normals[i];
+                    vertices[i].tangent = tangents[i];
                     vertices[i].uv = uvs[i];
 
                     const glm::vec3 world_position =

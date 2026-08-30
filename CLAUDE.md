@@ -41,11 +41,11 @@ documented reasoning matter as much as features.
   Inserted ahead of the editor because the sampled-image half of the bindless set
   has never been exercised, and object-space normals break the moment two objects
   rotate independently. One directional light, base colour only; the BRDF is M5's
-  job and IBL is M7's. ← current
+  job and IBL is M7's.
 - **M5** — BRDF and lights: Cook-Torrance GGX on the metallic-roughness workflow,
   normal mapping off `TANGENT`, the remaining three Lantern maps wired through
   the material table, and a `Light` type — directional and point, with
-  attenuation — living in a storage buffer rather than as shader constants.
+  attenuation — read from data rather than hardcoded as shader constants.
   The two ship together because a BRDF is evaluated per light: splitting them
   means writing the loop body with the loop removed, then re-adding it later.
   Watch the format split — base colour and emissive are sRGB, normal and
@@ -53,6 +53,8 @@ documented reasoning matter as much as features.
   Still no IBL: the only ambient term is a constant. Renders straight to the
   swapchain, so specular highlights above 1.0 clamp — a known and accepted
   limitation until M6 introduces the HDR offscreen target it already assumes.
+  Lights live in the per-frame buffer, not a storage buffer of their own; see
+  [ADR 0022](docs/adr/0022-lights-in-the-per-frame-buffer.md). ← current
 - **M6** — CUDA interop: `ComputePass` interface, exportable VMA pool, shared timeline
   semaphore. Introduces the HDR offscreen target and a full-screen resolve pass,
   deferred out of M5 — the same machinery a G-buffer needs later. Keep the first
