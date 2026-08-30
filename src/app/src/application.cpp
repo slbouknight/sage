@@ -146,17 +146,12 @@ Application::Application(const std::filesystem::path& model_path)
                     .cache = pipeline_cache_.handle(),
                 }),
       frame_pacer_(device_) {
-    scene_ = gpu::load_gltf(model_path, geometry_registry_, texture_registry_);
+    const gpu::LoadedScene loaded =
+        gpu::load_gltf(model_path, geometry_registry_, texture_registry_, scene_graph_);
 
-    // TEMPORARY: Lantern sets neither factor so glTF defaults to 1.0.
-    // Fully metallic, fully rough, no diffuse lobe at all. Hardcoding for now
-    // to see better results.
-    scene_.materials[0].metallic = 0.1F;
-    scene_.materials[0].roughness = 0.4F;
+    material_registry_.upload(loaded.materials);
 
-    material_registry_.upload(scene_.materials);
-
-    frame_camera_on(scene_.bounds_min, scene_.bounds_max);
+    frame_camera_on(loaded.bounds_min, loaded.bounds_max);
 }
 
 Application::~Application() {
@@ -283,11 +278,16 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     frame_buffer_.write(&frame_data, sizeof(frame_data), frame_offset);
     const VkDeviceAddress frame_address = frame_buffer_.device_address() + frame_offset;
 
-    for (const gpu::SceneNode& node : scene_.nodes) {
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.has_mesh) {
+            // Pure transform nodes: glTF hierarchy nodes, and the per-load root.
+            continue;
+        }
+
         PushConstants push{};
         push.vertex_address = node.mesh.vertex_address;
         push.frame_address = frame_address;
-        push.model = node.transform;
+        push.model = node.world_transform;
         push.material_index = node.material_index;
         vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                            &push);

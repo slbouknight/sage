@@ -14,6 +14,7 @@
 #include <sage/gpu/pipeline.hpp>
 #include <sage/gpu/pipeline_cache.hpp>
 #include <sage/gpu/sampler.hpp>
+#include <sage/gpu/scene.hpp>
 #include <sage/gpu/surface.hpp>
 #include <sage/gpu/swapchain.hpp>
 #include <sage/gpu/texture_registry.hpp>
@@ -58,7 +59,7 @@ private:
     gpu::TextureRegistry texture_registry_;
     gpu::MaterialRegistry material_registry_;
     gpu::Buffer frame_buffer_;
-    gpu::Scene scene_;
+    gpu::SceneGraph scene_graph_;
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;
     gpu::PipelineCache pipeline_cache_;
