@@ -220,7 +220,11 @@ void Uploader::upload_to_image(VkImage image, VkExtent2D extent, std::uint32_t m
         image, 0, mip_levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     to_transfer_dst.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
     to_transfer_dst.srcAccessMask = VK_ACCESS_2_NONE;
-    to_transfer_dst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    // A layout transition is itself a write, and this one covers every level.
+    // COPY alone would leave it unordered against the blits that write levels 1
+    // and up -- a write-after-write hazard synchronization validation catches
+    // and ordinary validation does not.
+    to_transfer_dst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT;
     to_transfer_dst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     record_barriers(command_buffer, &to_transfer_dst, 1);
 

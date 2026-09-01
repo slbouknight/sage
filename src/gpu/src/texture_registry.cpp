@@ -50,16 +50,48 @@ std::uint32_t TextureRegistry::register_texture(std::unique_ptr<Texture> texture
 
 std::uint32_t TextureRegistry::add(const std::filesystem::path& path,
                                    TextureColorSpace color_space) {
+    // Normalised so "assets/x/../x/map.png" and "assets/x/map.png" share a slot.
+    // weakly_canonical rather than canonical: it tolerates a path that does not
+    // resolve, which the existence check below is about to report anyway.
+    std::error_code error;
+    std::filesystem::path key_path = std::filesystem::weakly_canonical(path, error);
+    if (error) {
+        key_path = path;
+    }
+
+    const auto key = std::make_pair(key_path, color_space);
+    if (const auto cached = by_path_.find(key); cached != by_path_.end()) {
+        return cached->second;
+    }
+
     // Checked before constructing, because Texture aborts on a decode failure
     // and a missing map should degrade rather than take the model down.
-    std::error_code error;
-    if (!std::filesystem::exists(path, error)) {
+    if (!std::filesystem::exists(key_path, error)) {
         SAGE_LOG_WARN("Texture not found, using fallback: {}", path.string());
+        // Deliberately not cached: the fallback is not this texture, and a file
+        // that appears later should be picked up on the next load.
         return k_fallback_slot;
     }
 
-    return register_texture(
-        std::make_unique<Texture>(allocator_, device_, uploader_, path, color_space));
+    const std::uint32_t slot = register_texture(
+        std::make_unique<Texture>(allocator_, device_, uploader_, key_path, color_space));
+    by_path_.emplace(key, slot);
+    return slot;
+}
+
+void TextureRegistry::reset() {
+    // Every scene slot is pointed back at the white fallback before its image
+    // is destroyed. PARTIALLY_BOUND only excuses descriptors that were never
+    // written; one left naming a dead view is dangling whether or not a shader
+    // reaches it, and the fallback is still alive to name.
+    for (std::uint32_t slot = k_reserved_slots; slot < next_slot_; ++slot) {
+        bindless_set_.write_sampled_image(slot, textures_[k_fallback_slot]->view(),
+                                          sampler_.handle());
+    }
+
+    textures_.resize(k_reserved_slots);
+    next_slot_ = k_reserved_slots;
+    by_path_.clear();
 }
 
 TextureRegistry::~TextureRegistry() = default;

@@ -24,7 +24,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <vector>
+
+#include "file_picker.hpp"
 
 namespace sage::app {
 
@@ -49,17 +52,51 @@ private:
     // Split out of record_scene because the UI draws into the same swapchain
     // image and must get there before it is handed to the presentation engine.
     static void transition_to_present(VkCommandBuffer command_buffer, VkImage image);
+    // Lays a dockspace over the viewport and, on the first frame, docks the
+    // panels into it. Panels place themselves by name from then on, which is
+    // what stops a new one landing on top of an existing one.
+    void draw_dockspace();
     void draw_ui();
     void draw_hierarchy_panel();
+
+    // Loads a file into the registries and the graph. Returns false when the
+    // file could not be read; the scene is left as it was in that case, unless
+    // `replace` already emptied it.
+    bool load_model(const std::filesystem::path& path, bool replace);
+    // Rewinds all three registries and empties the graph. Waits for the device
+    // to go idle first: in-flight command buffers still name this geometry, and
+    // TextureRegistry::reset destroys live images.
+    void clear_scene();
+    // Runs a queued load at the top of a frame, before any recording. Loading
+    // from inside the picker's own draw call would mean blocking uploads and a
+    // wait_idle in the middle of a frame whose command buffer is already begun.
+    void service_pending_load();
     // Children per node, indexed by node index. Rebuilt each frame rather than
     // stored; see draw_hierarchy_panel for why.
     using ChildTable = std::vector<std::vector<std::uint32_t>>;
     void draw_hierarchy_node(std::uint32_t index, const ChildTable& children);
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
-    // Viewport size when the stats panel was last anchored, so a window resize
-    // can re-pin it to the corner without overriding the user dragging it.
-    glm::vec2 last_viewport_size_{0.0F};
+    bool dock_layout_built_ = false;
+
+    // The 3D view's rect within the swapchain image: the dockspace's central
+    // node, in framebuffer pixels. The scene is drawn here rather than across
+    // the whole image, so it is neither hidden behind panels nor framed for a
+    // viewport wider than the visible one.
+    VkRect2D viewport_rect_{};
+
+    struct SceneBounds {
+        glm::vec3 min{0.0F};
+        glm::vec3 max{0.0F};
+    };
+    // Framing is deferred to just after the dockspace is laid out, because it
+    // depends on the central node's aspect ratio -- which does not exist yet
+    // when the constructor loads a model named on the command line.
+    std::optional<SceneBounds> pending_frame_;
+
+    FilePicker file_picker_;
+    std::optional<FilePicker::Request> pending_load_;
+    bool pending_clear_ = false;
 
     core::Camera camera_;
     gpu::Window window_;

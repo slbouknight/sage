@@ -14,6 +14,10 @@ constexpr VkDeviceSize k_vertex_alignment = 16;
 // vkCmdBindIndexBuffer requires the offset be a multiple of the index size.
 constexpr VkDeviceSize k_index_alignment = sizeof(std::uint32_t);
 
+constexpr VkDeviceSize align_up(VkDeviceSize value, VkDeviceSize alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
 }  // namespace
 
 GeometryRegistry::GeometryRegistry(const Allocator& allocator, const Device& device,
@@ -31,16 +35,6 @@ GeometryRegistry::GeometryRegistry(const Allocator& allocator, const Device& dev
     SAGE_LOG_INFO("Geometry registry: {} KiB device-local", capacity / 1024);
 }
 
-VkDeviceSize GeometryRegistry::allocate(VkDeviceSize size, VkDeviceSize alignment) {
-    SAGE_VERIFY((alignment & (alignment - 1)) == 0, "Alignment must be a power of two");
-
-    const VkDeviceSize aligned = (head_ + alignment - 1) & ~(alignment - 1);
-    SAGE_VERIFY(aligned + size <= capacity_, "GeometryRegistry: out of capacity");
-
-    head_ = aligned + size;
-    return aligned;
-}
-
 GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
                                                       VkDeviceSize vertex_bytes,
                                                       const std::uint32_t* indices,
@@ -50,8 +44,19 @@ GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
 
     const VkDeviceSize index_bytes = VkDeviceSize{index_count} * sizeof(std::uint32_t);
 
-    const VkDeviceSize vertex_offset = allocate(vertex_bytes, k_vertex_alignment);
-    const VkDeviceSize index_offset = allocate(index_bytes, k_index_alignment);
+    // Both regions are laid out before either is committed. Advancing the head
+    // per region would leave the vertices stranded in the buffer when only the
+    // indices failed to fit.
+    const VkDeviceSize vertex_offset = align_up(head_, k_vertex_alignment);
+    const VkDeviceSize index_offset = align_up(vertex_offset + vertex_bytes, k_index_alignment);
+    const VkDeviceSize end = index_offset + index_bytes;
+
+    if (end > capacity_) {
+        SAGE_LOG_ERROR("Geometry registry full: mesh needs {} KiB, {} KiB of {} KiB free",
+                       (end - head_) / 1024, (capacity_ - head_) / 1024, capacity_ / 1024);
+        return {};
+    }
+    head_ = end;
 
     // The two regions are read by different stages, so each acquire barrier
     // gets the scope that actually applies to it.
@@ -66,6 +71,13 @@ GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
     view.index_offset = index_offset;
     view.index_count = index_count;
     return view;
+}
+
+void GeometryRegistry::reset() {
+    // Nothing to free and nothing to clear: the buffer stays, and every byte
+    // beyond the head is dead the moment the head moves. Uploads overwrite it
+    // in place, so stale contents are never read.
+    head_ = 0;
 }
 
 GeometryRegistry::~GeometryRegistry() {

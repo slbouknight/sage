@@ -75,13 +75,15 @@ documented reasoning matter as much as features. CUDA was cut after M5; see
   ImGui's Vulkan backend supports dynamic rendering via `UseDynamicRendering` and
   `PipelineRenderingCreateInfo`, so the no-`VkRenderPass` prohibition survives.
   New dependency: `imgui` (`docking-experimental`, `glfw-binding`,
-  `vulkan-binding`). ← current
+  `vulkan-binding`). Done. Loading turned out to be additive as well as
+  replacing, for one cursor's worth of extra work — see
+  [ADR 0026](docs/adr/0026-runtime-glTF-loading.md).
 - **M7** — Selection and manipulation: an `R32_UINT` object-ID attachment written
   alongside colour, giving cursor picking by one-texel readback *and* outline
   highlighting from ID discontinuity in a post pass — one buffer, both features,
   and no stencil, which matters because the depth format is `D32_SFLOAT`. Then a
   properties panel over the selection and ImGuizmo writing transforms back into
-  the scene graph. New dependency: `imguizmo`.
+  the scene graph. New dependency: `imguizmo`. ← current
 - **M8** — Presentation and capture: HDR offscreen target
   (`R16G16B16A16_SFLOAT`), a full-screen tonemap resolve, and screenshot-to-PNG
   reusing `stb_image_write` from the stb port. Speculars have clamped against the

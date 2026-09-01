@@ -1,6 +1,8 @@
 #include <sage/core/assert.hpp>
 #include <sage/core/log.hpp>
 #include <sage/gpu/gltf_loader.hpp>
+#include <sage/gpu/material.hpp>
+#include <sage/gpu/material_registry.hpp>
 #include <sage/gpu/scene.hpp>
 #include <sage/gpu/texture_registry.hpp>
 #include <sage/gpu/vertex.hpp>
@@ -25,13 +27,13 @@ namespace sage::gpu {
 
 namespace {
 
-fastgltf::Asset parse(const std::filesystem::path& path) {
+std::optional<fastgltf::Asset> parse(const std::filesystem::path& path) {
     auto data = fastgltf::GltfDataBuffer::FromPath(path);
     if (data.error() != fastgltf::Error::None) {
         SAGE_LOG_ERROR("Could not read glTF file: {} ({})", path.string(),
                        fastgltf::getErrorMessage(data.error()));
+        return std::nullopt;
     }
-    SAGE_VERIFY(data.error() == fastgltf::Error::None, "Failed to read glTF file");
 
     fastgltf::Parser parser;
     // LoadExternalBuffers pulls in the .bin sidecar. Images are deliberately
@@ -45,8 +47,8 @@ fastgltf::Asset parse(const std::filesystem::path& path) {
     if (expected.error() != fastgltf::Error::None) {
         SAGE_LOG_ERROR("Could not parse glTF: {} ({})", path.string(),
                        fastgltf::getErrorMessage(expected.error()));
+        return std::nullopt;
     }
-    SAGE_VERIFY(expected.error() == fastgltf::Error::None, "Failed to parse glTF");
 
     return std::move(expected.get());
 }
@@ -129,6 +131,7 @@ struct LoadState {
     glm::vec3 bounds_min{std::numeric_limits<float>::max()};
     glm::vec3 bounds_max{std::numeric_limits<float>::lowest()};
     std::size_t mesh_count = 0;
+    std::size_t dropped_count = 0;
 };
 
 // Uploads one primitive and returns how to draw it. Empty when the primitive is
@@ -209,10 +212,18 @@ std::optional<GeometryRegistry::MeshView> upload_primitive(
     scratch.indices.resize(index_accessor.count);
     fastgltf::copyFromAccessor<std::uint32_t>(asset, index_accessor, scratch.indices.data());
 
+    const GeometryRegistry::MeshView view = registry.add_mesh(
+        scratch.vertices.data(), sizeof(Vertex) * scratch.vertices.size(), scratch.indices.data(),
+        static_cast<std::uint32_t>(scratch.indices.size()));
+    if (!view.valid()) {
+        // Out of geometry capacity. add_mesh has already said so; carrying on
+        // yields a partial model, which beats losing the whole file.
+        ++state.dropped_count;
+        return std::nullopt;
+    }
+
     ++state.mesh_count;
-    return registry.add_mesh(scratch.vertices.data(), sizeof(Vertex) * scratch.vertices.size(),
-                             scratch.indices.data(),
-                             static_cast<std::uint32_t>(scratch.indices.size()));
+    return view;
 }
 
 // Adds one glTF node and everything beneath it. Depth-first, and the node is
@@ -220,7 +231,8 @@ std::optional<GeometryRegistry::MeshView> upload_primitive(
 // parents-precede-children invariant SceneGraph::add_node enforces.
 void add_gltf_node(const fastgltf::Asset& asset, std::size_t node_index, NodeHandle parent,
                    const glm::mat4& parent_world, SceneGraph& graph, GeometryRegistry& registry,
-                   LoadScratch& scratch, LoadState& state, std::uint32_t default_material_index) {
+                   LoadScratch& scratch, LoadState& state, std::uint32_t material_base,
+                   std::uint32_t default_material_index) {
     const fastgltf::Node& node = asset.nodes[node_index];
 
     // getTransformMatrix against the default identity base yields this node's
@@ -246,9 +258,12 @@ void add_gltf_node(const fastgltf::Asset& asset, std::size_t node_index, NodeHan
                 upload_primitive(asset, primitive, registry, scratch, world, state);
 
             if (view.has_value()) {
+                // materialIndex is local to this file. The registry is shared
+                // across loads, so the block's base is what turns one into the
+                // other; default_material_index is already a table index.
                 const std::uint32_t material_index =
                     primitive.materialIndex.has_value()
-                        ? static_cast<std::uint32_t>(*primitive.materialIndex)
+                        ? material_base + static_cast<std::uint32_t>(*primitive.materialIndex)
                         : default_material_index;
 
                 if (attach_directly) {
@@ -265,21 +280,28 @@ void add_gltf_node(const fastgltf::Asset& asset, std::size_t node_index, NodeHan
 
     for (const std::size_t child_index : node.children) {
         add_gltf_node(asset, child_index, handle, world, graph, registry, scratch, state,
-                      default_material_index);
+                      material_base, default_material_index);
     }
 }
 
 }  // namespace
 
-LoadedScene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
-                      TextureRegistry& textures, SceneGraph& graph) {
-    const fastgltf::Asset asset = parse(path);
+std::optional<LoadedScene> load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
+                                     TextureRegistry& textures, MaterialRegistry& materials,
+                                     SceneGraph& graph) {
+    const std::optional<fastgltf::Asset> parsed = parse(path);
+    if (!parsed.has_value()) {
+        return std::nullopt;
+    }
+    const fastgltf::Asset& asset = *parsed;
 
     LoadedScene loaded;
     // Index-for-index with the glTF's own material list, so a primitive's
-    // materialIndex maps across untouched, plus one appended fallback carrying
-    // glTF's prescribed defaults for primitives that name no material.
-    loaded.materials.reserve(asset.materials.size() + 1);
+    // materialIndex maps across by a single added base, plus one appended
+    // fallback carrying glTF's prescribed defaults for primitives that name no
+    // material.
+    std::vector<Material> material_table;
+    material_table.reserve(asset.materials.size() + 1);
     std::unordered_map<std::uint64_t, std::uint32_t> image_slots;
     for (const fastgltf::Material& source : asset.materials) {
         Material material;
@@ -318,10 +340,13 @@ LoadedScene load_gltf(const std::filesystem::path& path, GeometryRegistry& regis
         material.emissive_factor = glm::make_vec3(source.emissiveFactor.data());
         material.normal_scale =
             source.normalTexture.has_value() ? source.normalTexture->scale : 1.0F;
-        loaded.materials.push_back(material);
+        material_table.push_back(material);
     }
-    const auto default_material_index = static_cast<std::uint32_t>(loaded.materials.size());
-    loaded.materials.emplace_back();
+    // Appended before the walk, because a node's material index is written
+    // during it and needs the base this block landed at.
+    const std::uint32_t material_base = materials.append(material_table);
+    const auto default_material_index =
+        material_base + static_cast<std::uint32_t>(material_table.size()) - 1;
 
     // One node per load, so a file can be moved or removed as a unit and the
     // hierarchy panel has something to collapse.
@@ -332,23 +357,34 @@ LoadedScene load_gltf(const std::filesystem::path& path, GeometryRegistry& regis
     const std::size_t scene_index = asset.defaultScene.value_or(0);
     for (const std::size_t node_index : asset.scenes[scene_index].nodeIndices) {
         add_gltf_node(asset, node_index, loaded.root, glm::mat4(1.0F), graph, registry, scratch,
-                      state, default_material_index);
+                      state, material_base, default_material_index);
     }
-
-    SAGE_VERIFY(state.mesh_count > 0, "glTF contained no drawable triangle primitives");
 
     // The graph owns composition from here; the walk's matrices only fed bounds.
     graph.update_transforms();
 
-    loaded.bounds_min = state.bounds_min;
-    loaded.bounds_max = state.bounds_max;
+    loaded.mesh_count = state.mesh_count;
+    if (state.mesh_count > 0) {
+        loaded.bounds_min = state.bounds_min;
+        loaded.bounds_max = state.bounds_max;
+    }
+    // Otherwise the bounds stay zeroed rather than the inverted sentinels the
+    // walk started from, which would frame a camera at a nonsense distance.
+
+    if (state.dropped_count > 0) {
+        SAGE_LOG_WARN("Dropped {} primitive(s) from {}: geometry buffer full", state.dropped_count,
+                      path.filename().string());
+    }
+    if (state.mesh_count == 0) {
+        SAGE_LOG_WARN("{} contained no drawable triangle primitives", path.filename().string());
+    }
 
     SAGE_LOG_INFO(
-        "Loaded {}: {} nodes, {} meshes, {} material(s) plus one default, bounds "
+        "Loaded {}: {} nodes, {} meshes, {} material(s) plus one default at base {}, bounds "
         "({:.2f}, {:.2f}, {:.2f}) to ({:.2f}, {:.2f}, {:.2f})",
         path.filename().string(), graph.size(), state.mesh_count, asset.materials.size(),
-        loaded.bounds_min.x, loaded.bounds_min.y, loaded.bounds_min.z, loaded.bounds_max.x,
-        loaded.bounds_max.y, loaded.bounds_max.z);
+        material_base, loaded.bounds_min.x, loaded.bounds_min.y, loaded.bounds_min.z,
+        loaded.bounds_max.x, loaded.bounds_max.y, loaded.bounds_max.z);
 
     return loaded;
 }
