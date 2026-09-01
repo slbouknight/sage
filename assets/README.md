@@ -1,42 +1,75 @@
 # Assets
 
-Third-party test assets, vendored so a fresh clone runs without fetching
-anything.
+Test models are **fetched, not vendored**. This directory holds only this file
+in a fresh clone; everything else here is gitignored.
 
-Point the app at any other glTF with a path argument:
+```bash
+python3 tools/fetch_assets.py            # all three models, ~61 MB
+python3 tools/fetch_assets.py lantern    # just one
+python3 tools/fetch_assets.py --list     # names and upstream URLs
+```
+
+Stdlib only, so it runs on a fresh clone with nothing installed. Files already
+present are skipped, so re-running it is cheap and `--force` re-downloads.
+
+Fetching is optional. The app starts on an empty scene and waits for the **Load
+glTF** panel, so a clone with no assets still builds, runs and renders — it just
+has nothing to show until you point it at something.
+
+Point it at any glTF on disk, fetched or not:
 
 ```bash
 ./build/debug/src/app/sage path/to/model.gltf
 ```
 
-## lantern/
+## Why these are not committed
 
-`Lantern.gltf`, `Lantern.bin`, and all four texture maps — `Lantern_baseColor`,
-`Lantern_roughnessMetallic`, `Lantern_normal`, `Lantern_emissive` — from the
-[Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets)
-repository, unmodified and at source resolution (2048x2048 each).
+They were, through M5, and [ADR 0014](../docs/adr/0014-vendor-a-cc0-test-asset.md)
+argued for it: a fresh clone that runs without fetching anything is worth real
+bytes. That held at 9 MB for one model. M6 made loading arbitrary files a
+feature rather than a fixed path, and a second and third model took the
+directory to 56 MB — at which point every contributor pays a clone for art the
+renderer does not depend on. Fetching restores the property that mattered
+(assets are one command away) without the property that stopped scaling (they
+are in everyone's history forever).
 
-© 2017 Microsoft, © 2018 Frank Galligan.
-Licensed under [Creative Commons Zero v1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/legalcode)
-(public domain dedication).
+## The models
 
-Chosen because it is CC0 rather than a bespoke license, and structurally
-non-trivial: a parent node carrying a rotation over three translated children,
-which exercises node-hierarchy flattening rather than just single-mesh loading.
-It also carries `TEXCOORD_0` and `TANGENT` on every primitive and a complete
-metallic-roughness material, so the same asset serves base-colour texturing now
-and normal mapping plus a full BRDF later without needing to be replaced.
+All three come from
+[Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets),
+unmodified and at source resolution. Each model's `LICENSE.md` is fetched
+alongside it. The separate-file `glTF/` variant is used rather than
+`glTF-Binary/`: sage reads images by URI, and a `.glb` keeps them in a buffer
+view, which the loader reports and falls back to white for.
 
-The complete set costs about 9 MB. That is deliberate: the maps are committed
-unmodified so the vendored files are byte-identical to upstream, and every one
-of them is read by a planned milestone. An earlier revision vendored only a
-downscaled base colour, which made sense while materials were the end of the
-road; extending the ladder to cover a BRDF made the rest of the set load-bearing.
+| Directory | Model | Size | Materials | Notes |
+| --- | --- | --- | --- | --- |
+| `lantern/` | Lantern | 9.6 MB | 1 | A parent node with a rotation over three translated children, so it exercises hierarchy rather than single-mesh loading. `TANGENT` throughout. 25.85 units tall. |
+| `flight_helmet/` | FlightHelmet | 48.4 MB | 6 | The multi-material case: six materials over six meshes sharing five texture groups, since `HoseMat` reuses `RubberWoodMat`'s maps. `TANGENT` throughout. 0.72 units tall. |
+| `damaged_helmet/` | DamagedHelmet | 3.8 MB | 1 | The only JPEG-textured model here, and the only one **without `TANGENT`** — the loader substitutes an arbitrary tangent and warns, so its normal map does not shade correctly. 3.3 units tall. |
+
+Two things worth knowing before comparing them.
+
+**Scale varies by a factor of 36.** Every load lands at the world origin with an
+identity transform, so loading the lantern and the flight helmet together puts a
+speck at the foot of a street lamp. M7's gizmos are what fix that.
+
+**Occlusion is never read.** glTF packs occlusion, roughness and metallic into
+one image's R, G and B, and the renderer samples only G and B. Ambient occlusion
+has nothing to modulate while the ambient term is a constant, so it arrives with
+IBL in v2. `DamagedHelmet`'s separate `Default_AO.jpg` is unused for the same
+reason.
+
+Why FlightHelmet in particular: it is the first asset here with more than one
+material, and multi-material files are what exercise `MaterialRegistry::append`'s
+base offset. A bug where a file's local material indices were not rebased is
+invisible against a single-material model, and one was in fact live until a
+second model was loaded beside the first.
 
 ## uv_grid.png
 
-Not third-party. Generated by `tools/make_uv_grid.py`, and used as a texture
-test pattern: a red block marks UV (0,0) and a green block UV (1,0), so a
-flipped V axis is obvious rather than merely suspicious. Kept alongside the real
-maps because a diagnostic pattern isolates UV and mip bugs far better than
+Not third-party, and not committed either — generated by
+`python3 tools/make_uv_grid.py`. A texture test pattern: a red block marks UV
+(0,0) and a green block UV (1,0), so a flipped V axis is obvious rather than
+merely suspicious. A diagnostic pattern isolates UV and mip bugs far better than
 photographic art does.

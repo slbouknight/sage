@@ -23,17 +23,32 @@ MaterialRegistry::MaterialRegistry(const Allocator& allocator, const Uploader& u
                   size_ / 1024, k_storage_slot);
 }
 
-void MaterialRegistry::upload(const std::vector<Material>& materials) {
+std::uint32_t MaterialRegistry::append(const std::vector<Material>& materials) {
     SAGE_VERIFY(!materials.empty(), "MaterialRegistry: nothing to upload");
-    SAGE_VERIFY(materials.size() <= capacity_, "MaterialRegistry: out of capacity");
+    // Asserted rather than reported, unlike GeometryRegistry: materials are 64
+    // bytes each against a capacity in the thousands, so a file that overruns
+    // this is a reason to raise the constant, not a case to degrade gracefully.
+    SAGE_VERIFY(materials.size() <= capacity_ - count_, "MaterialRegistry: out of capacity");
+
+    const std::uint32_t base = count_;
 
     // FRAGMENT_SHADER because the material is read per fragment. Vertex stages
     // never touch it, so widening the destination scope would only over-order.
-    uploader_.upload_to_buffer(
-        allocation_.buffer, 0, materials.data(), materials.size() * sizeof(Material),
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    uploader_.upload_to_buffer(allocation_.buffer, VkDeviceSize{base} * sizeof(Material),
+                               materials.data(), materials.size() * sizeof(Material),
+                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    SAGE_LOG_INFO("Uploaded {} material(s)", materials.size());
+    count_ += static_cast<std::uint32_t>(materials.size());
+    SAGE_LOG_INFO("Uploaded {} material(s) at index {}; {} of {} slots used", materials.size(),
+                  base, count_, capacity_);
+    return base;
+}
+
+void MaterialRegistry::reset() {
+    // The descriptor names the buffer, not its contents, so it survives
+    // untouched -- only the cursor moves.
+    count_ = 0;
 }
 
 MaterialRegistry::~MaterialRegistry() {

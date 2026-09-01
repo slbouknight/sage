@@ -1,41 +1,40 @@
 #pragma once
 
 #include <sage/core/math.hpp>
-#include <sage/gpu/geometry_registry.hpp>
-#include <sage/gpu/material.hpp>
+#include <sage/gpu/scene.hpp>
 
-#include <cstdint>
 #include <filesystem>
-#include <vector>
+#include <optional>
 
 namespace sage::gpu {
 
+class GeometryRegistry;
+class MaterialRegistry;
 class TextureRegistry;
 
-// One drawable primitive plus where it sits in the scene.
-
-struct SceneNode {
-    GeometryRegistry::MeshView mesh;
-    glm::mat4 transform{1.0F};
-    // Index into Scene::materials, not into glTF's own material list
-    std::uint32_t material_index = 0;
-};
-
-// A loaded scene, flattened: the node hierarchy is already resolved to world
-// transforms, so drawing is a flat loop with no tree walk per frame.
-struct Scene {
-    std::vector<SceneNode> nodes;
-    // World-space bounds, for framing a camera on an arbitrary model.
+// Everything a glTF load produces other than the nodes, which go straight into
+// the SceneGraph rather than being returned.
+struct LoadedScene {
+    // World-space, for framing a camera on an arbitrary model. Equal when the
+    // file drew nothing.
     glm::vec3 bounds_min{0.0F};
     glm::vec3 bounds_max{0.0F};
-    // The scene's material table, uploaded verbatim to the MaterialRegistry.
-    std::vector<Material> materials;
+    // Everything from the file is parented under this one node, so a load can
+    // later be moved, hidden or removed as a unit.
+    NodeHandle root;
+    std::size_t mesh_count = 0;
 };
 
-// Loads geometry from a glTF or GLB file into the registry. Materials,
-// textures, animations, and cameras are ignored for now. Blocks until every mesh
-// is resident on the GPU.
-[[nodiscard]] Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
-                              TextureRegistry& textures);
+// Loads a glTF or GLB file, appending its hierarchy to `graph` rather than
+// flattening it, and its materials to `materials`. Blocks until every mesh and
+// texture is resident on the GPU.
+//
+// Returns nothing when the file cannot be read or parsed, leaving every
+// registry as it found them. The path comes from a file picker, so a bad choice
+// has to be a message rather than an abort.
+[[nodiscard]] std::optional<LoadedScene> load_gltf(const std::filesystem::path& path,
+                                                   GeometryRegistry& registry,
+                                                   TextureRegistry& textures,
+                                                   MaterialRegistry& materials, SceneGraph& graph);
 
 }  // namespace sage::gpu

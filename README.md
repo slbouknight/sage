@@ -48,12 +48,20 @@ was scoped, seriously considered, and then cut.
 scripts/build.sh debug --run
 ```
 
-That loads the vendored [Lantern](assets/README.md) sample. Point it at any
-other glTF or GLB with a path argument:
+That opens on an empty scene. Test models are fetched rather than committed:
 
 ```bash
-./build/debug/src/app/sage path/to/model.gltf
+python3 tools/fetch_assets.py
 ```
+
+Then load one from the **Load glTF** panel, or name it on the command line:
+
+```bash
+./build/debug/src/app/sage assets/lantern/Lantern.gltf
+```
+
+See [`assets/README.md`](assets/README.md) for what the three models are and
+why they are not in the repository.
 
 The camera frames itself on whatever it loads. Controls follow Unreal's
 viewport: **hold right mouse** to look, **WASD** to fly, **E**/**Q** for

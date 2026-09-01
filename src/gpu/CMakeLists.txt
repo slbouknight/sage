@@ -9,6 +9,7 @@ if(NOT Vulkan_FOUND)
 endif()
 find_package(fastgltf CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 # stb ships no imported target -- the port exports only Stb_INCLUDE_DIR, so
 # this is an include directory rather than a target_link_libraries entry.
@@ -23,12 +24,14 @@ add_library(sage_gpu STATIC
     src/frame_pacer.cpp
     src/geometry_registry.cpp
     src/gltf_loader.cpp
+    src/imgui_layer.cpp
     src/instance.cpp
     src/material_registry.cpp
     src/physical_device.cpp
     src/pipeline.cpp
     src/pipeline_cache.cpp
     src/sampler.cpp
+    src/scene.cpp
     src/shader_module.cpp
     src/surface.cpp
     src/swapchain.cpp
@@ -55,6 +58,7 @@ target_link_libraries(sage_gpu
     PRIVATE
         sage::compile_options
         glfw
+        imgui::imgui
         GPUOpen::VulkanMemoryAllocator
         fastgltf::fastgltf
     PUBLIC

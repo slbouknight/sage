@@ -22,15 +22,19 @@ jobs:
       - uses: actions/checkout@v4
 
       # Vulkan headers/loader for find_package(Vulkan); xorg + wayland dev
-      # packages are what vcpkg's glfw3 port builds against. CI builds and
-      # runs unit tests only -- the windowed app needs a GPU and a display,
-      # which hosted runners do not have.
+      # packages are what vcpkg's glfw3 port builds against. libgl1-mesa-dev is
+      # for GL/gl.h, which glfw3.h includes unless GLFW_INCLUDE_NONE is set --
+      # sage sets it, but vcpkg's imgui port compiles imgui_impl_glfw.cpp
+      # without it, so the header has to exist even though nothing uses GL.
+      # CI builds and runs unit tests only -- the windowed app needs a GPU and
+      # a display, which hosted runners do not have.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             ninja-build \
             libvulkan-dev \
+            libgl1-mesa-dev \
             libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxext-dev libx11-dev \
             libwayland-dev libxkbcommon-dev wayland-protocols \
@@ -65,6 +69,19 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
 
+      # vcpkg reports only "port X failed" and points at a log file inside the
+      # runner, which is unreachable once the job ends. Without this, a port
+      # failure gives you the wrapper error and nothing actionable.
+      - name: Dump vcpkg failure logs
+        if: failure()
+        run: |
+          for f in "${{ github.workspace }}"/vcpkg/buildtrees/*/*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f"
+            tail -n 200 "$f"
+            echo "::endgroup::"
+          done
+
       - name: Test
         run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
 
@@ -98,6 +115,7 @@ jobs:
             ninja-build \
             clang-tidy \
             libvulkan-dev \
+            libgl1-mesa-dev \
             libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxext-dev libx11-dev \
             libwayland-dev libxkbcommon-dev wayland-protocols \
@@ -125,6 +143,16 @@ jobs:
 
       - name: Configure
         run: cmake --preset debug
+
+      - name: Dump vcpkg failure logs
+        if: failure()
+        run: |
+          for f in "${{ github.workspace }}"/vcpkg/buildtrees/*/*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f"
+            tail -n 200 "$f"
+            echo "::endgroup::"
+          done
 
       - name: Run clang-tidy
         run: |

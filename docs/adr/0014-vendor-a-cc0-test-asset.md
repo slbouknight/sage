@@ -33,3 +33,15 @@ roughly 9 MB. Downscaling was considered and rejected: once the ladder grew a
 BRDF and IBL milestone, every map became load-bearing rather than decorative,
 and a derived file would have to be justified and reproduced where an unmodified
 one need only be attributed. The `images` entries now all resolve.
+
+**Amended in M6:** vendoring is reversed entirely. The decision above traded
+bytes for a clone that runs with nothing fetched, which was a good trade at 9 MB
+for one model. M6 turned loading into a file-picker feature rather than a fixed
+path, and two further models took `assets/` to 56 MB — art the renderer does not
+depend on, in every contributor's history permanently. The models are now
+gitignored and fetched by `tools/fetch_assets.py`, stdlib-only so a fresh clone
+can run it unprepared. The property this ADR was protecting survives in a weaker
+but sufficient form: assets are one command away rather than zero. What made
+that acceptable is that the app no longer needs them — it starts on an empty
+scene and waits for the picker, so a clone with no assets still builds, runs and
+renders.

@@ -25,3 +25,9 @@ no user. Loading a scene larger than the capacity, or unloading anything, forces
 a real allocator; the `MeshView` interface is what keeps that change local to
 the registry. Because device addresses are ordinary integers, a mesh's address
 is `base + offset`, so one address query at construction serves every mesh.
+
+**Amended in M6** ([ADR 0026](0026-runtime-glTF-loading.md)): runtime loading
+did *not* force a real allocator. It needed `reset()` — a rewind of the whole
+buffer — because a scene is cleared as a unit, so the free list this predicted
+still has no user. Overflow now returns an invalid `MeshView` rather than
+asserting, since the capacity is reachable by choosing a file.

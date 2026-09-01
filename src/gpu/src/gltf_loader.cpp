@@ -1,6 +1,9 @@
 #include <sage/core/assert.hpp>
 #include <sage/core/log.hpp>
 #include <sage/gpu/gltf_loader.hpp>
+#include <sage/gpu/material.hpp>
+#include <sage/gpu/material_registry.hpp>
+#include <sage/gpu/scene.hpp>
 #include <sage/gpu/texture_registry.hpp>
 #include <sage/gpu/vertex.hpp>
 
@@ -14,6 +17,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -22,13 +27,13 @@ namespace sage::gpu {
 
 namespace {
 
-fastgltf::Asset parse(const std::filesystem::path& path) {
+std::optional<fastgltf::Asset> parse(const std::filesystem::path& path) {
     auto data = fastgltf::GltfDataBuffer::FromPath(path);
     if (data.error() != fastgltf::Error::None) {
         SAGE_LOG_ERROR("Could not read glTF file: {} ({})", path.string(),
                        fastgltf::getErrorMessage(data.error()));
+        return std::nullopt;
     }
-    SAGE_VERIFY(data.error() == fastgltf::Error::None, "Failed to read glTF file");
 
     fastgltf::Parser parser;
     // LoadExternalBuffers pulls in the .bin sidecar. Images are deliberately
@@ -42,8 +47,8 @@ fastgltf::Asset parse(const std::filesystem::path& path) {
     if (expected.error() != fastgltf::Error::None) {
         SAGE_LOG_ERROR("Could not parse glTF: {} ({})", path.string(),
                        fastgltf::getErrorMessage(expected.error()));
+        return std::nullopt;
     }
-    SAGE_VERIFY(expected.error() == fastgltf::Error::None, "Failed to parse glTF");
 
     return std::move(expected.get());
 }
@@ -111,29 +116,192 @@ std::uint32_t resolve_texture(const fastgltf::Asset& asset, const fastgltf::Text
     return resolve_image(asset, *texture.imageIndex, base_directory, textures, cache, color_space);
 }
 
-}  // namespace
-
-Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
-                TextureRegistry& textures) {
-    const fastgltf::Asset asset = parse(path);
-
-    Scene scene;
-    scene.bounds_min = glm::vec3(std::numeric_limits<float>::max());
-    scene.bounds_max = glm::vec3(std::numeric_limits<float>::lowest());
-
+// Reused across primitives so a scene with many meshes does not reallocate
+// these on every one.
+struct LoadScratch {
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
     std::vector<glm::vec3> positions;
     std::vector<glm::vec3> normals;
     std::vector<glm::vec4> tangents;
     std::vector<glm::vec2> uvs;
+};
 
-    const std::size_t scene_index = asset.defaultScene.value_or(0);
+struct LoadState {
+    glm::vec3 bounds_min{std::numeric_limits<float>::max()};
+    glm::vec3 bounds_max{std::numeric_limits<float>::lowest()};
+    std::size_t mesh_count = 0;
+    std::size_t dropped_count = 0;
+};
 
+// Uploads one primitive and returns how to draw it. Empty when the primitive is
+// not drawable, which is a warning rather than a failure -- one bad primitive
+// should not cost the whole file.
+std::optional<GeometryRegistry::MeshView> upload_primitive(
+    const fastgltf::Asset& asset, const fastgltf::Primitive& primitive, GeometryRegistry& registry,
+    LoadScratch& scratch, const glm::mat4& world, LoadState& state) {
+    if (primitive.type != fastgltf::PrimitiveType::Triangles) {
+        SAGE_LOG_WARN("Skipping non-triangle primitive");
+        return std::nullopt;
+    }
+
+    const auto* position_attribute = primitive.findAttribute("POSITION");
+    if (position_attribute == primitive.attributes.end()) {
+        SAGE_LOG_WARN("Skipping primitive with no POSITION attribute");
+        return std::nullopt;
+    }
+    SAGE_VERIFY(primitive.indicesAccessor.has_value(),
+                "Primitive has no indices despite GenerateMeshIndices");
+
+    const fastgltf::Accessor& position_accessor =
+        asset.accessors[position_attribute->accessorIndex];
+    const std::size_t vertex_count = position_accessor.count;
+
+    scratch.positions.resize(vertex_count);
+    fastgltf::copyFromAccessor<glm::vec3>(asset, position_accessor, scratch.positions.data());
+
+    // NORMAL is optional in glTF. Without it the mesh would be unlit; a fixed
+    // up-facing normal at least keeps it visible.
+    scratch.normals.assign(vertex_count, glm::vec3(0.0F, 1.0F, 0.0F));
+    if (const auto* normal_attribute = primitive.findAttribute("NORMAL");
+        normal_attribute != primitive.attributes.end()) {
+        fastgltf::copyFromAccessor<glm::vec3>(
+            asset, asset.accessors[normal_attribute->accessorIndex], scratch.normals.data());
+    } else {
+        SAGE_LOG_WARN("Primitive has no NORMAL attribute; shading will be flat");
+    }
+
+    // TANGENT is optional. The default is arbitrary but finite; a mesh without
+    // tangents cannot orient a normal map, and deriving them from UVs is real
+    // work no vendored asset needs.
+    scratch.tangents.assign(vertex_count, glm::vec4(1.0F, 0.0F, 0.0F, 1.0F));
+    if (const auto* tangent_attribute = primitive.findAttribute("TANGENT");
+        tangent_attribute != primitive.attributes.end()) {
+        fastgltf::copyFromAccessor<glm::vec4>(
+            asset, asset.accessors[tangent_attribute->accessorIndex], scratch.tangents.data());
+    } else {
+        SAGE_LOG_WARN("Primitive has no TANGENT; normal mapping will be wrong");
+    }
+
+    // TEXCOORD_0 is optional. Zeroed UVs sample a single texel rather than
+    // failing to load. Wrong, but visibly wrong.
+    scratch.uvs.assign(vertex_count, glm::vec2(0.0F));
+    if (const auto* uv_attribute = primitive.findAttribute("TEXCOORD_0");
+        uv_attribute != primitive.attributes.end()) {
+        fastgltf::copyFromAccessor<glm::vec2>(asset, asset.accessors[uv_attribute->accessorIndex],
+                                              scratch.uvs.data());
+    } else {
+        SAGE_LOG_WARN("Primitive has no TEXCOORD_0; textures will not map");
+    }
+
+    scratch.vertices.resize(vertex_count);
+    for (std::size_t i = 0; i < vertex_count; ++i) {
+        scratch.vertices[i].position = scratch.positions[i];
+        scratch.vertices[i].normal = scratch.normals[i];
+        scratch.vertices[i].tangent = scratch.tangents[i];
+        scratch.vertices[i].uv = scratch.uvs[i];
+
+        // Bounds are world-space so a camera can frame the load; the graph has
+        // not composed its transforms yet, so the walk carries the matrix down.
+        const glm::vec3 world_position = glm::vec3(world * glm::vec4(scratch.positions[i], 1.0F));
+        state.bounds_min = glm::min(state.bounds_min, world_position);
+        state.bounds_max = glm::max(state.bounds_max, world_position);
+    }
+
+    const fastgltf::Accessor& index_accessor = asset.accessors[*primitive.indicesAccessor];
+    scratch.indices.resize(index_accessor.count);
+    fastgltf::copyFromAccessor<std::uint32_t>(asset, index_accessor, scratch.indices.data());
+
+    const GeometryRegistry::MeshView view = registry.add_mesh(
+        scratch.vertices.data(), sizeof(Vertex) * scratch.vertices.size(), scratch.indices.data(),
+        static_cast<std::uint32_t>(scratch.indices.size()));
+    if (!view.valid()) {
+        // Out of geometry capacity. add_mesh has already said so; carrying on
+        // yields a partial model, which beats losing the whole file.
+        ++state.dropped_count;
+        return std::nullopt;
+    }
+
+    ++state.mesh_count;
+    return view;
+}
+
+// Adds one glTF node and everything beneath it. Depth-first, and the node is
+// added before recursing into its children -- which is exactly the
+// parents-precede-children invariant SceneGraph::add_node enforces.
+void add_gltf_node(const fastgltf::Asset& asset, std::size_t node_index, NodeHandle parent,
+                   const glm::mat4& parent_world, SceneGraph& graph, GeometryRegistry& registry,
+                   LoadScratch& scratch, LoadState& state, std::uint32_t material_base,
+                   std::uint32_t default_material_index) {
+    const fastgltf::Node& node = asset.nodes[node_index];
+
+    // getTransformMatrix against the default identity base yields this node's
+    // own transform rather than a composed one. Composition is the graph's job
+    // now, which is the entire point of keeping the hierarchy.
+    const glm::mat4 local = glm::make_mat4(fastgltf::getTransformMatrix(node).data());
+    const glm::mat4 world = parent_world * local;
+
+    const std::string node_name =
+        node.name.empty() ? "node " + std::to_string(node_index) : std::string(node.name.c_str());
+    const NodeHandle handle = graph.add_node(parent, local, node_name);
+
+    if (node.meshIndex.has_value()) {
+        const fastgltf::Mesh& mesh = asset.meshes[*node.meshIndex];
+        // A node carries at most one draw. A single-primitive mesh attaches
+        // directly; several become children, so the hierarchy panel stays clean
+        // for the common case instead of showing a wrapper per mesh.
+        const bool attach_directly = mesh.primitives.size() == 1;
+
+        std::size_t primitive_index = 0;
+        for (const fastgltf::Primitive& primitive : mesh.primitives) {
+            const std::optional<GeometryRegistry::MeshView> view =
+                upload_primitive(asset, primitive, registry, scratch, world, state);
+
+            if (view.has_value()) {
+                // materialIndex is local to this file. The registry is shared
+                // across loads, so the block's base is what turns one into the
+                // other; default_material_index is already a table index.
+                const std::uint32_t material_index =
+                    primitive.materialIndex.has_value()
+                        ? material_base + static_cast<std::uint32_t>(*primitive.materialIndex)
+                        : default_material_index;
+
+                if (attach_directly) {
+                    graph.set_mesh(handle, *view, material_index);
+                } else {
+                    const NodeHandle child = graph.add_node(
+                        handle, glm::mat4(1.0F), node_name + "." + std::to_string(primitive_index));
+                    graph.set_mesh(child, *view, material_index);
+                }
+            }
+            ++primitive_index;
+        }
+    }
+
+    for (const std::size_t child_index : node.children) {
+        add_gltf_node(asset, child_index, handle, world, graph, registry, scratch, state,
+                      material_base, default_material_index);
+    }
+}
+
+}  // namespace
+
+std::optional<LoadedScene> load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
+                                     TextureRegistry& textures, MaterialRegistry& materials,
+                                     SceneGraph& graph) {
+    const std::optional<fastgltf::Asset> parsed = parse(path);
+    if (!parsed.has_value()) {
+        return std::nullopt;
+    }
+    const fastgltf::Asset& asset = *parsed;
+
+    LoadedScene loaded;
     // Index-for-index with the glTF's own material list, so a primitive's
-    // materialIndex maps across untouched, plus one appended fallback carrying
-    // glTF's prescribed defaults for primitives that name no material.
-    scene.materials.reserve(asset.materials.size() + 1);
+    // materialIndex maps across by a single added base, plus one appended
+    // fallback carrying glTF's prescribed defaults for primitives that name no
+    // material.
+    std::vector<Material> material_table;
+    material_table.reserve(asset.materials.size() + 1);
     std::unordered_map<std::uint64_t, std::uint32_t> image_slots;
     for (const fastgltf::Material& source : asset.materials) {
         Material material;
@@ -172,113 +340,59 @@ Scene load_gltf(const std::filesystem::path& path, GeometryRegistry& registry,
         material.emissive_factor = glm::make_vec3(source.emissiveFactor.data());
         material.normal_scale =
             source.normalTexture.has_value() ? source.normalTexture->scale : 1.0F;
-        scene.materials.push_back(material);
+        material_table.push_back(material);
     }
-    const auto default_material_index = static_cast<std::uint32_t>(scene.materials.size());
-    scene.materials.emplace_back();
+    // Appended before the walk, because a node's material index is written
+    // during it and needs the base this block landed at.
+    // One appended fallback carrying glTF's prescribed defaults, for primitives
+    // that name no material. It also guarantees the block is never empty, which
+    // a file defining no materials at all would otherwise leave it -- and an
+    // empty append is a programming error the registry asserts on.
+    const auto default_local_index = static_cast<std::uint32_t>(material_table.size());
+    material_table.emplace_back();
 
-    fastgltf::iterateSceneNodes(
-        asset, scene_index, fastgltf::math::fmat4x4(),
-        [&](const fastgltf::Node& node, const fastgltf::math::fmat4x4& world) {
-            if (!node.meshIndex.has_value()) {
-                return;
-            }
+    const std::uint32_t material_base = materials.append(material_table);
+    const std::uint32_t default_material_index = material_base + default_local_index;
 
-            const glm::mat4 transform = glm::make_mat4(world.data());
+    // One node per load, so a file can be moved or removed as a unit and the
+    // hierarchy panel has something to collapse.
+    loaded.root = graph.add_node(NodeHandle{}, glm::mat4(1.0F), path.filename().string());
 
-            for (const fastgltf::Primitive& primitive : asset.meshes[*node.meshIndex].primitives) {
-                if (primitive.type != fastgltf::PrimitiveType::Triangles) {
-                    SAGE_LOG_WARN("Skipping non-triangle primitive");
-                    continue;
-                }
+    LoadScratch scratch;
+    LoadState state;
+    const std::size_t scene_index = asset.defaultScene.value_or(0);
+    for (const std::size_t node_index : asset.scenes[scene_index].nodeIndices) {
+        add_gltf_node(asset, node_index, loaded.root, glm::mat4(1.0F), graph, registry, scratch,
+                      state, material_base, default_material_index);
+    }
 
-                const auto* position_attribute = primitive.findAttribute("POSITION");
-                if (position_attribute == primitive.attributes.end()) {
-                    SAGE_LOG_WARN("Skipping primitive with no POSITION attribute");
-                    continue;
-                }
-                SAGE_VERIFY(primitive.indicesAccessor.has_value(),
-                            "Primitive has no indices despite GenerateMeshIndices");
+    // The graph owns composition from here; the walk's matrices only fed bounds.
+    graph.update_transforms();
 
-                const fastgltf::Accessor& position_accessor =
-                    asset.accessors[position_attribute->accessorIndex];
-                const std::size_t vertex_count = position_accessor.count;
+    loaded.mesh_count = state.mesh_count;
+    if (state.mesh_count > 0) {
+        loaded.bounds_min = state.bounds_min;
+        loaded.bounds_max = state.bounds_max;
+    }
+    // Otherwise the bounds stay zeroed rather than the inverted sentinels the
+    // walk started from, which would frame a camera at a nonsense distance.
 
-                positions.resize(vertex_count);
-                fastgltf::copyFromAccessor<glm::vec3>(asset, position_accessor, positions.data());
+    if (state.dropped_count > 0) {
+        SAGE_LOG_WARN("Dropped {} primitive(s) from {}: geometry buffer full", state.dropped_count,
+                      path.filename().string());
+    }
+    if (state.mesh_count == 0) {
+        SAGE_LOG_WARN("{} contained no drawable triangle primitives", path.filename().string());
+    }
 
-                // NORMAL is optional in glTF. Without it the mesh would be
-                // unlit; a fixed up-facing normal at least keeps it visible.
-                normals.assign(vertex_count, glm::vec3(0.0F, 1.0F, 0.0F));
-                if (const auto* normal_attribute = primitive.findAttribute("NORMAL");
-                    normal_attribute != primitive.attributes.end()) {
-                    fastgltf::copyFromAccessor<glm::vec3>(
-                        asset, asset.accessors[normal_attribute->accessorIndex], normals.data());
-                } else {
-                    SAGE_LOG_WARN("Primitive has no NORMAL attribute; shading will be flat");
-                }
-
-                // TEXCOORD_0 is optional in glTF. Zeroed UVs sample a single
-                // texel rather than failing to load. Wrong, but visibly wrong.
-                uvs.assign(vertex_count, glm::vec2(0.0F));
-                if (const auto* uv_attribute = primitive.findAttribute("TEXCOORD_0");
-                    uv_attribute != primitive.attributes.end()) {
-                    fastgltf::copyFromAccessor<glm::vec2>(
-                        asset, asset.accessors[uv_attribute->accessorIndex], uvs.data());
-                } else {
-                    SAGE_LOG_WARN("Primitive has no TEXCOORD_0; textures will not map");
-                }
-
-                // TANGENT is optional.
-                tangents.assign(vertex_count, glm::vec4(1.0F, 0.0F, 0.0F, 1.0F));
-                if (const auto* tangent_attribute = primitive.findAttribute("TANGENT");
-                    tangent_attribute != primitive.attributes.end()) {
-                    fastgltf::copyFromAccessor<glm::vec4>(
-                        asset, asset.accessors[tangent_attribute->accessorIndex], tangents.data());
-                } else {
-                    SAGE_LOG_WARN("Primitive has no TANGENT; normal mapping will be wrong");
-                }
-
-                vertices.resize(vertex_count);
-                for (std::size_t i = 0; i < vertex_count; ++i) {
-                    vertices[i].position = positions[i];
-                    vertices[i].normal = normals[i];
-                    vertices[i].tangent = tangents[i];
-                    vertices[i].uv = uvs[i];
-
-                    const glm::vec3 world_position =
-                        glm::vec3(transform * glm::vec4(positions[i], 1.0F));
-                    scene.bounds_min = glm::min(scene.bounds_min, world_position);
-                    scene.bounds_max = glm::max(scene.bounds_max, world_position);
-                }
-
-                const fastgltf::Accessor& index_accessor =
-                    asset.accessors[*primitive.indicesAccessor];
-                indices.resize(index_accessor.count);
-                fastgltf::copyFromAccessor<std::uint32_t>(asset, index_accessor, indices.data());
-
-                SceneNode scene_node;
-                scene_node.transform = transform;
-                scene_node.material_index =
-                    primitive.materialIndex.has_value()
-                        ? static_cast<std::uint32_t>(*primitive.materialIndex)
-                        : default_material_index;
-                scene_node.mesh =
-                    registry.add_mesh(vertices.data(), sizeof(Vertex) * vertices.size(),
-                                      indices.data(), static_cast<std::uint32_t>(indices.size()));
-                scene.nodes.push_back(scene_node);
-            }
-        });
-
-    SAGE_VERIFY(!scene.nodes.empty(), "glTF contained no drawable triangle primitives");
     SAGE_LOG_INFO(
-        "Loaded {}: {} primitives, bounds ({:.2f}, {:.2f}, {:.2f}) to "
-        "({:.2f}, {:.2f}, {:.2f})",
-        path.filename().string(), scene.nodes.size(), scene.bounds_min.x, scene.bounds_min.y,
-        scene.bounds_min.z, scene.bounds_max.x, scene.bounds_max.y, scene.bounds_max.z);
-    SAGE_LOG_INFO("Materials: {} from glTF, plus one default", asset.materials.size());
+        "Loaded {}: {} nodes, {} meshes, {} material(s) plus one default at base {}, bounds "
+        "({:.2f}, {:.2f}, {:.2f}) to ({:.2f}, {:.2f}, {:.2f})",
+        path.filename().string(), graph.size(), state.mesh_count, asset.materials.size(),
+        material_base, loaded.bounds_min.x, loaded.bounds_min.y, loaded.bounds_min.z,
+        loaded.bounds_max.x, loaded.bounds_max.y, loaded.bounds_max.z);
 
-    return scene;
+    return loaded;
 }
 
 }  // namespace sage::gpu

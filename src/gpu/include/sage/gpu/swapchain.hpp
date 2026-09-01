@@ -40,6 +40,10 @@ public:
 
     [[nodiscard]] VkImageView image_view(std::uint32_t index) const { return image_views_[index]; }
 
+    [[nodiscard]] std::uint32_t image_count() const {
+        return static_cast<std::uint32_t>(images_.size());
+    }
+
     [[nodiscard]] VkExtent2D extent() const { return extent_; }
     [[nodiscard]] VkFormat format() const { return format_; }
 
