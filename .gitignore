@@ -17,3 +17,9 @@ compile_commands.json
 
 # OS
 .DS_Store
+
+# Test assets. Fetched rather than vendored -- see assets/README.md.
+#   python3 tools/fetch_assets.py
+# assets/README.md stays tracked; only the models and generated images do not.
+assets/*/
+assets/uv_grid.png

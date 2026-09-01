@@ -344,9 +344,15 @@ std::optional<LoadedScene> load_gltf(const std::filesystem::path& path, Geometry
     }
     // Appended before the walk, because a node's material index is written
     // during it and needs the base this block landed at.
+    // One appended fallback carrying glTF's prescribed defaults, for primitives
+    // that name no material. It also guarantees the block is never empty, which
+    // a file defining no materials at all would otherwise leave it -- and an
+    // empty append is a programming error the registry asserts on.
+    const auto default_local_index = static_cast<std::uint32_t>(material_table.size());
+    material_table.emplace_back();
+
     const std::uint32_t material_base = materials.append(material_table);
-    const auto default_material_index =
-        material_base + static_cast<std::uint32_t>(material_table.size()) - 1;
+    const std::uint32_t default_material_index = material_base + default_local_index;
 
     // One node per load, so a file can be moved or removed as a unit and the
     // hierarchy panel has something to collapse.
