@@ -92,11 +92,14 @@ struct PushConstants {
     VkDeviceAddress frame_address = 0;
     alignas(16) glm::mat4 model{1.0F};
     std::uint32_t material_index = 0;
+    std::uint32_t object_id = 0;
 };
 static_assert(offsetof(PushConstants, vertex_address) == 0);
 static_assert(offsetof(PushConstants, frame_address) == 8);
 static_assert(offsetof(PushConstants, model) == 16);
 static_assert(offsetof(PushConstants, material_index) == 80);
+// Verified against the compiled SPIR-V, which decorates this member Offset 84.
+static_assert(offsetof(PushConstants, object_id) == 84);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 constexpr std::uint32_t k_initial_width = 1280;
@@ -212,13 +215,17 @@ Application::Application(const std::filesystem::path& model_path)
       material_registry_(allocator_, uploader_, bindless_set_, k_max_materials),
       frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
+      pick_buffer_(allocator_, device_, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   gpu::BufferAccess::host_read),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       depth_buffer_(allocator_, device_, swapchain_.extent()),
+      id_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
       pipeline_(device_,
                 gpu::GraphicsPipelineDesc{
                     .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
                     .color_format = swapchain_.format(),
+                    .id_format = gpu::IdBuffer::format(),
                     .depth_format = depth_buffer_.format(),
                     .set_layout = bindless_set_.layout(),
                     .cache = pipeline_cache_.handle(),
@@ -329,7 +336,22 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     to_depth.image = depth_buffer_.image();
     to_depth.subresourceRange = k_depth_range;
 
-    const std::array<VkImageMemoryBarrier2, 2> begin_barriers{to_color, to_depth};
+    // Same shape as the colour barrier: the previous contents are never read,
+    // so UNDEFINED discards them and the clear below writes every texel.
+    VkImageMemoryBarrier2 to_id{};
+    to_id.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_id.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_id.srcAccessMask = VK_ACCESS_2_NONE;
+    to_id.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_id.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_id.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_id.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_id.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_id.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_id.image = id_buffer_.image();
+    to_id.subresourceRange = k_color_range;
+
+    const std::array<VkImageMemoryBarrier2, 3> begin_barriers{to_color, to_depth, to_id};
 
     VkDependencyInfo begin_dependency{};
     begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -354,13 +376,26 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth_attachment.clearValue.depthStencil = {1.0F, 0};
 
+    // Cleared to k_null_id, so every pixel no draw covers reads back as
+    // "nothing here" rather than as whatever the last frame left behind.
+    VkRenderingAttachmentInfo id_attachment{};
+    id_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    id_attachment.imageView = id_buffer_.view();
+    id_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    id_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    id_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    id_attachment.clearValue.color.uint32[0] = gpu::IdBuffer::k_null_id;
+
+    const std::array<VkRenderingAttachmentInfo, 2> color_attachments{color_attachment,
+                                                                     id_attachment};
+
     VkRenderingInfo rendering{};
     rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering.renderArea.offset = {0, 0};
     rendering.renderArea.extent = extent;
     rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(color_attachments.size());
+    rendering.pColorAttachments = color_attachments.data();
     rendering.pDepthAttachment = &depth_attachment;
 
     vkCmdBeginRendering(command_buffer, &rendering);
@@ -417,7 +452,8 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     frame_buffer_.write(&frame_data, sizeof(frame_data), frame_offset);
     const VkDeviceAddress frame_address = frame_buffer_.device_address() + frame_offset;
 
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+    for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
+        const gpu::SceneNode& node = scene_graph_.nodes()[index];
         if (!node.has_mesh) {
             // Pure transform nodes: glTF hierarchy nodes, and the per-load root.
             continue;
@@ -428,6 +464,9 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
         push.frame_address = frame_address;
         push.model = node.world_transform;
         push.material_index = node.material_index;
+        // Offset by one so that k_null_id (0) stays reserved for empty space;
+        // resolve_pick subtracts it back off.
+        push.object_id = index + 1;
         vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                            &push);
         vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
@@ -436,6 +475,139 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     }
 
     vkCmdEndRendering(command_buffer);
+}
+
+void Application::handle_picking_input() {
+    // A panel under the pointer wins, matching the camera's rule -- otherwise
+    // clicking a tree row would also pick whatever is behind the panel.
+    if (gpu::ImGuiLayer::wants_mouse() || !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        return;
+    }
+    // Right button held means the camera is being flown, and a left click then
+    // is part of that gesture rather than a selection.
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+        return;
+    }
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
+        return;
+    }
+
+    // ImGui reports logical coordinates; the id attachment is framebuffer
+    // pixels. Same conversion as central_node_rect, for the same reason.
+    const VkExtent2D extent = id_buffer_.extent();
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const float x =
+        (mouse.x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
+    const float y =
+        (mouse.y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
+
+    const auto texel_x = static_cast<std::int32_t>(x);
+    const auto texel_y = static_cast<std::int32_t>(y);
+
+    // Outside the 3D view is not a miss, it is not a pick at all -- clicking
+    // the dockspace border should leave the selection alone.
+    const VkRect2D& rect = viewport_rect_;
+    if (texel_x < rect.offset.x || texel_y < rect.offset.y ||
+        texel_x >= rect.offset.x + static_cast<std::int32_t>(rect.extent.width) ||
+        texel_y >= rect.offset.y + static_cast<std::int32_t>(rect.extent.height)) {
+        return;
+    }
+
+    pending_pick_ = VkOffset2D{texel_x, texel_y};
+}
+
+void Application::record_pick_copy(VkCommandBuffer command_buffer) const {
+    if (!pending_pick_.has_value()) {
+        return;
+    }
+
+    VkImageMemoryBarrier2 to_transfer_src{};
+    to_transfer_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_transfer_src.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_transfer_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_transfer_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_transfer_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_src.image = id_buffer_.image();
+    to_transfer_src.subresourceRange = k_color_range;
+
+    VkDependencyInfo to_transfer_dependency{};
+    to_transfer_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    to_transfer_dependency.imageMemoryBarrierCount = 1;
+    to_transfer_dependency.pImageMemoryBarriers = &to_transfer_src;
+    vkCmdPipelineBarrier2(command_buffer, &to_transfer_dependency);
+
+    // One texel. The whole point of an id attachment over a CPU-side raycast is
+    // that the answer is already rendered; reading more of it would be waste.
+    VkBufferImageCopy2 region{};
+    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {pending_pick_->x, pending_pick_->y, 0};
+    region.imageExtent = {1, 1, 1};
+
+    VkCopyImageToBufferInfo2 copy{};
+    copy.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+    copy.srcImage = id_buffer_.image();
+    copy.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    copy.dstBuffer = pick_buffer_.handle();
+    copy.regionCount = 1;
+    copy.pRegions = &region;
+    vkCmdCopyImageToBuffer2(command_buffer, &copy);
+
+    // Waiting on the submission alone does not make the copy visible to the
+    // host; the HOST stage has to be named as a destination for that.
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = pick_buffer_.handle();
+    to_host.offset = 0;
+    to_host.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo to_host_dependency{};
+    to_host_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    to_host_dependency.bufferMemoryBarrierCount = 1;
+    to_host_dependency.pBufferMemoryBarriers = &to_host;
+    vkCmdPipelineBarrier2(command_buffer, &to_host_dependency);
+}
+
+void Application::resolve_pick() {
+    if (!pending_pick_.has_value()) {
+        return;
+    }
+    pending_pick_.reset();
+
+    // The copy is in a submission that has to have completed before the mapping
+    // holds this frame's value. Blocking is deliberate: it costs a stall on the
+    // frame a click happens, where the alternative -- reading a slot two frames
+    // old -- would hand back whatever was under the cursor before the click.
+    frame_pacer_.wait_all();
+
+    std::uint32_t id = gpu::IdBuffer::k_null_id;
+    pick_buffer_.read(&id, sizeof(id));
+
+    selected_ = id == gpu::IdBuffer::k_null_id ? gpu::NodeHandle{} : scene_graph_.handle_at(id - 1);
+
+    if (const gpu::SceneNode* node = scene_graph_.find(selected_); node != nullptr) {
+        SAGE_LOG_INFO("Selected '{}' (node {})", node->name, id - 1);
+    } else {
+        SAGE_LOG_INFO("Selection cleared");
+    }
 }
 
 void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage image) {
@@ -518,6 +690,8 @@ void Application::draw_ui() {
                 static_cast<unsigned long long>(geometry_registry_.capacity() / 1024));
     ImGui::Text("Materials: %u / %u", material_registry_.count(), material_registry_.capacity());
     ImGui::Text("Textures: %u", texture_registry_.count());
+    const gpu::SceneNode* selected = scene_graph_.find(selected_);
+    ImGui::Text("Selected: %s", selected != nullptr ? selected->name.c_str() : "(none)");
     const glm::vec3 position = camera_.position();
     ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
                 static_cast<double>(position.y), static_cast<double>(position.z));
@@ -573,6 +747,11 @@ void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& chi
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
                                ImGuiTreeNodeFlags_DefaultOpen;
+    // Compared by handle rather than index: a stale handle from before a scene
+    // reload must not light up whatever now occupies that slot.
+    if (selected_.valid() && scene_graph_.handle_at(index) == selected_) {
+        flags |= ImGuiTreeNodeFlags_Selected;
+    }
     if (children[index].empty()) {
         // A leaf gets no arrow, and NoTreePushOnOpen means it must not be
         // popped -- which is why the TreePop below is guarded on having
@@ -607,6 +786,9 @@ bool Application::recreate_swapchain() {
     }
     swapchain_.recreate(extent);
     depth_buffer_.recreate(swapchain_.extent());
+    id_buffer_.recreate(swapchain_.extent());
+    // A pick names a texel in an image that no longer exists.
+    pending_pick_.reset();
     return true;
 }
 
@@ -714,17 +896,26 @@ void Application::run() {
             pending_frame_.reset();
         }
 
+        // After draw_dockspace, which refreshes viewport_rect_, and before the
+        // panels, so a click is tested against this frame's layout.
+        handle_picking_input();
+
         draw_ui();
         draw_hierarchy_panel();
 
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
                      swapchain_.extent(), frame.slot);
+        record_pick_copy(frame.command_buffer);
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
                       swapchain_.extent());
         transition_to_present(frame.command_buffer, acquired.image);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
+
+        // After submit, so the copy has been handed to the GPU; resolve_pick
+        // waits for it before touching the mapping.
+        resolve_pick();
 
         const VkResult present_result = swapchain_.present(device_.present_queue(), acquired.index);
         if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR ||

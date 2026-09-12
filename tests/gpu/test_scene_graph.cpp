@@ -158,3 +158,45 @@ TEST_CASE("Handles stay valid as the node array grows", "[scene]") {
     REQUIRE(graph.find(first) != nullptr);
     check_position(world_position(graph, first), 1.0F, 0.0F, 0.0F);
 }
+
+TEST_CASE("handle_at is the inverse of the node array index", "[scene]") {
+    SceneGraph graph;
+    const NodeHandle root = graph.add_node(NodeHandle{}, k_identity, "root");
+    const NodeHandle child = graph.add_node(root, k_identity, "child");
+
+    // What object-id picking depends on: the GPU hands back an index, and this
+    // has to name the same node the draw loop wrote that index for.
+    CHECK(graph.handle_at(0) == root);
+    CHECK(graph.handle_at(1) == child);
+
+    REQUIRE(graph.find(graph.handle_at(1)) != nullptr);
+    CHECK(graph.find(graph.handle_at(1))->name == "child");
+}
+
+TEST_CASE("handle_at rejects an out-of-range index", "[scene]") {
+    SceneGraph graph;
+    graph.add_node(NodeHandle{}, k_identity, "only");
+
+    // A pick that lands on a stale id -- the scene shrank between the draw and
+    // the readback -- must come back invalid rather than naming a live node.
+    CHECK_FALSE(graph.handle_at(1).valid());
+    CHECK_FALSE(graph.handle_at(99).valid());
+    CHECK(graph.find(graph.handle_at(1)) == nullptr);
+}
+
+TEST_CASE("handle_at after a clear does not resolve a pre-clear handle", "[scene]") {
+    SceneGraph graph;
+    const NodeHandle before = graph.add_node(NodeHandle{}, k_identity, "before");
+
+    graph.clear();
+    graph.add_node(NodeHandle{}, k_identity, "after");
+
+    // Index 0 is occupied again, but by a different node. A pick resolved
+    // through handle_at must not compare equal to the handle issued earlier,
+    // which is what stops a selection surviving a scene reload.
+    const NodeHandle reused = graph.handle_at(0);
+    REQUIRE(reused.valid());
+    CHECK(reused != before);
+    REQUIRE(graph.find(reused) != nullptr);
+    CHECK(graph.find(reused)->name == "after");
+}

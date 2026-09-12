@@ -41,6 +41,13 @@ const SceneNode* SceneGraph::find(NodeHandle node) const {
     return is_live(node) ? &nodes_[node.index()] : nullptr;
 }
 
+NodeHandle SceneGraph::handle_at(std::size_t index) const {
+    if (index >= nodes_.size()) {
+        return {};
+    }
+    return NodeHandle{static_cast<NodeHandle::Index>(index), generations_[index]};
+}
+
 SceneNode* SceneGraph::mutable_find(NodeHandle node) {
     return is_live(node) ? &nodes_[node.index()] : nullptr;
 }

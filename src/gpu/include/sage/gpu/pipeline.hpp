@@ -12,6 +12,10 @@ class Device;
 struct GraphicsPipelineDesc {
     std::filesystem::path spirv_path;
     VkFormat color_format = VK_FORMAT_UNDEFINED;
+    // Optional second colour attachment carrying object ids. UNDEFINED builds a
+    // single-attachment pipeline, so a pass that does not write ids -- the
+    // outline resolve, and M8's tonemap -- needs no special case.
+    VkFormat id_format = VK_FORMAT_UNDEFINED;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;

@@ -50,6 +50,19 @@ public:
     [[nodiscard]] BufferAllocation create_device_local_buffer(VkDeviceSize size,
                                                               VkBufferUsageFlags usage) const;
 
+    // Host-visible and persistently mapped for reading back GPU results.
+    // Distinct from create_mapped_buffer because the access pattern picks the
+    // memory type: SEQUENTIAL_WRITE lets VMA choose uncached write-combined
+    // memory, which is right for upload staging and pathological to read from.
+    // RANDOM asks for host-cached memory instead.
+    [[nodiscard]] BufferAllocation create_readback_buffer(VkDeviceSize size,
+                                                          VkBufferUsageFlags usage) const;
+
+    // Makes device writes visible to the host. The mirror of flush(), and
+    // required before reading a readback buffer on non-coherent memory.
+    void invalidate(const BufferAllocation& allocation, VkDeviceSize size,
+                    VkDeviceSize offset = 0) const;
+
     void flush(const BufferAllocation& allocation, VkDeviceSize size,
                VkDeviceSize offset = 0) const;
     void destroy_buffer(const BufferAllocation& allocation) const;

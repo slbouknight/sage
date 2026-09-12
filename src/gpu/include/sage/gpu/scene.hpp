@@ -57,6 +57,13 @@ public:
     // Null when the handle is stale or was never valid.
     [[nodiscard]] const SceneNode* find(NodeHandle node) const;
 
+    // The handle naming the node at `index`, or a default handle when the
+    // index is out of range. This is the inverse of nodes()[i] and exists for
+    // object-ID picking: the GPU can only hand back an index, and a raw index
+    // is worthless a scene-clear later. Converting it here, while the index is
+    // still fresh, gives a handle whose generation catches exactly that.
+    [[nodiscard]] NodeHandle handle_at(std::size_t index) const;
+
     // Recomposes every world transform. Call after changing any local transform.
     void update_transforms();
 
