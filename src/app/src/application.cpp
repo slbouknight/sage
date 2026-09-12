@@ -469,6 +469,14 @@ void Application::clear_scene() {
     geometry_registry_.reset();
     material_registry_.reset();
     texture_registry_.reset();
+
+    // The tree's open/closed state is keyed on node index, and indices restart
+    // at zero after this. Without dropping it, a replace-load would inherit
+    // whatever the previous scene had been expanded to -- so the next file
+    // would come up part-opened on nodes that have nothing to do with the ones
+    // that were opened. Deferred because the storage belongs to the Hierarchy
+    // window, which is only current inside its own Begin/End.
+    hierarchy_state_stale_ = true;
 }
 
 void Application::service_pending_load() {
@@ -1782,6 +1790,13 @@ bool Application::draw_gizmo() {
 void Application::draw_hierarchy_panel() {
     ImGui::Begin("Hierarchy");
 
+    // Inside Begin, because GetStateStorage() returns the *current* window's,
+    // and this one holds every tree node's open flag keyed by node index.
+    if (hierarchy_state_stale_) {
+        ImGui::GetStateStorage()->Clear();
+        hierarchy_state_stale_ = false;
+    }
+
     const std::span<const gpu::SceneNode> nodes = scene_graph_.nodes();
 
     if (nodes.empty()) {
@@ -1814,8 +1829,10 @@ void Application::draw_hierarchy_panel() {
 void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& children) {
     const gpu::SceneNode& node = scene_graph_.nodes()[index];
 
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
-                               ImGuiTreeNodeFlags_DefaultOpen;
+    // No DefaultOpen: a loaded file arrives collapsed to a single row named
+    // after it, and is expanded on demand. A chess set is 50 nodes and a real
+    // scene is more, which is a wall of names rather than an overview.
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     // Compared by handle rather than index: a stale handle from before a scene
     // reload must not light up whatever now occupies that slot.
     if (selected_.valid() && scene_graph_.handle_at(index) == selected_) {

@@ -185,6 +185,9 @@ private:
     [[nodiscard]] LightFit fit_light(const Bounds& bounds) const;
 
     bool dock_layout_built_ = false;
+    // Set when node indices are about to be reused, so the hierarchy panel
+    // drops ImGui's remembered tree open/closed state on its next draw.
+    bool hierarchy_state_stale_ = false;
 
     // The 3D view's rect within the swapchain image: the dockspace's central
     // node, in framebuffer pixels. The scene is drawn here rather than across
