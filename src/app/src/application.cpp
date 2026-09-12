@@ -4,6 +4,7 @@
 #include <sage/core/math.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/light.hpp>
+#include <sage/gpu/selection_buffer.hpp>
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
@@ -19,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <span>
@@ -101,6 +103,21 @@ static_assert(offsetof(PushConstants, material_index) == 80);
 // Verified against the compiled SPIR-V, which decorates this member Offset 84.
 static_assert(offsetof(PushConstants, object_id) == 84);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
+
+// Must match PushConstants in shaders/outline.slang. The padding is not
+// cosmetic: Slang aligns an int2 to 8 and a float3 to 16, which is what puts
+// these members where the static_asserts say they are.
+struct OutlinePushConstants {
+    glm::ivec2 viewport_origin{0, 0};
+    glm::ivec2 viewport_size{0, 0};
+    alignas(16) glm::vec3 color{1.0F, 0.55F, 0.12F};
+    std::int32_t thickness = 2;
+};
+static_assert(offsetof(OutlinePushConstants, viewport_origin) == 0);
+static_assert(offsetof(OutlinePushConstants, viewport_size) == 8);
+static_assert(offsetof(OutlinePushConstants, color) == 16);
+static_assert(offsetof(OutlinePushConstants, thickness) == 28);
+static_assert(sizeof(OutlinePushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
@@ -213,6 +230,7 @@ Application::Application(const std::filesystem::path& model_path)
       sampler_(device_),
       texture_registry_(allocator_, device_, uploader_, bindless_set_, sampler_),
       material_registry_(allocator_, uploader_, bindless_set_, k_max_materials),
+      selection_buffer_(allocator_, uploader_, bindless_set_),
       frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
       pick_buffer_(allocator_, device_, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -230,8 +248,22 @@ Application::Application(const std::filesystem::path& model_path)
                     .set_layout = bindless_set_.layout(),
                     .cache = pipeline_cache_.handle(),
                 }),
+      outline_pipeline_(device_,
+                        gpu::GraphicsPipelineDesc{
+                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "outline.spv",
+                            .color_format = swapchain_.format(),
+                            // No id attachment and no depth: this pass reads
+                            // ids, it does not write them, and a full-screen
+                            // triangle has nothing to be occluded by.
+                            .alpha_blend = true,
+                            .cull_backfaces = false,
+                            .set_layout = bindless_set_.layout(),
+                            .cache = pipeline_cache_.handle(),
+                        }),
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
+    bindless_set_.write_object_id_image(id_buffer_.view());
+
     if (model_path.empty()) {
         SAGE_LOG_INFO("No model given; use the Load glTF panel to pick one");
         return;
@@ -275,6 +307,7 @@ void Application::clear_scene() {
     // a submitted draw may still sample.
     device_.wait_idle();
 
+    select(gpu::NodeHandle{});
     scene_graph_.clear();
     geometry_registry_.reset();
     material_registry_.reset();
@@ -518,6 +551,98 @@ void Application::handle_picking_input() {
     pending_pick_ = VkOffset2D{texel_x, texel_y};
 }
 
+void Application::select(gpu::NodeHandle node) {
+    if (node == selected_) {
+        return;
+    }
+    selected_ = node;
+    selection_dirty_ = true;
+}
+
+void Application::service_selection() {
+    if (!selection_dirty_) {
+        return;
+    }
+    selection_dirty_ = false;
+
+    scene_graph_.mark_subtree(selected_, selection_flags_);
+    selection_buffer_.update(selection_flags_);
+}
+
+void Application::record_outline(VkCommandBuffer command_buffer, VkImageView image_view) const {
+    // Unconditional, even with nothing selected: the barrier below is what
+    // leaves the id image in the layout record_pick_copy expects, so skipping
+    // the pass would make that layout depend on the selection.
+    VkImageMemoryBarrier2 to_read{};
+    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.image = id_buffer_.image();
+    to_read.subresourceRange = k_color_range;
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &to_read;
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+
+    if (!selected_.valid()) {
+        return;
+    }
+
+    // LOAD, not CLEAR: the shaded scene is already here and the outline is
+    // drawn over it.
+    VkRenderingAttachmentInfo color_attachment{};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.offset = viewport_rect_.offset;
+    rendering.renderArea.extent = viewport_rect_.extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color_attachment;
+
+    vkCmdBeginRendering(command_buffer, &rendering);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_pipeline_.handle());
+
+    const VkDescriptorSet descriptor_set = bindless_set_.handle();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            outline_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
+
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(viewport_rect_.offset.x);
+    viewport.y = static_cast<float>(viewport_rect_.offset.y);
+    viewport.width = static_cast<float>(viewport_rect_.extent.width);
+    viewport.height = static_cast<float>(viewport_rect_.extent.height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
+
+    OutlinePushConstants push{};
+    push.viewport_origin = {viewport_rect_.offset.x, viewport_rect_.offset.y};
+    push.viewport_size = {static_cast<std::int32_t>(viewport_rect_.extent.width),
+                          static_cast<std::int32_t>(viewport_rect_.extent.height)};
+    vkCmdPushConstants(command_buffer, outline_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
+                       sizeof(push), &push);
+
+    // Three vertices, no buffers: the vertex shader builds a full-screen
+    // triangle from SV_VertexID.
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    vkCmdEndRendering(command_buffer);
+}
+
 void Application::record_pick_copy(VkCommandBuffer command_buffer) const {
     if (!pending_pick_.has_value()) {
         return;
@@ -525,11 +650,14 @@ void Application::record_pick_copy(VkCommandBuffer command_buffer) const {
 
     VkImageMemoryBarrier2 to_transfer_src{};
     to_transfer_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_transfer_src.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    // SHADER_READ_ONLY, not COLOR_ATTACHMENT: record_outline has already moved
+    // the image there. Ordering the two passes rather than making each one
+    // handle both cases keeps a single source layout per barrier.
+    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    to_transfer_src.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
     to_transfer_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
     to_transfer_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     to_transfer_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_transfer_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -601,10 +729,16 @@ void Application::resolve_pick() {
     std::uint32_t id = gpu::IdBuffer::k_null_id;
     pick_buffer_.read(&id, sizeof(id));
 
-    selected_ = id == gpu::IdBuffer::k_null_id ? gpu::NodeHandle{} : scene_graph_.handle_at(id - 1);
+    // Promoted to the root of whatever was hit. Clicking a mesh selects the
+    // object it belongs to, not the individual submesh -- which is what makes
+    // a loaded file behave as one thing to move, and what the properties panel
+    // will want to describe.
+    const gpu::NodeHandle hit =
+        id == gpu::IdBuffer::k_null_id ? gpu::NodeHandle{} : scene_graph_.handle_at(id - 1);
+    select(scene_graph_.root_of(hit));
 
     if (const gpu::SceneNode* node = scene_graph_.find(selected_); node != nullptr) {
-        SAGE_LOG_INFO("Selected '{}' (node {})", node->name, id - 1);
+        SAGE_LOG_INFO("Selected '{}'", node->name);
     } else {
         SAGE_LOG_INFO("Selection cleared");
     }
@@ -765,6 +899,13 @@ void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& chi
     ImGui::PushID(static_cast<int>(index));
     const bool open = ImGui::TreeNodeEx(node.name.c_str(), flags);
 
+    // Not promoted to the root, unlike a viewport click: the panel exists to
+    // reach a specific node, so clicking a child selects that child and
+    // outlines its own subtree.
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+        select(scene_graph_.handle_at(index));
+    }
+
     if (node.has_mesh) {
         ImGui::SameLine();
         ImGui::TextDisabled("(mesh)");
@@ -787,6 +928,8 @@ bool Application::recreate_swapchain() {
     swapchain_.recreate(extent);
     depth_buffer_.recreate(swapchain_.extent());
     id_buffer_.recreate(swapchain_.extent());
+    // The old view is gone, so the descriptor naming it has to be rewritten.
+    bindless_set_.write_object_id_image(id_buffer_.view());
     // A pick names a texel in an image that no longer exists.
     pending_pick_.reset();
     return true;
@@ -841,6 +984,7 @@ void Application::run() {
         // and no ImGui frame is open, so a wait_idle and a blocking upload here
         // disturb nothing. Costs the picker one frame of latency.
         service_pending_load();
+        service_selection();
 
         const auto now = std::chrono::steady_clock::now();
         const float delta_seconds = std::chrono::duration<float>(now - last_frame_time).count();
@@ -899,12 +1043,12 @@ void Application::run() {
         // After draw_dockspace, which refreshes viewport_rect_, and before the
         // panels, so a click is tested against this frame's layout.
         handle_picking_input();
-
         draw_ui();
         draw_hierarchy_panel();
 
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
                      swapchain_.extent(), frame.slot);
+        record_outline(frame.command_buffer, swapchain_.image_view(acquired.index));
         record_pick_copy(frame.command_buffer);
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
                       swapchain_.extent());

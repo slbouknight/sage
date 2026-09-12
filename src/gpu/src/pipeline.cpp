@@ -57,7 +57,7 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     raster.depthClampEnable = VK_FALSE;
     raster.rasterizerDiscardEnable = VK_FALSE;
     raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_BACK_BIT;
+    raster.cullMode = desc.cull_backfaces ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.depthBiasEnable = VK_FALSE;
     raster.lineWidth = 1.0F;
@@ -67,10 +67,12 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     multisample.sampleShadingEnable = VK_FALSE;
 
+    const bool has_depth = desc.depth_format != VK_FORMAT_UNDEFINED;
+
     VkPipelineDepthStencilStateCreateInfo depth_stencil{};
     depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth_stencil.depthTestEnable = VK_TRUE;
-    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthTestEnable = has_depth ? VK_TRUE : VK_FALSE;
+    depth_stencil.depthWriteEnable = has_depth ? VK_TRUE : VK_FALSE;
     depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
     depth_stencil.depthBoundsTestEnable = VK_FALSE;
     depth_stencil.stencilTestEnable = VK_FALSE;
@@ -90,7 +92,13 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     // nothing, where narrowing the id's mask to R would have cost a device
     // feature request for no benefit.
     VkPipelineColorBlendAttachmentState blend_attachment{};
-    blend_attachment.blendEnable = VK_FALSE;
+    blend_attachment.blendEnable = desc.alpha_blend ? VK_TRUE : VK_FALSE;
+    blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     const std::array<VkPipelineColorBlendAttachmentState, 2> blend_attachments{blend_attachment,

@@ -32,6 +32,7 @@ add_library(sage_gpu STATIC
     src/pipeline_cache.cpp
     src/sampler.cpp
     src/scene.cpp
+    src/selection_buffer.cpp
     src/id_buffer.cpp
     src/shader_module.cpp
     src/surface.cpp

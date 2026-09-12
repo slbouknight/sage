@@ -16,7 +16,15 @@ struct GraphicsPipelineDesc {
     // single-attachment pipeline, so a pass that does not write ids -- the
     // outline resolve, and M8's tonemap -- needs no special case.
     VkFormat id_format = VK_FORMAT_UNDEFINED;
+    // UNDEFINED disables depth entirely, which is what a full-screen resolve
+    // pass wants: it covers every pixel and has nothing to occlude it.
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    // Straight alpha blending over whatever is already in the attachment.
+    // Off for the scene pass, which owns its pixels outright.
+    bool alpha_blend = false;
+    // A full-screen triangle has no back face to cull, and culling one would
+    // silently draw nothing.
+    bool cull_backfaces = true;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;
 };

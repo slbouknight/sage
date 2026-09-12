@@ -3,6 +3,10 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
 using Catch::Approx;
 using sage::gpu::NodeHandle;
 using sage::gpu::SceneGraph;
@@ -199,4 +203,61 @@ TEST_CASE("handle_at after a clear does not resolve a pre-clear handle", "[scene
     CHECK(reused != before);
     REQUIRE(graph.find(reused) != nullptr);
     CHECK(graph.find(reused)->name == "after");
+}
+
+TEST_CASE("root_of walks to the topmost ancestor", "[scene]") {
+    SceneGraph graph;
+    const NodeHandle root = graph.add_node(NodeHandle{}, k_identity, "root");
+    const NodeHandle middle = graph.add_node(root, k_identity, "middle");
+    const NodeHandle leaf = graph.add_node(middle, k_identity, "leaf");
+
+    // What a viewport click relies on: any depth resolves to the object.
+    CHECK(graph.root_of(leaf) == root);
+    CHECK(graph.root_of(middle) == root);
+    CHECK(graph.root_of(root) == root);
+    CHECK_FALSE(graph.root_of(NodeHandle{}).valid());
+}
+
+TEST_CASE("mark_subtree flags a node and everything beneath it", "[scene]") {
+    SceneGraph graph;
+    const NodeHandle root = graph.add_node(NodeHandle{}, k_identity, "root");
+    const NodeHandle middle = graph.add_node(root, k_identity, "middle");
+    const NodeHandle leaf = graph.add_node(middle, k_identity, "leaf");
+    const NodeHandle other = graph.add_node(NodeHandle{}, k_identity, "other");
+
+    std::vector<std::uint32_t> flags;
+
+    graph.mark_subtree(root, flags);
+    REQUIRE(flags.size() == 4);
+    CHECK(flags[root.index()] == 1);
+    CHECK(flags[middle.index()] == 1);
+    CHECK(flags[leaf.index()] == 1);
+    CHECK(flags[other.index()] == 0);
+
+    // Selecting a middle node must catch its descendants but not its parent,
+    // which is the case a contiguous index range would get wrong.
+    graph.mark_subtree(middle, flags);
+    CHECK(flags[root.index()] == 0);
+    CHECK(flags[middle.index()] == 1);
+    CHECK(flags[leaf.index()] == 1);
+    CHECK(flags[other.index()] == 0);
+
+    graph.mark_subtree(NodeHandle{}, flags);
+    CHECK(std::ranges::none_of(flags, [](std::uint32_t f) { return f != 0; }));
+}
+
+TEST_CASE("mark_subtree does not rely on descendants being contiguous", "[scene]") {
+    SceneGraph graph;
+    const NodeHandle a = graph.add_node(NodeHandle{}, k_identity, "a");
+    const NodeHandle b = graph.add_node(NodeHandle{}, k_identity, "b");
+    // Interleaved: a's child is added after b, so a's subtree is indices 0 and
+    // 2 with an unrelated node sitting between them.
+    const NodeHandle a_child = graph.add_node(a, k_identity, "a_child");
+
+    std::vector<std::uint32_t> flags;
+    graph.mark_subtree(a, flags);
+
+    CHECK(flags[a.index()] == 1);
+    CHECK(flags[b.index()] == 0);
+    CHECK(flags[a_child.index()] == 1);
 }
