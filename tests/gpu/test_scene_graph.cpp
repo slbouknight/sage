@@ -261,3 +261,105 @@ TEST_CASE("mark_subtree does not rely on descendants being contiguous", "[scene]
     CHECK(flags[b.index()] == 0);
     CHECK(flags[a_child.index()] == 1);
 }
+
+TEST_CASE("remove_subtree takes a node and its descendants", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto root = graph.add_node({}, k_identity, "root");
+    const auto child = graph.add_node(root, k_identity, "child");
+    const auto grandchild = graph.add_node(child, k_identity, "grandchild");
+    const auto sibling = graph.add_node({}, k_identity, "sibling");
+
+    graph.remove_subtree(child);
+
+    CHECK(graph.find(child) == nullptr);
+    CHECK(graph.find(grandchild) == nullptr);
+    // Neither the ancestor nor an unrelated root goes with it.
+    CHECK(graph.find(root) != nullptr);
+    CHECK(graph.find(sibling) != nullptr);
+}
+
+TEST_CASE("removal leaves surviving handles resolving to the same nodes", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto first = graph.add_node({}, k_identity, "first");
+    const auto second = graph.add_node({}, k_identity, "second");
+    const auto third = graph.add_node({}, k_identity, "third");
+
+    graph.remove_subtree(first);
+
+    // The whole reason deletion tombstones rather than compacting. Erasing
+    // index 0 would slide these down and leave both handles naming the wrong
+    // node -- silently, since the generations would still match.
+    REQUIRE(graph.find(second) != nullptr);
+    REQUIRE(graph.find(third) != nullptr);
+    CHECK(graph.find(second)->name == "second");
+    CHECK(graph.find(third)->name == "third");
+}
+
+TEST_CASE("a deleted node is distinguishable from a stale handle", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto node = graph.add_node({}, k_identity, "node");
+
+    CHECK_FALSE(graph.is_deleted(node));
+    graph.remove_subtree(node);
+    // Deleted: gone from find, but still resolvable, which is what lets undo
+    // hand the same handle to restore_subtree.
+    CHECK(graph.is_deleted(node));
+    CHECK(graph.find(node) == nullptr);
+
+    graph.clear();
+    // Cleared: the generation moved, so the handle names nothing at all.
+    CHECK_FALSE(graph.is_deleted(node));
+}
+
+TEST_CASE("restore_subtree puts back exactly what was removed", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto root = graph.add_node({}, k_identity, "root");
+    const auto child = graph.add_node(root, k_identity, "child");
+    const auto grandchild = graph.add_node(child, k_identity, "grandchild");
+
+    graph.remove_subtree(child);
+    graph.restore_subtree(child);
+
+    CHECK(graph.find(child) != nullptr);
+    CHECK(graph.find(grandchild) != nullptr);
+    CHECK(graph.live_size() == 3);
+}
+
+TEST_CASE("live_size counts nodes, size counts slots", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto a = graph.add_node({}, k_identity, "a");
+    graph.add_node({}, k_identity, "b");
+
+    CHECK(graph.size() == 2);
+    CHECK(graph.live_size() == 2);
+
+    graph.remove_subtree(a);
+    // The slot stays, which is what keeps b's index -- and so its object id --
+    // from moving.
+    CHECK(graph.size() == 2);
+    CHECK(graph.live_size() == 1);
+}
+
+TEST_CASE("mark_subtree ignores deleted nodes", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto root = graph.add_node({}, k_identity, "root");
+    const auto child = graph.add_node(root, k_identity, "child");
+
+    std::vector<std::uint32_t> flags;
+    graph.remove_subtree(child);
+    graph.mark_subtree(root, flags);
+
+    REQUIRE(flags.size() == 2);
+    CHECK(flags[0] == 1U);
+    // Otherwise the outline would trace the silhouette of something deleted.
+    CHECK(flags[1] == 0U);
+}
+
+TEST_CASE("root_of refuses a deleted node", "[scene_graph]") {
+    sage::gpu::SceneGraph graph;
+    const auto root = graph.add_node({}, k_identity, "root");
+    const auto child = graph.add_node(root, k_identity, "child");
+
+    graph.remove_subtree(root);
+    CHECK_FALSE(graph.root_of(child).valid());
+}

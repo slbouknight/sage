@@ -1,6 +1,7 @@
 #include <sage/core/assert.hpp>
 #include <sage/gpu/scene.hpp>
 
+#include <algorithm>
 #include <utility>
 
 namespace sage::gpu {
@@ -38,7 +39,18 @@ bool SceneGraph::is_live(NodeHandle node) const {
 }
 
 const SceneNode* SceneGraph::find(NodeHandle node) const {
-    return is_live(node) ? &nodes_[node.index()] : nullptr;
+    // A deleted node is gone as far as every caller here is concerned. Undo
+    // reaches one through restore_subtree, which is the only thing that should.
+    return (is_live(node) && nodes_[node.index()].alive) ? &nodes_[node.index()] : nullptr;
+}
+
+bool SceneGraph::is_deleted(NodeHandle node) const {
+    return is_live(node) && !nodes_[node.index()].alive;
+}
+
+std::size_t SceneGraph::live_size() const {
+    return static_cast<std::size_t>(
+        std::count_if(nodes_.begin(), nodes_.end(), [](const SceneNode& n) { return n.alive; }));
 }
 
 NodeHandle SceneGraph::handle_at(std::size_t index) const {
@@ -49,7 +61,7 @@ NodeHandle SceneGraph::handle_at(std::size_t index) const {
 }
 
 NodeHandle SceneGraph::root_of(NodeHandle node) const {
-    if (!is_live(node)) {
+    if (!is_live(node) || !nodes_[node.index()].alive) {
         return {};
     }
 
@@ -68,9 +80,16 @@ void SceneGraph::mark_subtree(NodeHandle node, std::vector<std::uint32_t>& flags
         return;
     }
 
+    if (!nodes_[node.index()].alive) {
+        return;
+    }
+
     flags[node.index()] = 1U;
     // Starting past the selected node: nothing before it can be beneath it.
     for (std::size_t i = node.index() + 1; i < nodes_.size(); ++i) {
+        if (!nodes_[i].alive) {
+            continue;
+        }
         const NodeHandle parent = nodes_[i].parent;
         if (parent.valid() && flags[parent.index()] != 0U) {
             flags[i] = 1U;
@@ -79,7 +98,42 @@ void SceneGraph::mark_subtree(NodeHandle node, std::vector<std::uint32_t>& flags
 }
 
 SceneNode* SceneGraph::mutable_find(NodeHandle node) {
-    return is_live(node) ? &nodes_[node.index()] : nullptr;
+    return (is_live(node) && nodes_[node.index()].alive) ? &nodes_[node.index()] : nullptr;
+}
+
+void SceneGraph::set_subtree_alive(NodeHandle node, bool alive) {
+    if (!is_live(node)) {
+        return;
+    }
+
+    // The same forward pass mark_subtree uses, and for the same reason: a
+    // parent always sits at a lower index, so by the time a child is reached
+    // its parent's answer is settled. Descendants are found by asking whether
+    // the parent was just touched, which needs the flags to be written in
+    // order -- hence no early exit.
+    std::vector<bool> touched(nodes_.size(), false);
+    touched[node.index()] = true;
+    nodes_[node.index()].alive = alive;
+
+    for (std::size_t i = node.index() + 1; i < nodes_.size(); ++i) {
+        const NodeHandle parent = nodes_[i].parent;
+        if (parent.valid() && touched[parent.index()]) {
+            touched[i] = true;
+            nodes_[i].alive = alive;
+        }
+    }
+}
+
+void SceneGraph::remove_subtree(NodeHandle node) {
+    // Generations are deliberately not bumped. The slot is never reused -- a
+    // tombstone is permanent until clear() -- so nothing can be confused with
+    // it, and leaving the handle resolvable is what lets undo hand the same
+    // handle back to restore_subtree.
+    set_subtree_alive(node, false);
+}
+
+void SceneGraph::restore_subtree(NodeHandle node) {
+    set_subtree_alive(node, true);
 }
 
 void SceneGraph::set_mesh(NodeHandle node, const GeometryRegistry::MeshView& mesh,

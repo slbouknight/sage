@@ -63,6 +63,10 @@ struct SceneNode {
     // shadow pass -- an icon marking a light must not cast a shadow of its own
     // -- and out of captures, which are meant to be the render, not the tool.
     bool editor_only = false;
+
+    // False for a node that has been deleted. It stays in the array rather than
+    // being erased; see remove_subtree for why.
+    bool alive = true;
 };
 
 // A mutable scene hierarchy, stored flat.
@@ -111,19 +115,52 @@ public:
     // size(). An invalid handle clears every flag.
     void mark_subtree(NodeHandle node, std::vector<std::uint32_t>& flags) const;
 
+    // Deletes a node and everything beneath it.
+    //
+    // Tombstoned, not erased. Handles carry an index into this array, so
+    // compacting it would silently repoint every handle past the hole --
+    // deleting node 3 would leave a handle to node 5 naming node 6. Marking
+    // instead keeps every surviving handle correct, keeps parents ahead of
+    // their children without a re-sort, and keeps object-id picking valid,
+    // since an id is an index and indices no longer move.
+    //
+    // The cost is that the array only grows, and that the deleted node's
+    // geometry stays resident -- the registries bump-allocate and free nothing
+    // below a full reset (see ADR 0011). That same property is what makes
+    // restore_subtree free, and undo with it.
+    void remove_subtree(NodeHandle node);
+    // Puts one back, for undo. Restores exactly the nodes remove_subtree took,
+    // which is why it works from the same handle.
+    void restore_subtree(NodeHandle node);
+
+    // Whether a handle names a node that still exists. find() returns null for
+    // a deleted one; this separates "deleted" from "never valid", which undo
+    // needs and a caller walking the scene does not.
+    [[nodiscard]] bool is_deleted(NodeHandle node) const;
+
     // Recomposes every world transform. Call after changing any local transform.
     void update_transforms();
 
     // Drops every node. Handles issued beforehand stop resolving.
     void clear();
 
+    // Every slot, including tombstoned ones. Callers that walk this must skip
+    // nodes whose `alive` is false; there is no filtered view because the index
+    // is the identity -- an id, a selection flag and a parent all name a slot,
+    // and a compacted view would renumber them.
     [[nodiscard]] std::span<const SceneNode> nodes() const { return nodes_; }
+    // Slots, not live nodes. live_size() is what a read-out should show.
     [[nodiscard]] std::size_t size() const { return nodes_.size(); }
+    [[nodiscard]] std::size_t live_size() const;
     [[nodiscard]] bool empty() const { return nodes_.empty(); }
 
 private:
+    // Whether the handle resolves to a slot at all -- index in range and
+    // generation current. Says nothing about whether that slot is alive.
     [[nodiscard]] bool is_live(NodeHandle node) const;
     SceneNode* mutable_find(NodeHandle node);
+    // Marks a node and its descendants, for remove and restore alike.
+    void set_subtree_alive(NodeHandle node, bool alive);
 
     std::vector<SceneNode> nodes_;
     // Parallel to nodes_, but deliberately not shrunk by clear(): an index

@@ -30,8 +30,11 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "file_picker.hpp"
@@ -199,6 +202,54 @@ private:
     // Queued for the same reason: adding one uploads its icon mesh.
     std::optional<PendingLight> pending_light_;
     void service_pending_light();
+    // Deletes the selection and everything beneath it. Immediate rather than
+    // queued: nothing is freed, so no in-flight command buffer is invalidated.
+    void delete_selected();
+
+    // One reversible edit.
+    //
+    // Closures rather than a variant of command types: every operation here is
+    // a handful of captured values and two calls into the scene graph, and a
+    // class hierarchy for that would be more machinery than the thing it
+    // describes. They capture by value and `this`, which outlives the stack.
+    struct Command {
+        std::string name;
+        std::function<void()> undo;
+        std::function<void()> redo;
+    };
+    // Pushes a command, discarding anything that had been undone past the
+    // cursor -- the usual rule: a new edit after an undo forks the history and
+    // the abandoned branch goes.
+    // Records an addition, which undo tombstones and redo restores.
+    void push_add_command(std::string name, gpu::NodeHandle added,
+                          gpu::NodeHandle previous_selection);
+    // Closes a transform drag, pushing one command for the whole gesture.
+    // Does nothing when the value came back unchanged.
+    void commit_transform_edit();
+    void commit_light_edit();
+    void push_light_command(std::string name, gpu::NodeHandle node, const gpu::SceneLight& before,
+                            const gpu::SceneLight& after);
+    void push_command(std::string name, std::function<void()> undo, std::function<void()> redo);
+    void undo();
+    void redo();
+    [[nodiscard]] bool can_undo() const { return undo_cursor_ > 0; }
+    [[nodiscard]] bool can_redo() const { return undo_cursor_ < undo_stack_.size(); }
+    // Drops the history. Called when the registries rewind, which is the one
+    // thing here that genuinely cannot be reversed.
+    void clear_history();
+
+    std::vector<Command> undo_stack_;
+    // How many commands are currently applied. Undo steps it back, redo
+    // forward; everything at or past it has been undone.
+    std::size_t undo_cursor_ = 0;
+
+    // A transform edit in progress, and the value it started from. Both the
+    // gizmo and the Properties drags run across many frames, so the command is
+    // pushed on release -- otherwise one drag would leave a hundred entries and
+    // Ctrl+Z would rewind a frame at a time.
+    std::optional<std::pair<gpu::NodeHandle, glm::mat4>> transform_edit_;
+    // The same, for the light fields in the Properties panel.
+    std::optional<std::pair<gpu::NodeHandle, gpu::SceneLight>> light_edit_;
     // Builds a primitive, sizes it against the scene, and drops it in. Returns
     // false when the geometry did not fit.
     bool add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position);
@@ -259,7 +310,9 @@ private:
     void reposition_default_light();
     // Adds a light node, with the small mesh that makes it visible and
     // clickable, at `position`.
-    bool add_light(gpu::LightType type, const glm::vec3& position);
+    // `record` false for the default light, which is setup rather than an edit
+    // and must not be the first thing Ctrl+Z reaches for.
+    bool add_light(gpu::LightType type, const glm::vec3& position, bool record = true);
 
     // The light add_default_light created, and the transform it was left with.
     // Comparing against that transform is how "still a default" is decided --

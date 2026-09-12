@@ -263,6 +263,10 @@ constexpr float k_right_column_fraction = 0.22F;
 constexpr float k_overlay_margin = 12.0F;
 constexpr float k_overlay_alpha = 0.55F;
 
+// Edits kept on the undo stack. Deep enough that no realistic session runs
+// off the end, shallow enough that the closures cannot accumulate unboundedly.
+constexpr std::size_t k_max_undo_depth = 128;
+
 // Menu content has no panel to stretch into, so widgets that would otherwise
 // fill the available width need one given to them.
 constexpr float k_menu_item_width = 220.0F;
@@ -558,6 +562,13 @@ bool Application::load_model(const PendingLoad& load) {
     // where the scene has grown and a marker sized for the old one is in the
     // wrong place -- but only while the light is still untouched.
     reposition_default_light();
+
+    // Only an additive load. A replacing one ran clear_scene on the way in,
+    // which rewound the registries and dropped the history with them: there is
+    // no previous scene left to go back to.
+    if (!load.replace) {
+        push_add_command("Add " + load.path.filename().string(), loaded->root, selected_);
+    }
     return true;
 }
 
@@ -580,6 +591,12 @@ void Application::clear_scene() {
     // that were opened. Deferred because the storage belongs to the Hierarchy
     // window, which is only current inside its own Begin/End.
     hierarchy_state_stale_ = true;
+
+    // Every handle on the stack has just gone stale, and the registries have
+    // rewound, so nothing here could be put back even if the handles survived.
+    // Dropping the history is the honest answer; a Ctrl+Z that silently did
+    // nothing would be worse.
+    clear_history();
 
     // A light is a node, so clearing the graph removed it. Without putting one
     // back, the next model would load into a scene with nothing lighting it.
@@ -626,7 +643,7 @@ std::uint32_t Application::collect_lights(std::array<gpu::Light, gpu::k_max_ligh
     std::uint32_t count = 0;
 
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.has_light) {
+        if (!node.alive || !node.has_light) {
             continue;
         }
         if (count >= gpu::k_max_lights) {
@@ -659,7 +676,7 @@ std::uint32_t Application::collect_lights(std::array<gpu::Light, gpu::k_max_ligh
 gpu::NodeHandle Application::first_directional_light() const {
     for (std::size_t i = 0; i < scene_graph_.nodes().size(); ++i) {
         const gpu::SceneNode& node = scene_graph_.nodes()[i];
-        if (node.has_light && node.light.type == gpu::LightType::directional) {
+        if (node.alive && node.has_light && node.light.type == gpu::LightType::directional) {
             return scene_graph_.handle_at(i);
         }
     }
@@ -678,7 +695,7 @@ Application::Bounds Application::scene_bounds() const {
         // be sized against a scene the markers made bigger, and repositioning
         // the default light would move the very icon that set the bounds it
         // was positioned from.
-        if (!node.has_mesh || node.editor_only) {
+        if (!node.alive || !node.has_mesh || node.editor_only) {
             continue;
         }
         const glm::vec3& local_min = node.mesh.bounds_min;
@@ -857,7 +874,7 @@ void Application::record_shadow(VkCommandBuffer command_buffer, std::uint32_t fr
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
         // editor_only skipped as well as mesh-less: a marker standing for a
         // light must not cast a shadow of its own.
-        if (!node.has_mesh || node.editor_only) {
+        if (!node.alive || !node.has_mesh || node.editor_only) {
             continue;
         }
         // The same struct the main pass pushes. This pipeline's shader declares
@@ -1033,8 +1050,9 @@ void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t fra
 
     for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
         const gpu::SceneNode& node = scene_graph_.nodes()[index];
-        if (!node.has_mesh) {
-            // Pure transform nodes: glTF hierarchy nodes, and the per-load root.
+        if (!node.alive || !node.has_mesh) {
+            // Deleted, or a pure transform node: glTF hierarchy nodes, and the
+            // per-load root.
             continue;
         }
         if (node.editor_only && !show_editor_meshes) {
@@ -1746,7 +1764,7 @@ void Application::draw_stats_overlay() {
     ImGui::Text("%.1f fps  %.2f ms", static_cast<double>(io.Framerate),
                 1000.0 / static_cast<double>(io.Framerate));
     ImGui::Separator();
-    ImGui::Text("%zu nodes", scene_graph_.size());
+    ImGui::Text("%zu nodes", scene_graph_.live_size());
     ImGui::Text("Geometry  %llu / %llu KiB",
                 static_cast<unsigned long long>(geometry_registry_.used() / 1024),
                 static_cast<unsigned long long>(geometry_registry_.capacity() / 1024));
@@ -1792,6 +1810,26 @@ void Application::draw_menu_bar() {
         } else {
             ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
                                 viewport_rect_.extent.height);
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Edit")) {
+        // Labelled with what they would actually reverse, so the menu says
+        // "Undo Transform" rather than leaving you to remember what you did.
+        const std::string undo_label =
+            can_undo() ? "Undo " + undo_stack_[undo_cursor_ - 1].name : std::string("Undo");
+        const std::string redo_label =
+            can_redo() ? "Redo " + undo_stack_[undo_cursor_].name : std::string("Redo");
+        if (ImGui::MenuItem(undo_label.c_str(), "Ctrl+Z", false, can_undo())) {
+            undo();
+        }
+        if (ImGui::MenuItem(redo_label.c_str(), "Ctrl+Y", false, can_redo())) {
+            redo();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Delete", "Del", false, scene_graph_.find(selected_) != nullptr)) {
+            delete_selected();
         }
         ImGui::EndMenu();
     }
@@ -1928,18 +1966,20 @@ bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& positi
     glm::mat4 transform = glm::translate(glm::mat4(1.0F), position + glm::vec3(0.0F, lift, 0.0F));
     transform = glm::scale(transform, glm::vec3(scale));
 
+    const gpu::NodeHandle previous_selection = selected_;
     const gpu::NodeHandle node =
         scene_graph_.add_node(gpu::NodeHandle{}, transform, gpu::primitive_name(kind));
     scene_graph_.set_mesh(node, view, material_index);
     scene_graph_.update_transforms();
     select(node);
+    push_add_command(std::string("Add ") + gpu::primitive_name(kind), node, previous_selection);
 
     SAGE_LOG_INFO("Added {} at ({:.3f}, {:.3f}, {:.3f}), scale {:.3f}", gpu::primitive_name(kind),
                   position.x, position.y, position.z, scale);
     return true;
 }
 
-bool Application::add_light(gpu::LightType type, const glm::vec3& position) {
+bool Application::add_light(gpu::LightType type, const glm::vec3& position, bool record) {
     const bool directional = type == gpu::LightType::directional;
 
     gpu::SceneLight authored;
@@ -1963,6 +2003,7 @@ bool Application::add_light(gpu::LightType type, const glm::vec3& position) {
         transform *= orientation_pointing_down_along(k_default_key_direction);
     }
 
+    const gpu::NodeHandle previous_selection = selected_;
     const gpu::NodeHandle node = scene_graph_.add_node(
         gpu::NodeHandle{}, transform, directional ? "Directional Light" : "Point Light");
     scene_graph_.set_light(node, authored);
@@ -2017,6 +2058,10 @@ bool Application::add_light(gpu::LightType type, const glm::vec3& position) {
     scene_graph_.set_editor_only(icon_node, true);
     scene_graph_.update_transforms();
     select(node);
+    if (record) {
+        push_add_command(directional ? "Add directional light" : "Add point light", node,
+                         previous_selection);
+    }
 
     SAGE_LOG_INFO("Added {} at ({:.3f}, {:.3f}, {:.3f})",
                   directional ? "directional light" : "point light", position.x, position.y,
@@ -2028,8 +2073,12 @@ void Application::add_default_light() {
     // The scene is almost always empty here -- clear_scene calls this before
     // anything is loaded -- so this position is a placeholder that
     // reposition_default_light replaces once there is something to measure.
-    static_cast<void>(
-        add_light(gpu::LightType::directional, glm::vec3(0.0F, k_default_light_height, 0.0F)));
+    // Not recorded. The default light is setup rather than an edit: putting it
+    // on the stack means the very first Ctrl+Z in a fresh scene deletes the
+    // only light and leaves the viewport dark, undoing something the user
+    // never did.
+    static_cast<void>(add_light(gpu::LightType::directional,
+                                glm::vec3(0.0F, k_default_light_height, 0.0F), false));
     // add_light selects what it adds, which is how its handle is recovered
     // without threading a return value through it.
     default_light_ = selected_;
@@ -2077,6 +2126,160 @@ void Application::reposition_default_light() {
     scene_graph_.set_local_transform(default_light_, transform);
     scene_graph_.update_transforms();
     default_light_transform_ = transform;
+}
+
+// An addition is undone by tombstoning what it added and redone by putting it
+// back. Neither touches the registries, so the geometry never moves -- which is
+// the whole reason undo here is cheap.
+void Application::push_add_command(std::string name, gpu::NodeHandle added,
+                                   gpu::NodeHandle previous_selection) {
+    push_command(
+        std::move(name),
+        [this, added, previous_selection]() {
+            scene_graph_.remove_subtree(added);
+            select(previous_selection);
+        },
+        [this, added]() {
+            scene_graph_.restore_subtree(added);
+            scene_graph_.update_transforms();
+            select(added);
+        });
+}
+
+void Application::commit_transform_edit() {
+    if (!transform_edit_.has_value()) {
+        return;
+    }
+    // Plain locals rather than a structured binding: a binding cannot be
+    // captured by the lambdas below.
+    const gpu::NodeHandle node = transform_edit_->first;
+    const glm::mat4 before = transform_edit_->second;
+    transform_edit_.reset();
+
+    const gpu::SceneNode* current = scene_graph_.find(node);
+    if (current == nullptr || current->local_transform == before) {
+        // A click that moved nothing, or a node deleted mid-drag. Neither is an
+        // edit, and an entry for it would make Ctrl+Z appear to do nothing.
+        return;
+    }
+    const glm::mat4 after = current->local_transform;
+
+    push_command(
+        "Transform",
+        [this, node, before]() {
+            scene_graph_.set_local_transform(node, before);
+            scene_graph_.update_transforms();
+            select(node);
+        },
+        [this, node, after]() {
+            scene_graph_.set_local_transform(node, after);
+            scene_graph_.update_transforms();
+            select(node);
+        });
+}
+
+void Application::push_light_command(std::string name, gpu::NodeHandle node,
+                                     const gpu::SceneLight& before, const gpu::SceneLight& after) {
+    push_command(
+        std::move(name),
+        [this, node, before]() {
+            scene_graph_.set_light(node, before);
+            select(node);
+        },
+        [this, node, after]() {
+            scene_graph_.set_light(node, after);
+            select(node);
+        });
+}
+
+void Application::commit_light_edit() {
+    if (!light_edit_.has_value()) {
+        return;
+    }
+    const gpu::NodeHandle node = light_edit_->first;
+    const gpu::SceneLight before = light_edit_->second;
+    light_edit_.reset();
+
+    const gpu::SceneNode* current = scene_graph_.find(node);
+    if (current == nullptr) {
+        return;
+    }
+    push_light_command("Light", node, before, current->light);
+}
+
+void Application::push_command(std::string name, std::function<void()> undo_action,
+                               std::function<void()> redo_action) {
+    // Anything already undone is dropped: the history is a line, not a tree,
+    // and a new edit made after stepping back replaces what was ahead.
+    undo_stack_.resize(undo_cursor_);
+    undo_stack_.push_back(Command{std::move(name), std::move(undo_action), std::move(redo_action)});
+
+    // Bounded so a long session cannot grow it without limit. Dropping from the
+    // front costs an O(n) shift on a vector, which happens once per edit past
+    // the cap and is nothing next to the edit itself.
+    if (undo_stack_.size() > k_max_undo_depth) {
+        undo_stack_.erase(undo_stack_.begin());
+    }
+    undo_cursor_ = undo_stack_.size();
+}
+
+void Application::undo() {
+    if (!can_undo()) {
+        return;
+    }
+    --undo_cursor_;
+    undo_stack_[undo_cursor_].undo();
+    SAGE_LOG_INFO("Undo: {}", undo_stack_[undo_cursor_].name);
+}
+
+void Application::redo() {
+    if (!can_redo()) {
+        return;
+    }
+    undo_stack_[undo_cursor_].redo();
+    SAGE_LOG_INFO("Redo: {}", undo_stack_[undo_cursor_].name);
+    ++undo_cursor_;
+}
+
+void Application::clear_history() {
+    undo_stack_.clear();
+    undo_cursor_ = 0;
+    transform_edit_.reset();
+    light_edit_.reset();
+}
+
+void Application::delete_selected() {
+    if (scene_graph_.find(selected_) == nullptr) {
+        return;
+    }
+    const gpu::NodeHandle target = selected_;
+    // Cleared first: the outline and the properties panel both read the
+    // selection, and leaving it pointing at a tombstone would ask them to
+    // describe something that is no longer there.
+    select(gpu::NodeHandle{});
+    scene_graph_.remove_subtree(target);
+
+    // No wait_idle and no queueing, unlike a load or a clear. Nothing is freed
+    // here -- the geometry stays exactly where it was -- so an in-flight
+    // command buffer that still names it remains correct. All that changed is
+    // which nodes the next frame walks.
+    //
+    // That is also why undoing this is just un-tombstoning: the mesh never
+    // left, so there is nothing to upload again.
+    push_command(
+        "Delete",
+        [this, target]() {
+            scene_graph_.restore_subtree(target);
+            scene_graph_.update_transforms();
+            select(target);
+        },
+        [this, target]() {
+            select(gpu::NodeHandle{});
+            scene_graph_.remove_subtree(target);
+        });
+
+    SAGE_LOG_INFO("Deleted subtree; {} of {} slots live", scene_graph_.live_size(),
+                  scene_graph_.size());
 }
 
 void Application::service_pending_light() {
@@ -2199,7 +2402,7 @@ void Application::draw_lighting_menu() {
     std::uint32_t directional = 0;
     std::uint32_t point = 0;
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.has_light) {
+        if (!node.alive || !node.has_light) {
             continue;
         }
         (node.light.type == gpu::LightType::directional ? directional : point) += 1;
@@ -2264,9 +2467,24 @@ void Application::draw_properties_panel() {
                                           glm::value_ptr(rotation), glm::value_ptr(scale));
 
     bool edited = false;
+    bool activated = false;
+    bool released = false;
+
     edited |= ImGui::DragFloat3("Position", glm::value_ptr(translation), 0.01F);
+    activated |= ImGui::IsItemActivated();
+    released |= ImGui::IsItemDeactivatedAfterEdit();
     edited |= ImGui::DragFloat3("Rotation", glm::value_ptr(rotation), 0.5F);
+    activated |= ImGui::IsItemActivated();
+    released |= ImGui::IsItemDeactivatedAfterEdit();
     edited |= ImGui::DragFloat3("Scale", glm::value_ptr(scale), 0.01F);
+    activated |= ImGui::IsItemActivated();
+    released |= ImGui::IsItemDeactivatedAfterEdit();
+
+    // Recorded before the edit is written below, so the stored value is the one
+    // the drag began from.
+    if (activated && !transform_edit_.has_value()) {
+        transform_edit_ = std::make_pair(selected_, node->local_transform);
+    }
 
     if (edited) {
         // A zero on any axis makes the matrix singular, which the next
@@ -2278,6 +2496,9 @@ void Application::draw_properties_panel() {
         scene_graph_.set_local_transform(selected_, local);
         scene_graph_.update_transforms();
     }
+    if (released) {
+        commit_transform_edit();
+    }
 
     ImGui::Separator();
     if (node->has_light) {
@@ -2285,20 +2506,40 @@ void Application::draw_properties_panel() {
         gpu::SceneLight light = node->light;
 
         int type = static_cast<int>(light.type);
-        bool light_edited = ImGui::Combo("Type", &type, "Directional\0Point\0");
+        const bool type_changed = ImGui::Combo("Type", &type, "Directional\0Point\0");
+        bool light_edited = type_changed;
         light.type = static_cast<gpu::LightType>(type);
 
+        bool light_activated = false;
+        bool light_released = false;
         light_edited |= ImGui::ColorEdit3("Colour", glm::value_ptr(light.color));
+        light_activated |= ImGui::IsItemActivated();
+        light_released |= ImGui::IsItemDeactivatedAfterEdit();
         light_edited |= ImGui::DragFloat("Intensity", &light.intensity, 0.1F, 0.0F, 500.0F);
+        light_activated |= ImGui::IsItemActivated();
+        light_released |= ImGui::IsItemDeactivatedAfterEdit();
         if (light.type == gpu::LightType::point) {
             light_edited |= ImGui::DragFloat("Range", &light.range, 0.05F, 0.01F, 500.0F);
+            light_activated |= ImGui::IsItemActivated();
+            light_released |= ImGui::IsItemDeactivatedAfterEdit();
         } else {
             // A directional light has no position, only a bearing, and the
             // rotate gizmo is how that is set.
             ImGui::TextDisabled("Rotate to aim; position is only the icon's.");
         }
+        // The type combo commits in one go, so it is its own command rather
+        // than the start of a drag.
+        if (type_changed) {
+            push_light_command("Change light type", selected_, node->light, light);
+        }
+        if (light_activated && !light_edit_.has_value()) {
+            light_edit_ = std::make_pair(selected_, node->light);
+        }
         if (light_edited) {
             scene_graph_.set_light(selected_, light);
+        }
+        if (light_released) {
+            commit_light_edit();
         }
         ImGui::Separator();
     }
@@ -2362,6 +2603,16 @@ bool Application::draw_gizmo() {
         static_cast<ImGuizmo::OPERATION>(gizmo_operation_),
         gizmo_local_space_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD, glm::value_ptr(world));
 
+    // A drag runs over many frames and writes a transform on each. Recording
+    // where it started and pushing once on release is what makes Ctrl+Z undo
+    // the drag rather than one frame of it.
+    if (ImGuizmo::IsUsing() && !transform_edit_.has_value()) {
+        transform_edit_ = std::make_pair(selected_, node->local_transform);
+    }
+    if (!ImGuizmo::IsUsing()) {
+        commit_transform_edit();
+    }
+
     if (changed) {
         // Back out of world space into the parent's. The parent's world
         // transform is already final this frame -- parents precede children --
@@ -2402,6 +2653,9 @@ void Application::draw_hierarchy_panel() {
     ChildTable children(nodes.size());
     std::vector<std::uint32_t> roots;
     for (std::uint32_t i = 0; i < nodes.size(); ++i) {
+        if (!nodes[i].alive) {
+            continue;
+        }
         if (nodes[i].parent.valid()) {
             children[nodes[i].parent.index()].push_back(i);
         } else {
@@ -2614,6 +2868,22 @@ void Application::run() {
         // and there is no reason a capture should be.
         if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
             request_screenshot();
+        }
+        // Gated on the keyboard, so Delete typed into the file dialog's path
+        // field edits the text rather than the scene.
+        if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+            delete_selected();
+        }
+        if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::GetIO().KeyCtrl) {
+            // Ctrl+Y and Ctrl+Shift+Z both redo. The first is what was asked
+            // for; the second is what a hand trained on other editors reaches
+            // for, and supporting one does not cost the other.
+            if (ImGui::IsKeyPressed(ImGuiKey_Y) ||
+                (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))) {
+                redo();
+            } else if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
+                undo();
+            }
         }
         // Before picking: a drag that ends over a different object must not
         // also reselect it, and ImGuizmo only reports IsUsing() once drawn.
