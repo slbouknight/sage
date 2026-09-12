@@ -24,6 +24,7 @@ add_library(sage_gpu STATIC
     src/frame_pacer.cpp
     src/geometry_registry.cpp
     src/gltf_loader.cpp
+    src/hdr_target.cpp
     src/imgui_layer.cpp
     src/instance.cpp
     src/material_registry.cpp
@@ -32,6 +33,7 @@ add_library(sage_gpu STATIC
     src/pipeline_cache.cpp
     src/sampler.cpp
     src/scene.cpp
+    src/screenshot.cpp
     src/selection_buffer.cpp
     src/id_buffer.cpp
     src/shader_module.cpp
@@ -50,7 +52,9 @@ target_include_directories(sage_gpu PUBLIC
 )
 
 # PRIVATE: stb_image.h is included by texture.cpp alone, which is also the
-# single translation unit defining STB_IMAGE_IMPLEMENTATION.
+# single translation unit defining STB_IMAGE_IMPLEMENTATION; screenshot.cpp does
+# the same for stb_image_write.h. Two headers, two implementation macros, two
+# translation units -- neither can see the other's definition.
 # SYSTEM: stb is public-domain C, and its implementation trips -Wold-style-cast,
 # -Wconversion and friends by the dozen. -isystem silences warnings originating
 # inside the header without weakening any flag for our own code.

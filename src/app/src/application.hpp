@@ -9,6 +9,7 @@
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/gltf_loader.hpp>
+#include <sage/gpu/hdr_target.hpp>
 #include <sage/gpu/id_buffer.hpp>
 #include <sage/gpu/imgui_layer.hpp>
 #include <sage/gpu/instance.hpp>
@@ -26,6 +27,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -49,8 +51,15 @@ private:
     // Returns false when the window is minimized and the frame should be
     // skipped entirely.
     bool recreate_swapchain();
-    void record_scene(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view,
-                      VkExtent2D extent, std::uint32_t frame_slot) const;
+    // Shades into hdr_target_, not the swapchain: values above 1.0 have to
+    // survive as far as the tonemap, and an 8-bit attachment would clamp them
+    // where they were written.
+    void record_scene(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const;
+    // Resolves hdr_target_ to the swapchain through the tonemap curve. Also
+    // where the swapchain image first enters COLOR_ATTACHMENT_OPTIMAL, since
+    // nothing before this point touches it.
+    void record_tonemap(VkCommandBuffer command_buffer, VkImage image,
+                        VkImageView image_view) const;
     // Split out of record_scene because the UI draws into the same swapchain
     // image and must get there before it is handed to the presentation engine.
     static void transition_to_present(VkCommandBuffer command_buffer, VkImage image);
@@ -59,6 +68,9 @@ private:
     // what stops a new one landing on top of an existing one.
     void draw_dockspace();
     void draw_ui();
+    // Tonemap controls and the capture button. Grouped because both are about
+    // how the frame is presented rather than what is in it.
+    void draw_presentation_controls();
     void draw_hierarchy_panel();
     void draw_properties_panel();
     // Draws the manipulator and writes any drag back into the scene graph.
@@ -92,6 +104,18 @@ private:
     // Reads the copied texel back and resolves it to a node. Must run only
     // after the submission carrying record_pick_copy has completed.
     void resolve_pick();
+
+    // Queues a capture for the end of this frame. Names the file here rather
+    // than at write time so a burst of captures cannot collide on a timestamp.
+    void request_screenshot();
+    // Copies the viewport out of the tonemapped swapchain image. Recorded
+    // between the tonemap and the outline, so the file holds the rendered image
+    // and none of the editor's overlays. Non-const: it allocates the readback
+    // buffer, whose size is not known until the viewport rect is.
+    void record_screenshot_copy(VkCommandBuffer command_buffer, VkImage image);
+    // Encodes the copied pixels to PNG and releases the readback buffer. Same
+    // rule as resolve_pick: only after the submission carrying the copy is done.
+    void resolve_screenshot();
     // Records a new selection. The flag upload it implies is deferred rather
     // than done here, because this is reachable from inside a panel's draw.
     void select(gpu::NodeHandle node);
@@ -151,6 +175,24 @@ private:
     int gizmo_operation_ = 0;
     bool gizmo_local_space_ = false;
 
+    // Which curve the tonemap applies. Stored as int to match the push
+    // constant; the values are TonemapOperator in application.cpp, which must
+    // agree with shaders/tonemap.slang.
+    int tonemap_operator_ = 0;
+    // Exposure in stops, which is the unit it is reasoned about in. Converted
+    // to the linear multiplier the shader wants at push time.
+    float exposure_stops_ = 0.0F;
+
+    // Where the next capture goes, set on request and cleared once written.
+    std::optional<std::filesystem::path> pending_screenshot_;
+    // Allocated only while a capture is in flight. A permanent readback buffer
+    // would cost a swapchain's worth of host memory -- 33 MiB at 4K -- for a
+    // feature used a handful of times a session.
+    std::unique_ptr<gpu::Buffer> screenshot_buffer_;
+    // The region actually copied, kept because viewport_rect_ may have moved by
+    // the time the pixels are read back.
+    VkExtent2D screenshot_extent_{};
+
     FilePicker file_picker_;
     std::optional<FilePicker::Request> pending_load_;
     bool pending_clear_ = false;
@@ -177,9 +219,11 @@ private:
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;
     gpu::IdBuffer id_buffer_;
+    gpu::HdrTarget hdr_target_;
     gpu::PipelineCache pipeline_cache_;
     gpu::GraphicsPipeline pipeline_;
     gpu::GraphicsPipeline outline_pipeline_;
+    gpu::GraphicsPipeline tonemap_pipeline_;
     gpu::FramePacer frame_pacer_;
     // Last, so it is destroyed first: its teardown frees Vulkan objects and
     // touches the device, both of which must still be alive.

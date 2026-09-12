@@ -4,6 +4,7 @@
 #include <sage/core/math.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/light.hpp>
+#include <sage/gpu/screenshot.hpp>
 #include <sage/gpu/selection_buffer.hpp>
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vertex.hpp>
@@ -19,13 +20,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace sage::app {
@@ -123,6 +128,42 @@ static_assert(offsetof(OutlinePushConstants, color) == 16);
 static_assert(offsetof(OutlinePushConstants, thickness) == 28);
 static_assert(sizeof(OutlinePushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
+// Must match the k_operator_* constants in shaders/tonemap.slang.
+enum class TonemapOperator : std::int32_t {
+    none = 0,
+    reinhard = 1,
+    aces = 2,
+};
+
+// Parallel to the enum above, for the combo box. An array rather than a
+// function of the enum so the two orders cannot drift apart unnoticed.
+constexpr std::array<const char*, 3> k_tonemap_names{"None (clamp)", "Reinhard", "ACES (fitted)"};
+
+// Must match PushConstants in shaders/tonemap.slang. Verified against the
+// compiled SPIR-V, which decorates these members Offset 0 and Offset 4.
+struct TonemapPushConstants {
+    float exposure = 1.0F;
+    std::int32_t tonemap_operator = 0;
+};
+static_assert(offsetof(TonemapPushConstants, exposure) == 0);
+static_assert(offsetof(TonemapPushConstants, tonemap_operator) == 4);
+static_assert(sizeof(TonemapPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
+
+// Range of the exposure slider, in stops. Four either way covers "the scene is
+// lit for a sunny day" to "the scene is lit by one lantern" without the slider
+// becoming too coarse to make a small correction with.
+constexpr float k_min_exposure_stops = -4.0F;
+constexpr float k_max_exposure_stops = 4.0F;
+
+// Captures land here, relative to the working directory. Git-ignored: these are
+// output, and a portfolio screenshot belongs in a README by hand rather than
+// accumulating in the tree.
+constexpr const char* k_screenshot_directory = "screenshots";
+
+// Bytes per pixel in the swapchain format, for sizing the readback buffer.
+// Every format is_capturable_format accepts is 8-bit RGBA or BGRA.
+constexpr VkDeviceSize k_swapchain_bytes_per_pixel = 4;
+
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
 
@@ -147,6 +188,26 @@ std::filesystem::path pipeline_cache_path() {
     return std::filesystem::path(".sage-pipeline-cache.bin");
 }
 
+// A timestamped path under k_screenshot_directory, disambiguated if one already
+// exists. The timestamp resolves to the second, so two captures in the same
+// second would otherwise silently overwrite each other.
+std::filesystem::path next_screenshot_path() {
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm local{};
+    localtime_r(&now, &local);
+
+    std::array<char, 32> stamp{};
+    std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local);
+
+    const std::filesystem::path directory{k_screenshot_directory};
+    std::filesystem::path candidate = directory / ("sage-" + std::string(stamp.data()) + ".png");
+    for (int suffix = 2; std::filesystem::exists(candidate); ++suffix) {
+        candidate = directory /
+                    ("sage-" + std::string(stamp.data()) + "-" + std::to_string(suffix) + ".png");
+    }
+    return candidate;
+}
+
 // 64 MiB. The 4 MiB this started at suited one lantern; the picker can now be
 // pointed at anything, and additive loads accumulate. Reserved device-local up
 // front, which is comfortable on any discrete GPU and fine on integrated.
@@ -159,8 +220,9 @@ constexpr VkDeviceSize k_geometry_capacity = 64ULL * 1024 * 1024;
 constexpr float k_left_column_fraction = 0.22F;
 // Of the remainder after the left column, so ~22% of the window.
 constexpr float k_right_column_fraction = 0.28F;
-// The stats read-out is a handful of lines; the picker below it wants the rest.
-constexpr float k_stats_fraction = 0.35F;
+// The stats read-out is a handful of lines, plus the tonemap and capture
+// controls; the picker below it wants the rest.
+constexpr float k_stats_fraction = 0.5F;
 // The right column is split between the scene tree and the properties of
 // whatever is selected in it.
 constexpr float k_hierarchy_fraction = 0.5F;
@@ -245,11 +307,14 @@ Application::Application(const std::filesystem::path& model_path)
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       depth_buffer_(allocator_, device_, swapchain_.extent()),
       id_buffer_(allocator_, device_, swapchain_.extent()),
+      hdr_target_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
       pipeline_(device_,
                 gpu::GraphicsPipelineDesc{
                     .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
-                    .color_format = swapchain_.format(),
+                    // The HDR target, not the swapchain: this pass no longer
+                    // writes anything a display sees directly.
+                    .color_format = gpu::HdrTarget::format(),
                     .id_format = gpu::IdBuffer::format(),
                     .depth_format = depth_buffer_.format(),
                     .set_layout = bindless_set_.layout(),
@@ -258,6 +323,11 @@ Application::Application(const std::filesystem::path& model_path)
       outline_pipeline_(device_,
                         gpu::GraphicsPipelineDesc{
                             .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "outline.spv",
+                            // Still the swapchain. The outline is an editor
+                            // affordance, not a lit surface: drawing it into
+                            // the HDR target would put it through the tonemap,
+                            // which would quietly change the colour asked for
+                            // into a darker, less saturated one.
                             .color_format = swapchain_.format(),
                             // No id attachment and no depth: this pass reads
                             // ids, it does not write them, and a full-screen
@@ -267,10 +337,25 @@ Application::Application(const std::filesystem::path& model_path)
                             .set_layout = bindless_set_.layout(),
                             .cache = pipeline_cache_.handle(),
                         }),
+      tonemap_pipeline_(device_,
+                        gpu::GraphicsPipelineDesc{
+                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "tonemap.spv",
+                            .color_format = swapchain_.format(),
+                            .cull_backfaces = false,
+                            .set_layout = bindless_set_.layout(),
+                            .cache = pipeline_cache_.handle(),
+                        }),
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
     bindless_set_.write_object_id_image(id_buffer_.view());
+    bindless_set_.write_hdr_color_image(hdr_target_.view());
     gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
+    tonemap_operator_ = static_cast<int>(TonemapOperator::aces);
+
+    if (!gpu::is_capturable_format(swapchain_.format())) {
+        SAGE_LOG_WARN("Swapchain format {} cannot be captured; screenshots are disabled",
+                      static_cast<int>(swapchain_.format()));
+    }
 
     if (model_path.empty()) {
         SAGE_LOG_INFO("No model given; use the Load glTF panel to pick one");
@@ -358,12 +443,13 @@ Application::CameraMatrices Application::camera_matrices() const {
     return matrices;
 }
 
-void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
-                               VkImageView image_view, VkExtent2D extent,
-                               std::uint32_t frame_slot) const {
+void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
     VkImageMemoryBarrier2 to_color{};
     to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // FRAGMENT_SHADER as the source stage, not COLOR_ATTACHMENT_OUTPUT: the
+    // previous frame's last use of this image was the tonemap sampling it, and
+    // that read has to finish before this frame overwrites it.
+    to_color.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     to_color.srcAccessMask = VK_ACCESS_2_NONE;
     to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -371,7 +457,7 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.image = image;
+    to_color.image = hdr_target_.image();
     to_color.subresourceRange = k_color_range;
 
     VkImageMemoryBarrier2 to_depth{};
@@ -415,10 +501,14 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     // loadOp CLEAR is what replaces M1's vkCmdClearColorImage.
     VkRenderingAttachmentInfo color_attachment{};
     color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = image_view;
+    color_attachment.imageView = hdr_target_.view();
     color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // The clear covers the whole image while the draws below are scissored to
+    // the viewport. That is deliberate: it leaves every texel the tonemap will
+    // read defined, so the resolve can be one full-screen triangle with no
+    // special case for the region behind the panels.
     color_attachment.clearValue.color = k_clear_color;
 
     VkRenderingAttachmentInfo depth_attachment{};
@@ -445,7 +535,7 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     VkRenderingInfo rendering{};
     rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
+    rendering.renderArea.extent = hdr_target_.extent();
     rendering.layerCount = 1;
     rendering.colorAttachmentCount = static_cast<std::uint32_t>(color_attachments.size());
     rendering.pColorAttachments = color_attachments.data();
@@ -525,6 +615,98 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
         vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
     }
 
+    vkCmdEndRendering(command_buffer);
+}
+
+void Application::record_tonemap(VkCommandBuffer command_buffer, VkImage image,
+                                 VkImageView image_view) const {
+    // Two transitions, one dependency. The HDR target stops being an attachment
+    // and becomes a texture; the swapchain image, untouched so far this frame,
+    // becomes an attachment for the first time.
+    VkImageMemoryBarrier2 hdr_to_read{};
+    hdr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    hdr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    hdr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    hdr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    hdr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    hdr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    hdr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    hdr_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hdr_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hdr_to_read.image = hdr_target_.image();
+    hdr_to_read.subresourceRange = k_color_range;
+
+    VkImageMemoryBarrier2 swapchain_to_color{};
+    swapchain_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    swapchain_to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    swapchain_to_color.srcAccessMask = VK_ACCESS_2_NONE;
+    swapchain_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    swapchain_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    swapchain_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    swapchain_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    swapchain_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchain_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchain_to_color.image = image;
+    swapchain_to_color.subresourceRange = k_color_range;
+
+    const std::array<VkImageMemoryBarrier2, 2> barriers{hdr_to_read, swapchain_to_color};
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size());
+    dependency.pImageMemoryBarriers = barriers.data();
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+
+    // DONT_CARE, not CLEAR: the triangle below covers every pixel of the image,
+    // so clearing first would be writing the whole swapchain twice.
+    VkRenderingAttachmentInfo color_attachment{};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    const VkExtent2D extent = swapchain_.extent();
+
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.offset = {0, 0};
+    rendering.renderArea.extent = extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color_attachment;
+
+    vkCmdBeginRendering(command_buffer, &rendering);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, tonemap_pipeline_.handle());
+
+    const VkDescriptorSet descriptor_set = bindless_set_.handle();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            tonemap_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
+
+    // The whole image, not viewport_rect_: the region behind the panels was
+    // cleared by the scene pass and still has to be resolved, or it would show
+    // whatever the presentation engine last left in this swapchain image.
+    VkViewport viewport{};
+    viewport.x = 0.0F;
+    viewport.y = 0.0F;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{{0, 0}, extent};
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    TonemapPushConstants push{};
+    // Stops are a doubling each, which is what the exp2 is: +1 stop is twice
+    // the light reaching the sensor.
+    push.exposure = std::exp2(exposure_stops_);
+    push.tonemap_operator = tonemap_operator_;
+    vkCmdPushConstants(command_buffer, tonemap_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
+                       sizeof(push), &push);
+
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
     vkCmdEndRendering(command_buffer);
 }
 
@@ -777,6 +959,139 @@ void Application::resolve_pick() {
     }
 }
 
+void Application::request_screenshot() {
+    if (pending_screenshot_.has_value()) {
+        // One in flight already. Queuing a second would overwrite the readback
+        // buffer the first is still waiting on.
+        return;
+    }
+    if (!gpu::is_capturable_format(swapchain_.format())) {
+        SAGE_LOG_WARN("Swapchain format cannot be captured");
+        return;
+    }
+    pending_screenshot_ = next_screenshot_path();
+}
+
+void Application::record_screenshot_copy(VkCommandBuffer command_buffer, VkImage image) {
+    if (!pending_screenshot_.has_value()) {
+        return;
+    }
+
+    // The 3D view alone. Everything outside it is either the background the
+    // scene pass cleared or, once ImGui has drawn, editor chrome -- and this
+    // runs before ImGui anyway, so the panels would be blank rectangles.
+    const VkRect2D region_rect = viewport_rect_;
+    screenshot_extent_ = region_rect.extent;
+
+    const VkDeviceSize size = VkDeviceSize{screenshot_extent_.width} * screenshot_extent_.height *
+                              k_swapchain_bytes_per_pixel;
+    screenshot_buffer_ = std::make_unique<gpu::Buffer>(
+        allocator_, device_, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu::BufferAccess::host_read);
+
+    VkImageMemoryBarrier2 to_transfer_src{};
+    to_transfer_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_transfer_src.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_transfer_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_transfer_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_transfer_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_src.image = image;
+    to_transfer_src.subresourceRange = k_color_range;
+
+    VkDependencyInfo to_transfer_dependency{};
+    to_transfer_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    to_transfer_dependency.imageMemoryBarrierCount = 1;
+    to_transfer_dependency.pImageMemoryBarriers = &to_transfer_src;
+    vkCmdPipelineBarrier2(command_buffer, &to_transfer_dependency);
+
+    // bufferRowLength 0 means "rows are packed to imageExtent", which is the
+    // layout write_png expects.
+    VkBufferImageCopy2 region{};
+    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {region_rect.offset.x, region_rect.offset.y, 0};
+    region.imageExtent = {screenshot_extent_.width, screenshot_extent_.height, 1};
+
+    VkCopyImageToBufferInfo2 copy{};
+    copy.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+    copy.srcImage = image;
+    copy.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    copy.dstBuffer = screenshot_buffer_->handle();
+    copy.regionCount = 1;
+    copy.pRegions = &region;
+    vkCmdCopyImageToBuffer2(command_buffer, &copy);
+
+    // Back to an attachment: the outline and then ImGui still draw into this
+    // image, and transition_to_present expects to find it in that layout.
+    VkImageMemoryBarrier2 to_color{};
+    to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_color.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_color.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // READ as well as WRITE: the outline pass that follows begins with
+    // loadOp LOAD, which reads the attachment before blending over it. Granting
+    // only write access here is a read-after-write hazard that ordinary
+    // validation does not see and synchronisation validation does.
+    to_color.dstAccessMask =
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
+    to_color.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_color.image = image;
+    to_color.subresourceRange = k_color_range;
+
+    // Same reasoning as the pick copy: waiting on the submission alone does not
+    // make the copy visible to the host. The HOST stage has to be named.
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = screenshot_buffer_->handle();
+    to_host.offset = 0;
+    to_host.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo back_dependency{};
+    back_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    back_dependency.bufferMemoryBarrierCount = 1;
+    back_dependency.pBufferMemoryBarriers = &to_host;
+    back_dependency.imageMemoryBarrierCount = 1;
+    back_dependency.pImageMemoryBarriers = &to_color;
+    vkCmdPipelineBarrier2(command_buffer, &back_dependency);
+}
+
+void Application::resolve_screenshot() {
+    if (!pending_screenshot_.has_value() || screenshot_buffer_ == nullptr) {
+        return;
+    }
+
+    // Blocking, like resolve_pick: a capture is a deliberate one-off, so the
+    // simpler code is worth more than the frame it costs.
+    frame_pacer_.wait_all();
+
+    std::vector<std::byte> pixels(screenshot_buffer_->size());
+    screenshot_buffer_->read(pixels.data(), screenshot_buffer_->size());
+
+    static_cast<void>(
+        gpu::write_png(*pending_screenshot_, screenshot_extent_, swapchain_.format(), pixels));
+
+    pending_screenshot_.reset();
+    screenshot_buffer_.reset();
+}
+
 void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage image) {
     VkImageMemoryBarrier2 to_present{};
     to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -868,6 +1183,7 @@ void Application::draw_ui() {
     const glm::vec3 position = camera_.position();
     ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
                 static_cast<double>(position.y), static_cast<double>(position.z));
+    draw_presentation_controls();
     ImGui::End();
 
     // Queued rather than serviced here: this is the middle of a frame, and the
@@ -881,6 +1197,33 @@ void Application::draw_ui() {
         // not something to do with a frame half-recorded.
         pending_clear_ = true;
     }
+}
+
+void Application::draw_presentation_controls() {
+    ImGui::SeparatorText("Tonemap");
+
+    // Selectable at runtime rather than baked in, because the difference between
+    // two curves is only legible on the same frame -- comparing across a rebuild
+    // compares two memories of an image.
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::Combo("##tonemap", &tonemap_operator_, k_tonemap_names.data(),
+                 static_cast<int>(k_tonemap_names.size()));
+    if (tonemap_operator_ == static_cast<int>(TonemapOperator::none)) {
+        ImGui::TextDisabled("Clamped, as before M8");
+    }
+
+    ImGui::SliderFloat("Exposure", &exposure_stops_, k_min_exposure_stops, k_max_exposure_stops,
+                       "%+.2f stops");
+
+    ImGui::SeparatorText("Capture");
+    // Disabled rather than hidden while one is in flight: the button vanishing
+    // for a frame reads as a misclick.
+    ImGui::BeginDisabled(pending_screenshot_.has_value());
+    if (ImGui::Button("Screenshot (F2)", ImVec2(-FLT_MIN, 0.0F))) {
+        request_screenshot();
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width, viewport_rect_.extent.height);
 }
 
 void Application::draw_properties_panel() {
@@ -1083,10 +1426,17 @@ bool Application::recreate_swapchain() {
     swapchain_.recreate(extent);
     depth_buffer_.recreate(swapchain_.extent());
     id_buffer_.recreate(swapchain_.extent());
-    // The old view is gone, so the descriptor naming it has to be rewritten.
+    hdr_target_.recreate(swapchain_.extent());
+    // The old views are gone, so the descriptors naming them have to be
+    // rewritten.
     bindless_set_.write_object_id_image(id_buffer_.view());
+    bindless_set_.write_hdr_color_image(hdr_target_.view());
     // A pick names a texel in an image that no longer exists.
     pending_pick_.reset();
+    // Same for a capture: the region it named was measured against the old
+    // viewport, and the buffer it would read was sized for that.
+    pending_screenshot_.reset();
+    screenshot_buffer_.reset();
     return true;
 }
 
@@ -1200,6 +1550,12 @@ void Application::run() {
 
         handle_gizmo_keys();
 
+        // Not in handle_gizmo_keys: that is gated on the camera not being flown,
+        // and there is no reason a capture should be.
+        if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
+            request_screenshot();
+        }
+
         // Before picking: a drag that ends over a different object must not
         // also reselect it, and ImGuizmo only reports IsUsing() once drawn.
         const bool gizmo_active = draw_gizmo();
@@ -1214,8 +1570,13 @@ void Application::run() {
         draw_hierarchy_panel();
         draw_properties_panel();
 
-        record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
-                     swapchain_.extent(), frame.slot);
+        // Pass order is load-bearing. The scene shades into the HDR target; the
+        // tonemap resolves it to the swapchain and is the first thing to touch
+        // that image; the capture takes the resolved scene before any editor
+        // overlay reaches it; the outline and then ImGui draw on top.
+        record_scene(frame.command_buffer, frame.slot);
+        record_tonemap(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index));
+        record_screenshot_copy(frame.command_buffer, acquired.image);
         record_outline(frame.command_buffer, swapchain_.image_view(acquired.index));
         record_pick_copy(frame.command_buffer);
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
@@ -1225,9 +1586,10 @@ void Application::run() {
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
 
-        // After submit, so the copy has been handed to the GPU; resolve_pick
-        // waits for it before touching the mapping.
+        // After submit, so the copies have been handed to the GPU; both of these
+        // wait for it before touching their mappings.
         resolve_pick();
+        resolve_screenshot();
 
         const VkResult present_result = swapchain_.present(device_.present_queue(), acquired.index);
         if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR ||
