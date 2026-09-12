@@ -9,10 +9,12 @@
 #include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
 
+#include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
 // The DockBuilder API is internal and has no public equivalent. Confined to
 // this file, and only for the one-time default layout; everything else uses
 // the public header.
+#include <ImGuizmo.h>
 #include <imgui_internal.h>
 
 #include <algorithm>
@@ -35,6 +37,8 @@ const glm::vec3 k_initial_camera_position{2.0F, 1.5F, 3.0F};
 constexpr float k_initial_camera_yaw = -2.16F;    // radians
 constexpr float k_initial_camera_pitch = -0.39F;  // radians
 constexpr float k_field_of_view_degrees = 60.0F;
+constexpr float k_near_plane = 0.1F;
+constexpr float k_far_plane = 1000.0F;
 
 // Radians per pixel of the mouse movement.
 constexpr float k_mouse_sensitivity = 0.003F;
@@ -157,6 +161,9 @@ constexpr float k_left_column_fraction = 0.22F;
 constexpr float k_right_column_fraction = 0.28F;
 // The stats read-out is a handful of lines; the picker below it wants the rest.
 constexpr float k_stats_fraction = 0.35F;
+// The right column is split between the scene tree and the properties of
+// whatever is selected in it.
+constexpr float k_hierarchy_fraction = 0.5F;
 
 // Fraction of the bounding sphere's fitted distance to back off by, so the
 // model does not touch the edges of the view.
@@ -263,6 +270,7 @@ Application::Application(const std::filesystem::path& model_path)
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
     bindless_set_.write_object_id_image(id_buffer_.view());
+    gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
 
     if (model_path.empty()) {
         SAGE_LOG_INFO("No model given; use the Load glTF panel to pick one");
@@ -336,6 +344,18 @@ void Application::service_pending_load() {
 Application::~Application() {
     // Everything below must outlive in-flight GPU work.
     device_.wait_idle();
+}
+
+Application::CameraMatrices Application::camera_matrices() const {
+    const float aspect = static_cast<float>(viewport_rect_.extent.width) /
+                         static_cast<float>(viewport_rect_.extent.height);
+    const float fov = glm::radians(k_field_of_view_degrees);
+
+    CameraMatrices matrices;
+    matrices.view = camera_.view_matrix();
+    matrices.projection = core::perspective_vk(fov, aspect, k_near_plane, k_far_plane);
+    matrices.projection_gl = core::perspective_gl(fov, aspect, k_near_plane, k_far_plane);
+    return matrices;
 }
 
 void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
@@ -453,15 +473,13 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
 
     vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
 
-    const float aspect = viewport.width / viewport.height;
-    const glm::mat4 projection =
-        core::perspective_vk(glm::radians(k_field_of_view_degrees), aspect, 0.1F, 1000.0F);
+    const CameraMatrices matrices = camera_matrices();
 
     // One write per frame, into this frame's own slot. Writing a single shared
     // slot would race the GPU, which may still be reading the previous frame's
     // copy. begin_frame() has already waited out the work that used this slot.
     FrameData frame_data;
-    frame_data.view_projection = projection * camera_.view_matrix();
+    frame_data.view_projection = matrices.projection * matrices.view;
     frame_data.camera_position = camera_.position();
 
     // A scene owned light list arrives with the editor. What's important here
@@ -549,6 +567,21 @@ void Application::handle_picking_input() {
     }
 
     pending_pick_ = VkOffset2D{texel_x, texel_y};
+}
+
+void Application::handle_gizmo_keys() {
+    // Gated on the camera not being flown: W/E/R are also part of WASD, and
+    // holding the right button means the keys belong to the camera.
+    if (gpu::ImGuiLayer::wants_keyboard() || ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_W)) {
+        gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_E)) {
+        gizmo_operation_ = static_cast<int>(ImGuizmo::ROTATE);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+        gizmo_operation_ = static_cast<int>(ImGuizmo::SCALE);
+    }
 }
 
 void Application::select(gpu::NodeHandle node) {
@@ -803,7 +836,13 @@ void Application::draw_dockspace() {
 
     ImGui::DockBuilderDockWindow("sage", left_top);
     ImGui::DockBuilderDockWindow("Load glTF", left_bottom);
-    ImGui::DockBuilderDockWindow("Hierarchy", right);
+    ImGuiID right_top = 0;
+    ImGuiID right_bottom = 0;
+    ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, k_hierarchy_fraction, &right_top,
+                                &right_bottom);
+
+    ImGui::DockBuilderDockWindow("Hierarchy", right_top);
+    ImGui::DockBuilderDockWindow("Properties", right_bottom);
     ImGui::DockBuilderFinish(dockspace);
 
     // The split above changed the central node, so the rect taken before it is
@@ -842,6 +881,122 @@ void Application::draw_ui() {
         // not something to do with a frame half-recorded.
         pending_clear_ = true;
     }
+}
+
+void Application::draw_properties_panel() {
+    ImGui::Begin("Properties");
+
+    const gpu::SceneNode* node = scene_graph_.find(selected_);
+    if (node == nullptr) {
+        ImGui::TextDisabled("Nothing selected.");
+        ImGui::TextDisabled("Click an object, or a row in the Hierarchy.");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("%s", node->name.c_str());
+    ImGui::Separator();
+
+    // Decomposed with ImGuizmo's own helper rather than glm's, so the numbers
+    // shown here and the numbers a drag produces come from the same code. Two
+    // decompositions that disagree on, say, euler order would make the panel
+    // jitter while dragging.
+    glm::mat4 local = node->local_transform;
+    glm::vec3 translation{0.0F};
+    glm::vec3 rotation{0.0F};
+    glm::vec3 scale{1.0F};
+    ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(local), glm::value_ptr(translation),
+                                          glm::value_ptr(rotation), glm::value_ptr(scale));
+
+    bool edited = false;
+    edited |= ImGui::DragFloat3("Position", glm::value_ptr(translation), 0.01F);
+    edited |= ImGui::DragFloat3("Rotation", glm::value_ptr(rotation), 0.5F);
+    edited |= ImGui::DragFloat3("Scale", glm::value_ptr(scale), 0.01F);
+
+    if (edited) {
+        // A zero on any axis makes the matrix singular, which the next
+        // decomposition cannot undo -- the node would be stuck flat.
+        scale = glm::max(scale, glm::vec3(1e-4F));
+        ImGuizmo::RecomposeMatrixFromComponents(glm::value_ptr(translation),
+                                                glm::value_ptr(rotation), glm::value_ptr(scale),
+                                                glm::value_ptr(local));
+        scene_graph_.set_local_transform(selected_, local);
+        scene_graph_.update_transforms();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Mesh: %s", node->has_mesh ? "yes" : "no");
+    if (node->has_mesh) {
+        ImGui::Text("Indices: %u", node->mesh.index_count);
+        ImGui::Text("Material: %u", node->material_index);
+    }
+
+    ImGui::Separator();
+    // Radio buttons rather than a combo: three options that change with one
+    // click, and the keyboard shortcuts below mirror them.
+    int operation = gizmo_operation_;
+    ImGui::TextUnformatted("Gizmo");
+    ImGui::RadioButton("Move (W)", &operation, static_cast<int>(ImGuizmo::TRANSLATE));
+    ImGui::SameLine();
+    ImGui::RadioButton("Rotate (E)", &operation, static_cast<int>(ImGuizmo::ROTATE));
+    ImGui::SameLine();
+    ImGui::RadioButton("Scale (R)", &operation, static_cast<int>(ImGuizmo::SCALE));
+    gizmo_operation_ = operation;
+
+    // Scale is always along the object's own axes; offering a world-space
+    // scale would just be a lie about what the gizmo does.
+    if (gizmo_operation_ != static_cast<int>(ImGuizmo::SCALE)) {
+        ImGui::Checkbox("Local space", &gizmo_local_space_);
+    }
+
+    ImGui::End();
+}
+
+bool Application::draw_gizmo() {
+    const gpu::SceneNode* node = scene_graph_.find(selected_);
+    if (node == nullptr) {
+        return false;
+    }
+
+    ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
+    ImGuizmo::SetOrthographic(false);
+
+    // ImGui's logical coordinates, not framebuffer pixels: the gizmo is drawn
+    // through ImGui's draw list, which works in the same space the mouse does.
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const VkExtent2D extent = swapchain_.extent();
+    const float to_logical_x = viewport->Size.x / static_cast<float>(extent.width);
+    const float to_logical_y = viewport->Size.y / static_cast<float>(extent.height);
+    ImGuizmo::SetRect(viewport->Pos.x + static_cast<float>(viewport_rect_.offset.x) * to_logical_x,
+                      viewport->Pos.y + static_cast<float>(viewport_rect_.offset.y) * to_logical_y,
+                      static_cast<float>(viewport_rect_.extent.width) * to_logical_x,
+                      static_cast<float>(viewport_rect_.extent.height) * to_logical_y);
+
+    const CameraMatrices matrices = camera_matrices();
+
+    // The gizmo manipulates a world transform, which is what makes dragging a
+    // child behave the way the screen suggests rather than in its parent's
+    // rotated frame.
+    glm::mat4 world = node->world_transform;
+
+    const bool changed = ImGuizmo::Manipulate(
+        glm::value_ptr(matrices.view), glm::value_ptr(matrices.projection_gl),
+        static_cast<ImGuizmo::OPERATION>(gizmo_operation_),
+        gizmo_local_space_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD, glm::value_ptr(world));
+
+    if (changed) {
+        // Back out of world space into the parent's. The parent's world
+        // transform is already final this frame -- parents precede children --
+        // so no re-composition is needed before inverting it.
+        glm::mat4 parent_world{1.0F};
+        if (const gpu::SceneNode* parent = scene_graph_.find(node->parent); parent != nullptr) {
+            parent_world = parent->world_transform;
+        }
+        scene_graph_.set_local_transform(selected_, glm::inverse(parent_world) * world);
+        scene_graph_.update_transforms();
+    }
+
+    return ImGuizmo::IsUsing();
 }
 
 void Application::draw_hierarchy_panel() {
@@ -1030,6 +1185,9 @@ void Application::run() {
         // out-of-date path above bails without rendering, and an unterminated
         // ImGui frame would trip the next NewFrame().
         gpu::ImGuiLayer::begin_frame();
+        // After ImGui::NewFrame and before anything queries the gizmo: it
+        // caches per-frame state of its own.
+        ImGuizmo::BeginFrame();
         // First, so the panels below have a dockspace to place themselves in.
         draw_dockspace();
 
@@ -1040,11 +1198,21 @@ void Application::run() {
             pending_frame_.reset();
         }
 
+        handle_gizmo_keys();
+
+        // Before picking: a drag that ends over a different object must not
+        // also reselect it, and ImGuizmo only reports IsUsing() once drawn.
+        const bool gizmo_active = draw_gizmo();
+
         // After draw_dockspace, which refreshes viewport_rect_, and before the
         // panels, so a click is tested against this frame's layout.
-        handle_picking_input();
+        if (!gizmo_active) {
+            handle_picking_input();
+        }
+
         draw_ui();
         draw_hierarchy_panel();
+        draw_properties_panel();
 
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
                      swapchain_.extent(), frame.slot);

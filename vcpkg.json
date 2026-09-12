@@ -13,6 +13,7 @@
         "vulkan-binding"
       ]
     },
+    "imguizmo",
     "glfw3",
     "glm",
     "spdlog",

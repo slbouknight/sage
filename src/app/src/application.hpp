@@ -60,10 +60,28 @@ private:
     void draw_dockspace();
     void draw_ui();
     void draw_hierarchy_panel();
+    void draw_properties_panel();
+    // Draws the manipulator and writes any drag back into the scene graph.
+    // Returns true while the gizmo is being dragged, which suppresses picking
+    // so that releasing over another object does not reselect.
+    bool draw_gizmo();
+
+    struct CameraMatrices {
+        glm::mat4 view{1.0F};
+        // Vulkan convention, with Y flipped for NDC. What the scene renders with.
+        glm::mat4 projection{1.0F};
+        // The same projection without the flip, for ImGuizmo.
+        glm::mat4 projection_gl{1.0F};
+    };
+    // Derived from the camera and the current viewport rect, so the gizmo and
+    // the scene pass cannot disagree about where a point lands on screen.
+    [[nodiscard]] CameraMatrices camera_matrices() const;
 
     // Turns a click in the 3D view into a pending object-id readback. No-op
     // when a panel has the pointer or the cursor is outside the viewport.
     void handle_picking_input();
+    // W/E/R switch the manipulator, as in Unreal and Blender.
+    void handle_gizmo_keys();
     // Copies the picked texel out of the id attachment. Recorded after the
     // scene, so the value read is the one this frame just drew.
     void record_pick_copy(VkCommandBuffer command_buffer) const;
@@ -126,6 +144,12 @@ private:
     // nothing changed.
     std::vector<std::uint32_t> selection_flags_;
     bool selection_dirty_ = false;
+    // Which manipulator is active. Stored as int to keep ImGuizmo's enum out
+    // of this header; application.cpp casts it back.
+    // ImGuizmo::TRANSLATE, assigned in the constructor body so the enum stays
+    // out of this header.
+    int gizmo_operation_ = 0;
+    bool gizmo_local_space_ = false;
 
     FilePicker file_picker_;
     std::optional<FilePicker::Request> pending_load_;

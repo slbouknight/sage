@@ -18,4 +18,14 @@ namespace sage::core {
     return projection;
 }
 
+// The same projection without the Y flip, i.e. OpenGL's convention where NDC
+// +Y points up. Needed by anything that projects to the screen itself rather
+// than letting Vulkan's viewport do it -- ImGuizmo assumes GL-style NDC, and
+// handing it perspective_vk() puts the gizmo upside down relative to the scene
+// it is supposed to be sitting on.
+[[nodiscard]] inline glm::mat4 perspective_gl(float fov_y_radians, float aspect, float near_plane,
+                                              float far_plane) {
+    return glm::perspective(fov_y_radians, aspect, near_plane, far_plane);
+}
+
 }  // namespace sage::core
