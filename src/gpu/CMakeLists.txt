@@ -21,6 +21,7 @@ add_library(sage_gpu STATIC
     src/buffer.cpp
     src/depth_buffer.cpp
     src/device.cpp
+    src/drag_gesture.cpp
     src/frame_pacer.cpp
     src/geometry_registry.cpp
     src/gltf_loader.cpp
@@ -31,6 +32,7 @@ add_library(sage_gpu STATIC
     src/material_registry.cpp
     src/physical_device.cpp
     src/pipeline.cpp
+    src/primitives.cpp
     src/pipeline_cache.cpp
     src/sampler.cpp
     src/scene.cpp

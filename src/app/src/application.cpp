@@ -29,6 +29,7 @@
 #include <ctime>
 #include <filesystem>
 #include <memory>
+#include <numbers>
 #include <span>
 #include <string>
 #include <vector>
@@ -252,15 +253,23 @@ std::filesystem::path next_screenshot_path() {
 // Overrunning it drops primitives with a message rather than aborting.
 constexpr VkDeviceSize k_geometry_capacity = 64ULL * 1024 * 1024;
 
-// Default dock layout, as fractions of the node being split. The left column
-// carries the read-out and the file picker, the right the scene tree, and what
-// is left in the middle is the 3D view.
-constexpr float k_left_column_fraction = 0.22F;
-// Of the remainder after the left column, so ~22% of the window.
-constexpr float k_right_column_fraction = 0.28F;
-// The stats read-out is a handful of lines, plus the tonemap and capture
-// controls; the picker below it wants the rest.
-constexpr float k_stats_fraction = 0.5F;
+// The one docked column, as a fraction of the window. It carries the scene
+// tree over the selection's properties; everything else is a menu, an overlay
+// or a dialog, and the rest of the window is the 3D view.
+constexpr float k_right_column_fraction = 0.22F;
+// Inset of the read-out from the 3D view's top-right corner, and how opaque
+// its backing is: enough to stay legible over a bright surface without hiding
+// what is behind it.
+constexpr float k_overlay_margin = 12.0F;
+constexpr float k_overlay_alpha = 0.55F;
+
+// Edits kept on the undo stack. Deep enough that no realistic session runs
+// off the end, shallow enough that the closures cannot accumulate unboundedly.
+constexpr std::size_t k_max_undo_depth = 128;
+
+// Menu content has no panel to stretch into, so widgets that would otherwise
+// fill the available width need one given to them.
+constexpr float k_menu_item_width = 220.0F;
 // The right column is split between the scene tree and the properties of
 // whatever is selected in it.
 constexpr float k_hierarchy_fraction = 0.5F;
@@ -268,6 +277,87 @@ constexpr float k_hierarchy_fraction = 0.5F;
 // Fraction of the bounding sphere's fitted distance to back off by, so the
 // model does not touch the edges of the view.
 constexpr float k_framing_margin = 1.15F;
+
+// Neutral, slightly rough dielectric. Bright enough to read against the dark
+// background without being the brightest thing in frame.
+constexpr float k_primitive_albedo = 0.8F;
+constexpr float k_primitive_roughness = 0.6F;
+
+// A new primitive's size, as a fraction of the current scene's radius. A plane
+// is ground, so it wants to run past the edge of frame; a solid wants to look
+// like an object sitting next to what is already there.
+//
+// The plane's factor is a trade rather than a taste: the shadow frustum is
+// fitted to the whole scene, so a ground plane several times the model's size
+// spends most of the shadow map on empty floor and coarsens the shadow on the
+// model itself. Three is about where a floor still reads as a floor.
+constexpr float k_plane_scene_fraction = 3.0F;
+// Smaller than it first looks it should be, because a ground plane inflates
+// the scene's diagonal that this is measured against: add a plane and then a
+// sphere, and the sphere is sized against a scene the plane just made half as
+// big again. A third keeps both orders sensible.
+constexpr float k_solid_scene_fraction = 0.3F;
+
+// A light icon marks a position; it is not an object in the scene, so it is a
+// good deal smaller than a primitive added deliberately. Small enough to read
+// as a marker rather than as geometry, but still a comfortable click target at
+// the distances the camera frames a scene from.
+constexpr float k_light_icon_fraction = 0.020F;
+// A point light's reach, as a fraction of the scene. Beyond this the windowed
+// falloff takes it to zero.
+constexpr float k_point_range_fraction = 2.0F;
+// A directional light's intensity is irradiance and does not fall off. A point
+// light's divides by distance squared, so it needs far more to read at all.
+constexpr float k_default_key_intensity = 8.0F;
+constexpr float k_default_point_intensity = 60.0F;
+
+// Mostly along -X, with far less -Z than the obvious diagonal.
+//
+// The obvious diagonal is what this was, and it is wrong for a default: the
+// camera starts at +X, +Y, +Z and framing puts it back there, so a light
+// shining along -X, -Y, -Z travels straight down the view axis. Its shadow
+// falls directly behind the object, where the object itself hides it -- which
+// looks exactly like shadows being broken. Casting across the view instead
+// puts the shadow beside the subject, where it can be seen.
+const glm::vec3 k_default_key_direction{-0.80F, -0.50F, -0.33F};
+
+// Where the default light starts, before anything is loaded to measure. Only
+// its icon's position; a directional light shades by rotation alone.
+constexpr float k_default_light_height = 2.0F;
+// Once there is a scene: how far back along the beam the marker sits, and the
+// clearance above the scene's top it is never allowed below, both as fractions
+// of the scene radius.
+constexpr float k_default_light_distance = 2.0F;
+constexpr float k_default_light_clearance = 0.3F;
+
+constexpr float k_pi_f = std::numbers::pi_v<float>;
+
+// A rotation whose -Y axis lands on `direction`, built as a basis rather than
+// through glm's quaternion helpers: those live in GLM_GTX, which needs
+// GLM_ENABLE_EXPERIMENTAL defined across every translation unit that includes
+// glm. That is a project-wide decision to take for one rotation, and this is
+// four lines.
+glm::mat4 orientation_pointing_down_along(const glm::vec3& direction) {
+    const glm::vec3 down = glm::normalize(direction);
+    // The node's +Y is the opposite of where the light shines.
+    const glm::vec3 up = -down;
+    // Any hint not parallel to up; world X fails only when the light points
+    // along X, which world Z then covers.
+    const glm::vec3 hint =
+        std::abs(up.x) > 0.99F ? glm::vec3(0.0F, 0.0F, 1.0F) : glm::vec3(1.0F, 0.0F, 0.0F);
+    const glm::vec3 right = glm::normalize(glm::cross(hint, up));
+    const glm::vec3 forward = glm::cross(up, right);
+    return glm::mat4(glm::vec4(right, 0.0F), glm::vec4(up, 0.0F), glm::vec4(forward, 0.0F),
+                     glm::vec4(0.0F, 0.0F, 0.0F, 1.0F));
+}
+
+// Where a context-menu placement lands when the cursor ray never meets the
+// ground plane -- looking up, or along it. Far enough to be in front of the
+// camera rather than inside it, near enough to stay in frame.
+constexpr float k_fallback_placement_distance = 5.0F;
+// Past this, a ray that technically does hit the ground is hitting it so far
+// away that the object would be invisible. Treated as a miss.
+constexpr float k_max_placement_distance = 1000.0F;
 
 // The dockspace's central node in framebuffer pixels, or the whole image when
 // there is no layout yet. Free rather than a member so ImGuiID stays out of
@@ -415,13 +505,17 @@ Application::Application(const std::filesystem::path& model_path)
     bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
     gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
     tonemap_operator_ = static_cast<int>(TonemapOperator::aces);
-
     if (!gpu::is_capturable_format(swapchain_.format())) {
         SAGE_LOG_WARN("Swapchain format {} cannot be captured; screenshots are disabled",
                       static_cast<int>(swapchain_.format()));
     }
 
     if (model_path.empty()) {
+        // Nothing will call clear_scene, so the default light is this path's to
+        // create. With a model named, load_model clears first and clear_scene
+        // puts one back -- doing it here as well would build one and throw it
+        // away a line later.
+        add_default_light();
         SAGE_LOG_INFO("No model given; use the Load glTF panel to pick one");
         return;
     }
@@ -429,20 +523,28 @@ Application::Application(const std::filesystem::path& model_path)
     // Through the same path a picker click takes, so a command-line model gets
     // no special handling and a bad argument is a message rather than a crash
     // before the window is ever useful.
-    if (!load_model(model_path, true)) {
+    if (!load_model(PendingLoad{model_path, true, std::nullopt})) {
         SAGE_LOG_WARN("Starting with an empty scene");
     }
 }
 
-bool Application::load_model(const std::filesystem::path& path, bool replace) {
-    if (replace) {
+bool Application::load_model(const PendingLoad& load) {
+    if (load.replace) {
         clear_scene();
     }
 
     const std::optional<gpu::LoadedScene> loaded = gpu::load_gltf(
-        path, geometry_registry_, texture_registry_, material_registry_, scene_graph_);
+        load.path, geometry_registry_, texture_registry_, material_registry_, scene_graph_);
     if (!loaded.has_value()) {
         return false;
+    }
+
+    // Everything from a file hangs off one root, so placing the load is one
+    // transform rather than a walk.
+    if (load.placement.has_value()) {
+        scene_graph_.set_local_transform(loaded->root,
+                                         glm::translate(glm::mat4(1.0F), *load.placement));
+        scene_graph_.update_transforms();
     }
 
     // Only when the load actually drew something and had the viewport to
@@ -452,8 +554,20 @@ bool Application::load_model(const std::filesystem::path& path, bool replace) {
     // Queued rather than applied: framing needs the central node's aspect, and
     // the dockspace does not exist yet when the constructor loads a model named
     // on the command line.
-    if (replace && loaded->mesh_count > 0) {
+    if (load.replace && loaded->mesh_count > 0) {
         pending_frame_ = SceneBounds{loaded->bounds_min, loaded->bounds_max};
+    }
+
+    // Now that there is something to measure. Also runs for an additive load,
+    // where the scene has grown and a marker sized for the old one is in the
+    // wrong place -- but only while the light is still untouched.
+    reposition_default_light();
+
+    // Only an additive load. A replacing one ran clear_scene on the way in,
+    // which rewound the registries and dropped the history with them: there is
+    // no previous scene left to go back to.
+    if (!load.replace) {
+        push_add_command("Add " + load.path.filename().string(), loaded->root, selected_);
     }
     return true;
 }
@@ -469,6 +583,24 @@ void Application::clear_scene() {
     geometry_registry_.reset();
     material_registry_.reset();
     texture_registry_.reset();
+
+    // The tree's open/closed state is keyed on node index, and indices restart
+    // at zero after this. Without dropping it, a replace-load would inherit
+    // whatever the previous scene had been expanded to -- so the next file
+    // would come up part-opened on nodes that have nothing to do with the ones
+    // that were opened. Deferred because the storage belongs to the Hierarchy
+    // window, which is only current inside its own Begin/End.
+    hierarchy_state_stale_ = true;
+
+    // Every handle on the stack has just gone stale, and the registries have
+    // rewound, so nothing here could be put back even if the handles survived.
+    // Dropping the history is the honest answer; a Ctrl+Z that silently did
+    // nothing would be worse.
+    clear_history();
+
+    // A light is a node, so clearing the graph removed it. Without putting one
+    // back, the next model would load into a scene with nothing lighting it.
+    add_default_light();
 }
 
 void Application::service_pending_load() {
@@ -482,11 +614,11 @@ void Application::service_pending_load() {
         return;
     }
 
-    const FilePicker::Request request = *pending_load_;
+    const PendingLoad load = *pending_load_;
     pending_load_.reset();
 
-    if (!load_model(request.path, request.replace)) {
-        SAGE_LOG_ERROR("Could not load {}", request.path.string());
+    if (!load_model(load)) {
+        SAGE_LOG_ERROR("Could not load {}", load.path.string());
     }
 }
 
@@ -507,12 +639,63 @@ Application::CameraMatrices Application::camera_matrices() const {
     return matrices;
 }
 
+std::uint32_t Application::collect_lights(std::array<gpu::Light, gpu::k_max_lights>& lights) const {
+    std::uint32_t count = 0;
+
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.alive || !node.has_light) {
+            continue;
+        }
+        if (count >= gpu::k_max_lights) {
+            // Dropped rather than grown: the frame buffer's light array is a
+            // fixed size the shader also declares, so the limit is a layout
+            // fact rather than a policy this function can bend.
+            break;
+        }
+
+        gpu::Light& light = lights[count];
+        light.type = node.light.type;
+        light.color = node.light.color;
+        light.intensity = node.light.intensity;
+        light.range = node.light.range;
+        // Both derived from the transform, which is what makes the gizmo work
+        // on a light at all.
+        light.position = glm::vec3(node.world_transform[3]);
+        // -Y is the canonical direction, so an unrotated light points down and
+        // the rotate gizmo tilts it from there. Normalised because a scaled
+        // node would otherwise hand the shader a non-unit direction, which the
+        // BRDF has no way to notice and every dot product would be wrong by.
+        const glm::vec3 down = glm::mat3(node.world_transform) * glm::vec3(0.0F, -1.0F, 0.0F);
+        const float length = glm::length(down);
+        light.direction = length > 1e-6F ? down / length : glm::vec3(0.0F, -1.0F, 0.0F);
+        ++count;
+    }
+    return count;
+}
+
+gpu::NodeHandle Application::first_directional_light() const {
+    for (std::size_t i = 0; i < scene_graph_.nodes().size(); ++i) {
+        const gpu::SceneNode& node = scene_graph_.nodes()[i];
+        if (node.alive && node.has_light && node.light.type == gpu::LightType::directional) {
+            return scene_graph_.handle_at(i);
+        }
+    }
+    return gpu::NodeHandle{};
+}
+
 Application::Bounds Application::scene_bounds() const {
     Bounds bounds{glm::vec3(std::numeric_limits<float>::max()),
                   glm::vec3(std::numeric_limits<float>::lowest())};
 
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.has_mesh) {
+        // editor_only excluded as well as mesh-less. A light icon is not scene
+        // content, and counting it here would cost three separate things: the
+        // shadow frustum would stretch to cover a marker floating above the
+        // subject and spend its resolution on empty air, a new primitive would
+        // be sized against a scene the markers made bigger, and repositioning
+        // the default light would move the very icon that set the bounds it
+        // was positioned from.
+        if (!node.alive || !node.has_mesh || node.editor_only) {
             continue;
         }
         const glm::vec3& local_min = node.mesh.bounds_min;
@@ -533,7 +716,8 @@ Application::Bounds Application::scene_bounds() const {
     return bounds;
 }
 
-Application::LightFit Application::fit_light(const Bounds& bounds) const {
+Application::LightFit Application::fit_light(const Bounds& bounds,
+                                             const glm::vec3& light_direction) const {
     if (bounds.empty()) {
         return {};
     }
@@ -548,7 +732,7 @@ Application::LightFit Application::fit_light(const Bounds& bounds) const {
     // projection and divide by zero.
     const float extent = std::max(radius, 1e-3F);
 
-    const glm::vec3 direction = glm::normalize(key_light_.direction);
+    const glm::vec3 direction = glm::normalize(light_direction);
 
     // Any vector not parallel to the light will do as an up hint; world up
     // fails exactly when the light points straight down, which is a common
@@ -584,37 +768,32 @@ void Application::write_frame_data(std::uint32_t frame_slot) const {
     frame_data.view_projection = matrices.projection * matrices.view;
     frame_data.camera_position = camera_.position();
 
-    // The shader reads data rather than constants, so moving a light is a value
-    // change and not a recompile -- which is what makes a lighting panel
-    // possible at all.
-    frame_data.lights[0].type = gpu::LightType::directional;
-    frame_data.lights[0].direction = glm::normalize(key_light_.direction);
-    frame_data.lights[0].color = key_light_.color;
-    frame_data.lights[0].intensity = key_light_.intensity;
-    frame_data.light_count = 1;
-
-    if (fill_light_.enabled) {
-        frame_data.lights[1].type = gpu::LightType::point;
-        frame_data.lights[1].position = fill_light_.position;
-        frame_data.lights[1].color = fill_light_.color;
-        frame_data.lights[1].intensity = fill_light_.intensity;
-        frame_data.lights[1].range = fill_light_.range;
-        frame_data.light_count = 2;
-    }
-
+    // Gathered from the graph rather than from members. The shader has always
+    // read lights as data; what changed is that the data now comes from nodes,
+    // so a light can be placed, parented and dragged like anything else.
+    frame_data.light_count = collect_lights(frame_data.lights);
     frame_data.ambient_intensity = ambient_intensity_;
 
     // Refitted every frame from live world transforms. A gizmo drag moves
     // geometry, which moves the bounds, which moves the frustum -- so a shadow
     // keeps up with the thing casting it.
-    const LightFit fit = fit_light(scene_bounds());
+    // The shadow map is fitted to one directional light -- the first in the
+    // graph, matching the shader, which spends it on the first directional
+    // light it evaluates. With none in the scene there is nothing to fit and
+    // nothing to cast, so the pass still runs but the lookup is skipped.
+    const gpu::SceneNode* key = scene_graph_.find(first_directional_light());
+    const glm::vec3 key_direction =
+        key != nullptr ? glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F))
+                       : glm::vec3(0.0F, -1.0F, 0.0F);
+
+    const LightFit fit = fit_light(scene_bounds(), key_direction);
     frame_data.light_view_projection = fit.view_projection;
     // Texels converted to world units here, so the shader stays in world space
     // and the slider keeps meaning the same thing at any scene scale.
     frame_data.shadow_normal_bias = shadow_normal_bias_texels_ * fit.world_texel_size;
     frame_data.shadow_pcf_radius = shadow_pcf_radius_;
     frame_data.shadow_texel_size = 1.0F / static_cast<float>(shadow_map_.resolution());
-    frame_data.shadow_enabled = shadows_enabled_ ? 1U : 0U;
+    frame_data.shadow_enabled = (shadows_enabled_ && key != nullptr) ? 1U : 0U;
 
     frame_buffer_.write(&frame_data, sizeof(frame_data),
                         VkDeviceSize{frame_slot} * sizeof(FrameData));
@@ -693,7 +872,9 @@ void Application::record_shadow(VkCommandBuffer command_buffer, std::uint32_t fr
         frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
 
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.has_mesh) {
+        // editor_only skipped as well as mesh-less: a marker standing for a
+        // light must not cast a shadow of its own.
+        if (!node.alive || !node.has_mesh || node.editor_only) {
             continue;
         }
         // The same struct the main pass pushes. This pipeline's shader declares
@@ -859,10 +1040,22 @@ void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t fra
     const VkDeviceAddress frame_address =
         frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
 
+    // Light icons are drawn with the scene so they pick and outline like any
+    // other mesh, but they are the tool rather than the render: hidden with the
+    // panels, and hidden for the frame a no-UI capture is taken on. That frame
+    // is also the one on screen, so pressing F2 without F11 blinks them for a
+    // single frame -- the alternative is rendering the scene twice.
+    const bool show_editor_meshes =
+        !ui_hidden_ && !(pending_screenshot_.has_value() && !screenshot_include_ui_);
+
     for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
         const gpu::SceneNode& node = scene_graph_.nodes()[index];
-        if (!node.has_mesh) {
-            // Pure transform nodes: glTF hierarchy nodes, and the per-load root.
+        if (!node.alive || !node.has_mesh) {
+            // Deleted, or a pure transform node: glTF hierarchy nodes, and the
+            // per-load root.
+            continue;
+        }
+        if (node.editor_only && !show_editor_meshes) {
             continue;
         }
 
@@ -1078,33 +1271,37 @@ void Application::handle_picking_input() {
         return;
     }
 
+    const ImVec2 mouse = ImGui::GetMousePos();
+    pending_pick_ = viewport_texel(mouse.x, mouse.y);
+}
+
+std::optional<VkOffset2D> Application::viewport_texel(float window_x, float window_y) const {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
-        return;
+        return std::nullopt;
     }
 
-    // ImGui reports logical coordinates; the id attachment is framebuffer
+    // ImGui reports logical coordinates; the attachments are framebuffer
     // pixels. Same conversion as central_node_rect, for the same reason.
-    const VkExtent2D extent = id_buffer_.extent();
-    const ImVec2 mouse = ImGui::GetMousePos();
+    const VkExtent2D extent = swapchain_.extent();
     const float x =
-        (mouse.x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
+        (window_x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
     const float y =
-        (mouse.y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
+        (window_y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
 
     const auto texel_x = static_cast<std::int32_t>(x);
     const auto texel_y = static_cast<std::int32_t>(y);
 
-    // Outside the 3D view is not a miss, it is not a pick at all -- clicking
-    // the dockspace border should leave the selection alone.
+    // Outside the 3D view is not a miss, it is not a click in it at all --
+    // clicking the dockspace border should leave the selection alone, and
+    // should not offer to add anything either.
     const VkRect2D& rect = viewport_rect_;
     if (texel_x < rect.offset.x || texel_y < rect.offset.y ||
         texel_x >= rect.offset.x + static_cast<std::int32_t>(rect.extent.width) ||
         texel_y >= rect.offset.y + static_cast<std::int32_t>(rect.extent.height)) {
-        return;
+        return std::nullopt;
     }
-
-    pending_pick_ = VkOffset2D{texel_x, texel_y};
+    return VkOffset2D{texel_x, texel_y};
 }
 
 void Application::handle_gizmo_keys() {
@@ -1477,6 +1674,9 @@ void Application::draw_dockspace() {
     // the layout gave it, so the rect would be a frame behind at best.
     if (ui_hidden_) {
         viewport_rect_ = VkRect2D{{0, 0}, swapchain_.extent()};
+        const ImGuiViewport* whole = ImGui::GetMainViewport();
+        viewport_logical_pos_ = glm::vec2(whole->Pos.x, whole->Pos.y);
+        viewport_logical_size_ = glm::vec2(whole->Size.x, whole->Size.y);
         return;
     }
 
@@ -1489,6 +1689,7 @@ void Application::draw_dockspace() {
         ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_NoDockingOverCentralNode);
 
     viewport_rect_ = central_node_rect(dockspace, swapchain_.extent());
+    update_viewport_logical_rect(dockspace);
 
     if (dock_layout_built_) {
         return;
@@ -1504,70 +1705,187 @@ void Application::draw_dockspace() {
     // and a node that has not been sized yet splits unpredictably.
     ImGui::DockBuilderSetNodeSize(dockspace, ImGui::GetMainViewport()->Size);
 
-    ImGuiID left = 0;
-    ImGuiID centre = 0;
-    ImGui::DockBuilderSplitNode(dockspace, ImGuiDir_Left, k_left_column_fraction, &left, &centre);
-
+    // One column, on the right. The left one is gone: the read-out it held is
+    // now an overlay inside the 3D view and the browser it held is a dialog off
+    // the File menu, so a whole column of screen was being spent on two things
+    // that needed no permanent home.
     ImGuiID right = 0;
-    ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, k_right_column_fraction, &right, &centre);
+    ImGuiID centre = 0;
+    ImGui::DockBuilderSplitNode(dockspace, ImGuiDir_Right, k_right_column_fraction, &right,
+                                &centre);
 
-    ImGuiID left_top = 0;
-    ImGuiID left_bottom = 0;
-    ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, k_stats_fraction, &left_top, &left_bottom);
-
-    ImGui::DockBuilderDockWindow("sage", left_top);
-    ImGui::DockBuilderDockWindow("Load glTF", left_bottom);
     ImGuiID right_top = 0;
     ImGuiID right_bottom = 0;
     ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, k_hierarchy_fraction, &right_top,
                                 &right_bottom);
 
     ImGui::DockBuilderDockWindow("Hierarchy", right_top);
-    // Lighting shares a node with Properties rather than taking a third row.
-    // The two are rarely wanted at once -- Properties describes a selection,
-    // Lighting describes the scene -- and tabs beat three panels each too short
-    // to show their contents. Either can be dragged out at runtime.
-    ImGui::DockBuilderDockWindow("Lighting", right_bottom);
     ImGui::DockBuilderDockWindow("Properties", right_bottom);
     ImGui::DockBuilderFinish(dockspace);
 
     // The split above changed the central node, so the rect taken before it is
     // stale for this frame.
     viewport_rect_ = central_node_rect(dockspace, swapchain_.extent());
+    update_viewport_logical_rect(dockspace);
 }
 
-void Application::draw_ui() {
-    const ImGuiIO& io = ImGui::GetIO();
+void Application::update_viewport_logical_rect(unsigned int dockspace) {
+    const ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace);
+    const ImGuiViewport* whole = ImGui::GetMainViewport();
+    if (central == nullptr || central->Size.x <= 0.0F || central->Size.y <= 0.0F) {
+        viewport_logical_pos_ = glm::vec2(whole->Pos.x, whole->Pos.y);
+        viewport_logical_size_ = glm::vec2(whole->Size.x, whole->Size.y);
+        return;
+    }
+    viewport_logical_pos_ = glm::vec2(central->Pos.x, central->Pos.y);
+    viewport_logical_size_ = glm::vec2(central->Size.x, central->Size.y);
+}
 
-    ImGui::Begin("sage");
-    ImGui::Text("%.1f fps (%.2f ms)", static_cast<double>(io.Framerate),
+void Application::draw_stats_overlay() {
+    // Pinned inside the 3D view rather than to the window, so it tracks the
+    // central node as panels resize and follows the whole screen once they are
+    // hidden.
+    const ImVec2 corner{viewport_logical_pos_.x + viewport_logical_size_.x - k_overlay_margin,
+                        viewport_logical_pos_.y + k_overlay_margin};
+    ImGui::SetNextWindowPos(corner, ImGuiCond_Always, ImVec2(1.0F, 0.0F));
+    ImGui::SetNextWindowBgAlpha(k_overlay_alpha);
+
+    // NoInputs is the one that matters: without it the overlay would swallow
+    // clicks meant for whatever is behind it, and picking would go dead in one
+    // corner of the viewport for no visible reason.
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoInputs;
+
+    ImGui::Begin("##stats", nullptr, flags);
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::Text("%.1f fps  %.2f ms", static_cast<double>(io.Framerate),
                 1000.0 / static_cast<double>(io.Framerate));
     ImGui::Separator();
-    ImGui::Text("Scene: %zu nodes", scene_graph_.size());
-    ImGui::Text("Geometry: %llu / %llu KiB",
+    ImGui::Text("%zu nodes", scene_graph_.live_size());
+    ImGui::Text("Geometry  %llu / %llu KiB",
                 static_cast<unsigned long long>(geometry_registry_.used() / 1024),
                 static_cast<unsigned long long>(geometry_registry_.capacity() / 1024));
-    ImGui::Text("Materials: %u / %u", material_registry_.count(), material_registry_.capacity());
-    ImGui::Text("Textures: %u", texture_registry_.count());
+    ImGui::Text("Materials %u / %u", material_registry_.count(), material_registry_.capacity());
+    ImGui::Text("Textures  %u", texture_registry_.count());
+    ImGui::Separator();
     const gpu::SceneNode* selected = scene_graph_.find(selected_);
-    ImGui::Text("Selected: %s", selected != nullptr ? selected->name.c_str() : "(none)");
+    ImGui::Text("Selected  %s", selected != nullptr ? selected->name.c_str() : "(none)");
     const glm::vec3 position = camera_.position();
-    ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
+    ImGui::Text("Camera    %.1f, %.1f, %.1f", static_cast<double>(position.x),
                 static_cast<double>(position.y), static_cast<double>(position.z));
-    draw_presentation_controls();
     ImGui::End();
+}
 
-    // Queued rather than serviced here: this is the middle of a frame, and the
-    // load blocks, waits for the device and destroys images the command buffer
-    // being recorded would still reference.
-    if (std::optional<FilePicker::Request> request = file_picker_.draw(); request.has_value()) {
-        pending_load_ = std::move(request);
+void Application::draw_menu_bar() {
+    if (!ImGui::BeginMainMenuBar()) {
+        return;
+    }
+
+    if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Open glTF...")) {
+            file_dialog_open_ = true;
+            file_dialog_scene_actions_ = true;
+            // Absent, so the file lands where it says it does. Only the context
+            // menu places a load.
+            file_dialog_placement_.reset();
+        }
+        if (ImGui::MenuItem("Clear scene")) {
+            // Queued: clear_scene waits for the device to go idle and destroys
+            // images a recording command buffer still names.
+            pending_clear_ = true;
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Include UI in captures", nullptr, &screenshot_include_ui_);
+        if (ImGui::MenuItem("Screenshot", "F2", false, !pending_screenshot_.has_value())) {
+            request_screenshot();
+        }
+        // What the next capture will actually contain, which the toggle above
+        // decides and is otherwise only discoverable by taking one.
+        if (screenshot_include_ui_) {
+            ImGui::TextDisabled("%ux%u, whole window", swapchain_.extent().width,
+                                swapchain_.extent().height);
+        } else {
+            ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
+                                viewport_rect_.extent.height);
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Edit")) {
+        // Labelled with what they would actually reverse, so the menu says
+        // "Undo Transform" rather than leaving you to remember what you did.
+        const std::string undo_label =
+            can_undo() ? "Undo " + undo_stack_[undo_cursor_ - 1].name : std::string("Undo");
+        const std::string redo_label =
+            can_redo() ? "Redo " + undo_stack_[undo_cursor_].name : std::string("Redo");
+        if (ImGui::MenuItem(undo_label.c_str(), "Ctrl+Z", false, can_undo())) {
+            undo();
+        }
+        if (ImGui::MenuItem(redo_label.c_str(), "Ctrl+Y", false, can_redo())) {
+            redo();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Delete", "Del", false, scene_graph_.find(selected_) != nullptr)) {
+            delete_selected();
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Render")) {
+        draw_presentation_controls();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Lighting")) {
+        draw_lighting_menu();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("Hide panels", "F11", &ui_hidden_);
+        ImGui::EndMenu();
+    }
+
+    ImGui::EndMainMenuBar();
+}
+
+void Application::draw_file_dialog() {
+    if (file_dialog_open_ && !ImGui::IsPopupOpen("Load glTF")) {
+        ImGui::OpenPopup("Load glTF");
+    }
+
+    // Centred rather than at the cursor: the browser is a good deal larger than
+    // a menu, and anchoring it to a click near an edge would push it off-screen.
+    const ImVec2 centre = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+    if (!ImGui::BeginPopupModal("Load glTF", &file_dialog_open_,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    if (const std::optional<FilePicker::Request> request =
+            file_picker_.draw_contents(file_dialog_scene_actions_);
+        request.has_value()) {
+        // Queued rather than loaded here: this is the middle of a frame, and a
+        // load blocks, waits for the device and destroys images the command
+        // buffer being recorded would still reference.
+        pending_load_ = PendingLoad{request->path, request->replace, file_dialog_placement_};
+        file_dialog_open_ = false;
+        ImGui::CloseCurrentPopup();
     }
     if (file_picker_.clear_requested()) {
-        // Same reasoning: clear_scene waits for the device to be idle, which is
-        // not something to do with a frame half-recorded.
         pending_clear_ = true;
+        file_dialog_open_ = false;
+        ImGui::CloseCurrentPopup();
     }
+    if (ImGui::Button("Cancel")) {
+        file_dialog_open_ = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 void Application::draw_presentation_controls() {
@@ -1576,7 +1894,7 @@ void Application::draw_presentation_controls() {
     // Selectable at runtime rather than baked in, because the difference between
     // two curves is only legible on the same frame -- comparing across a rebuild
     // compares two memories of an image.
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(k_menu_item_width);
     ImGui::Combo("##tonemap", &tonemap_operator_, k_tonemap_names.data(),
                  static_cast<int>(k_tonemap_names.size()));
     if (tonemap_operator_ == static_cast<int>(TonemapOperator::none)) {
@@ -1596,47 +1914,509 @@ void Application::draw_presentation_controls() {
     ImGui::SliderFloat("Dark floor", &fxaa_edge_threshold_min_, 0.005F, 0.1F, "%.4f");
     ImGui::SliderFloat("Subpixel", &fxaa_subpixel_quality_, 0.0F, 1.0F, "%.2f");
     ImGui::EndDisabled();
-
-    ImGui::SeparatorText("Capture");
-    ImGui::Checkbox("Include UI", &screenshot_include_ui_);
-    // Disabled rather than hidden while one is in flight: the button vanishing
-    // for a frame reads as a misclick.
-    ImGui::BeginDisabled(pending_screenshot_.has_value());
-    if (ImGui::Button("Screenshot (F2)", ImVec2(-FLT_MIN, 0.0F))) {
-        request_screenshot();
-    }
-    ImGui::EndDisabled();
-    if (screenshot_include_ui_) {
-        ImGui::TextDisabled("%ux%u, whole window", swapchain_.extent().width,
-                            swapchain_.extent().height);
-    } else {
-        ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
-                            viewport_rect_.extent.height);
-    }
-    ImGui::TextDisabled("F11 hides the panels");
 }
 
-void Application::draw_lighting_panel() {
-    ImGui::Begin("Lighting");
+bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position) {
+    const gpu::PrimitiveMesh mesh = gpu::make_primitive(kind);
 
-    ImGui::SeparatorText("Key light (directional)");
-    // A direction rather than two angles: matching a reference image is easier
-    // by nudging a vector than by converting to azimuth and elevation first.
-    // Normalised at upload, so the magnitude here does not matter.
-    ImGui::DragFloat3("Direction", glm::value_ptr(key_light_.direction), 0.01F, -1.0F, 1.0F);
-    ImGui::ColorEdit3("Colour##key", glm::value_ptr(key_light_.color));
-    ImGui::DragFloat("Intensity##key", &key_light_.intensity, 0.05F, 0.0F, 50.0F);
+    glm::vec3 low{std::numeric_limits<float>::max()};
+    glm::vec3 high{std::numeric_limits<float>::lowest()};
+    for (const gpu::Vertex& vertex : mesh.vertices) {
+        low = glm::min(low, vertex.position);
+        high = glm::max(high, vertex.position);
+    }
 
-    ImGui::SeparatorText("Fill light (point)");
-    ImGui::Checkbox("Enabled", &fill_light_.enabled);
-    ImGui::BeginDisabled(!fill_light_.enabled);
-    ImGui::DragFloat3("Position", glm::value_ptr(fill_light_.position), 0.01F);
-    ImGui::ColorEdit3("Colour##fill", glm::value_ptr(fill_light_.color));
-    ImGui::DragFloat("Intensity##fill", &fill_light_.intensity, 0.05F, 0.0F, 200.0F);
-    // Beyond this distance the light contributes nothing. Also what stops the
-    // falloff from being a pure inverse square that never quite reaches zero.
-    ImGui::DragFloat("Range", &fill_light_.range, 0.05F, 0.01F, 200.0F);
-    ImGui::EndDisabled();
+    const gpu::GeometryRegistry::MeshView view = geometry_registry_.add_mesh(
+        mesh.vertices.data(), sizeof(gpu::Vertex) * mesh.vertices.size(), mesh.indices.data(),
+        static_cast<std::uint32_t>(mesh.indices.size()), low, high);
+    if (!view.valid()) {
+        return false;
+    }
+
+    // Its own material rather than one shared table entry. A shared one would
+    // have to be rebuilt after every clear_scene, since the registry rewinds,
+    // and giving each primitive its own leaves room to tint them individually.
+    gpu::Material material;
+    material.base_color_factor =
+        glm::vec4(k_primitive_albedo, k_primitive_albedo, k_primitive_albedo, 1.0F);
+    material.metallic = 0.0F;
+    material.roughness = k_primitive_roughness;
+    // The registry's two permanent fallbacks: white multiplies to the factor,
+    // and the flat normal decodes to the geometric one.
+    material.base_color_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.normal_texture = gpu::TextureRegistry::k_flat_normal_slot;
+    material.metallic_roughness_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.emissive_texture = gpu::TextureRegistry::k_fallback_slot;
+    const std::uint32_t material_index = material_registry_.append({material});
+
+    // Sized against what is already here. A fixed size cannot suit both a
+    // chess piece and a street lamp -- the sample models alone span a factor
+    // of 36 -- so an absolute default would be wrong for nearly every scene.
+    const Bounds bounds = scene_bounds();
+    const float radius = bounds.empty() ? 0.0F : glm::length(bounds.max - bounds.min) * 0.5F;
+    const float reference = radius > 1e-4F ? radius : 1.0F;
+    const float scale =
+        (kind == gpu::PrimitiveKind::plane ? k_plane_scene_fraction : k_solid_scene_fraction) *
+        reference;
+
+    // Solids rest on the placement point rather than being buried half in it;
+    // the plane is the ground, so it sits exactly there.
+    const float lift = kind == gpu::PrimitiveKind::plane ? 0.0F : -low.y * scale;
+
+    glm::mat4 transform = glm::translate(glm::mat4(1.0F), position + glm::vec3(0.0F, lift, 0.0F));
+    transform = glm::scale(transform, glm::vec3(scale));
+
+    const gpu::NodeHandle previous_selection = selected_;
+    const gpu::NodeHandle node =
+        scene_graph_.add_node(gpu::NodeHandle{}, transform, gpu::primitive_name(kind));
+    scene_graph_.set_mesh(node, view, material_index);
+    scene_graph_.update_transforms();
+    select(node);
+    push_add_command(std::string("Add ") + gpu::primitive_name(kind), node, previous_selection);
+
+    SAGE_LOG_INFO("Added {} at ({:.3f}, {:.3f}, {:.3f}), scale {:.3f}", gpu::primitive_name(kind),
+                  position.x, position.y, position.z, scale);
+    return true;
+}
+
+bool Application::add_light(gpu::LightType type, const glm::vec3& position, bool record) {
+    const bool directional = type == gpu::LightType::directional;
+
+    gpu::SceneLight authored;
+    authored.type = type;
+    authored.color = glm::vec3(1.0F, 0.96F, 0.9F);
+    // A directional light's intensity is irradiance and does not fall off; a
+    // point light's is divided by distance squared, so the same number would
+    // be invisible a couple of units away.
+    authored.intensity = directional ? k_default_key_intensity : k_default_point_intensity;
+
+    const Bounds bounds = scene_bounds();
+    const float radius = bounds.empty() ? 1.0F : glm::length(bounds.max - bounds.min) * 0.5F;
+    const float reference = radius > 1e-4F ? radius : 1.0F;
+    authored.range = reference * k_point_range_fraction;
+
+    // Rotated so -Y, the canonical direction, points the way the default key
+    // light did. A directional light has no position, but the node still needs
+    // one to put its icon somewhere and to give the gizmo something to hold.
+    glm::mat4 transform = glm::translate(glm::mat4(1.0F), position);
+    if (directional) {
+        transform *= orientation_pointing_down_along(k_default_key_direction);
+    }
+
+    const gpu::NodeHandle previous_selection = selected_;
+    const gpu::NodeHandle node = scene_graph_.add_node(
+        gpu::NodeHandle{}, transform, directional ? "Directional Light" : "Point Light");
+    scene_graph_.set_light(node, authored);
+
+    // A light has no geometry, so without this it could not be picked in the
+    // viewport, could not be outlined, and would be reachable only from the
+    // hierarchy -- which is exactly when you least want to leave the 3D view.
+    const gpu::PrimitiveMesh icon =
+        gpu::make_primitive(directional ? gpu::PrimitiveKind::cone : gpu::PrimitiveKind::sphere);
+    glm::vec3 low{std::numeric_limits<float>::max()};
+    glm::vec3 high{std::numeric_limits<float>::lowest()};
+    for (const gpu::Vertex& vertex : icon.vertices) {
+        low = glm::min(low, vertex.position);
+        high = glm::max(high, vertex.position);
+    }
+
+    const gpu::GeometryRegistry::MeshView view = geometry_registry_.add_mesh(
+        icon.vertices.data(), sizeof(gpu::Vertex) * icon.vertices.size(), icon.indices.data(),
+        static_cast<std::uint32_t>(icon.indices.size()), low, high);
+    if (!view.valid()) {
+        return false;
+    }
+
+    // Emissive rather than lit: an icon standing for a light source should
+    // read as one, and a shaded grey blob sitting in mid-air reads as an
+    // object that someone forgot to delete.
+    gpu::Material material;
+    material.base_color_factor = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F);
+    material.emissive_factor = authored.color;
+    material.metallic = 0.0F;
+    material.roughness = 1.0F;
+    material.base_color_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.normal_texture = gpu::TextureRegistry::k_flat_normal_slot;
+    material.metallic_roughness_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.emissive_texture = gpu::TextureRegistry::k_fallback_slot;
+    const std::uint32_t material_index = material_registry_.append({material});
+
+    // A child, so moving the light moves its icon and the icon never needs
+    // updating separately. Scaled small: it marks a position, it is not a
+    // thing in the scene.
+    const float icon_scale = reference * k_light_icon_fraction;
+    glm::mat4 icon_transform = glm::scale(glm::mat4(1.0F), glm::vec3(icon_scale));
+    if (directional) {
+        // Cone tip towards -Y, so it reads as an arrow pointing the way the
+        // light travels. The generated cone points +Y.
+        icon_transform =
+            glm::rotate(glm::mat4(1.0F), k_pi_f, glm::vec3(1.0F, 0.0F, 0.0F)) * icon_transform;
+    }
+
+    const gpu::NodeHandle icon_node = scene_graph_.add_node(node, icon_transform, "Icon");
+    scene_graph_.set_mesh(icon_node, view, material_index);
+    scene_graph_.set_editor_only(icon_node, true);
+    scene_graph_.update_transforms();
+    select(node);
+    if (record) {
+        push_add_command(directional ? "Add directional light" : "Add point light", node,
+                         previous_selection);
+    }
+
+    SAGE_LOG_INFO("Added {} at ({:.3f}, {:.3f}, {:.3f})",
+                  directional ? "directional light" : "point light", position.x, position.y,
+                  position.z);
+    return true;
+}
+
+void Application::add_default_light() {
+    // The scene is almost always empty here -- clear_scene calls this before
+    // anything is loaded -- so this position is a placeholder that
+    // reposition_default_light replaces once there is something to measure.
+    // Not recorded. The default light is setup rather than an edit: putting it
+    // on the stack means the very first Ctrl+Z in a fresh scene deletes the
+    // only light and leaves the viewport dark, undoing something the user
+    // never did.
+    static_cast<void>(add_light(gpu::LightType::directional,
+                                glm::vec3(0.0F, k_default_light_height, 0.0F), false));
+    // add_light selects what it adds, which is how its handle is recovered
+    // without threading a return value through it.
+    default_light_ = selected_;
+    if (const gpu::SceneNode* node = scene_graph_.find(default_light_); node != nullptr) {
+        default_light_transform_ = node->local_transform;
+    }
+}
+
+void Application::reposition_default_light() {
+    const gpu::SceneNode* node = scene_graph_.find(default_light_);
+    if (node == nullptr) {
+        return;
+    }
+    // Only while it is still the light this put there. Once it has been moved
+    // or aimed, it is the user's, and relocating it under them on the next
+    // load would undo that.
+    if (node->local_transform != default_light_transform_) {
+        return;
+    }
+
+    const Bounds bounds = scene_bounds();
+    if (bounds.empty()) {
+        return;
+    }
+
+    const glm::vec3 centre = (bounds.min + bounds.max) * 0.5F;
+    const float radius = std::max(glm::length(bounds.max - bounds.min) * 0.5F, 1e-3F);
+
+    // Back along its own beam, which is where the light would be if it were a
+    // sun -- so the cone icon points at the scene rather than away from it.
+    const glm::vec3 direction =
+        glm::normalize(glm::mat3(node->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F));
+    glm::vec3 position = centre - (direction * (radius * k_default_light_distance));
+
+    // A nearly horizontal beam would leave the marker at the scene's own height
+    // and back inside it, which is the thing this exists to avoid. The default
+    // beam is not horizontal, but it is not the only one that reaches here.
+    position.y = std::max(position.y, bounds.max.y + (radius * k_default_light_clearance));
+
+    glm::mat4 transform = node->local_transform;
+    // Only the translation column: the rotation is the aim, and rebuilding it
+    // from the direction would round-trip through a basis for nothing.
+    transform[3] = glm::vec4(position, 1.0F);
+
+    scene_graph_.set_local_transform(default_light_, transform);
+    scene_graph_.update_transforms();
+    default_light_transform_ = transform;
+}
+
+// An addition is undone by tombstoning what it added and redone by putting it
+// back. Neither touches the registries, so the geometry never moves -- which is
+// the whole reason undo here is cheap.
+void Application::push_add_command(std::string name, gpu::NodeHandle added,
+                                   gpu::NodeHandle previous_selection) {
+    push_command(
+        std::move(name),
+        [this, added, previous_selection]() {
+            scene_graph_.remove_subtree(added);
+            select(previous_selection);
+        },
+        [this, added]() {
+            scene_graph_.restore_subtree(added);
+            scene_graph_.update_transforms();
+            select(added);
+        });
+}
+
+void Application::commit_transform_edit() {
+    if (!transform_edit_.has_value()) {
+        return;
+    }
+    // Plain locals rather than a structured binding: a binding cannot be
+    // captured by the lambdas below.
+    const gpu::NodeHandle node = transform_edit_->first;
+    const glm::mat4 before = transform_edit_->second;
+    transform_edit_.reset();
+
+    const gpu::SceneNode* current = scene_graph_.find(node);
+    if (current == nullptr || current->local_transform == before) {
+        // A click that moved nothing, or a node deleted mid-drag. Neither is an
+        // edit, and an entry for it would make Ctrl+Z appear to do nothing.
+        return;
+    }
+    const glm::mat4 after = current->local_transform;
+
+    push_command(
+        "Transform",
+        [this, node, before]() {
+            scene_graph_.set_local_transform(node, before);
+            scene_graph_.update_transforms();
+            select(node);
+        },
+        [this, node, after]() {
+            scene_graph_.set_local_transform(node, after);
+            scene_graph_.update_transforms();
+            select(node);
+        });
+}
+
+void Application::push_light_command(std::string name, gpu::NodeHandle node,
+                                     const gpu::SceneLight& before, const gpu::SceneLight& after) {
+    push_command(
+        std::move(name),
+        [this, node, before]() {
+            scene_graph_.set_light(node, before);
+            select(node);
+        },
+        [this, node, after]() {
+            scene_graph_.set_light(node, after);
+            select(node);
+        });
+}
+
+void Application::commit_light_edit() {
+    if (!light_edit_.has_value()) {
+        return;
+    }
+    const gpu::NodeHandle node = light_edit_->first;
+    const gpu::SceneLight before = light_edit_->second;
+    light_edit_.reset();
+
+    const gpu::SceneNode* current = scene_graph_.find(node);
+    if (current == nullptr) {
+        return;
+    }
+    push_light_command("Light", node, before, current->light);
+}
+
+void Application::push_command(std::string name, std::function<void()> undo_action,
+                               std::function<void()> redo_action) {
+    // Anything already undone is dropped: the history is a line, not a tree,
+    // and a new edit made after stepping back replaces what was ahead.
+    undo_stack_.resize(undo_cursor_);
+    undo_stack_.push_back(Command{std::move(name), std::move(undo_action), std::move(redo_action)});
+
+    // Bounded so a long session cannot grow it without limit. Dropping from the
+    // front costs an O(n) shift on a vector, which happens once per edit past
+    // the cap and is nothing next to the edit itself.
+    if (undo_stack_.size() > k_max_undo_depth) {
+        undo_stack_.erase(undo_stack_.begin());
+    }
+    undo_cursor_ = undo_stack_.size();
+}
+
+void Application::undo() {
+    if (!can_undo()) {
+        return;
+    }
+    --undo_cursor_;
+    undo_stack_[undo_cursor_].undo();
+    SAGE_LOG_INFO("Undo: {}", undo_stack_[undo_cursor_].name);
+}
+
+void Application::redo() {
+    if (!can_redo()) {
+        return;
+    }
+    undo_stack_[undo_cursor_].redo();
+    SAGE_LOG_INFO("Redo: {}", undo_stack_[undo_cursor_].name);
+    ++undo_cursor_;
+}
+
+void Application::clear_history() {
+    undo_stack_.clear();
+    undo_cursor_ = 0;
+    transform_edit_.reset();
+    light_edit_.reset();
+}
+
+void Application::delete_selected() {
+    if (scene_graph_.find(selected_) == nullptr) {
+        return;
+    }
+    const gpu::NodeHandle target = selected_;
+    // Cleared first: the outline and the properties panel both read the
+    // selection, and leaving it pointing at a tombstone would ask them to
+    // describe something that is no longer there.
+    select(gpu::NodeHandle{});
+    scene_graph_.remove_subtree(target);
+
+    // No wait_idle and no queueing, unlike a load or a clear. Nothing is freed
+    // here -- the geometry stays exactly where it was -- so an in-flight
+    // command buffer that still names it remains correct. All that changed is
+    // which nodes the next frame walks.
+    //
+    // That is also why undoing this is just un-tombstoning: the mesh never
+    // left, so there is nothing to upload again.
+    push_command(
+        "Delete",
+        [this, target]() {
+            scene_graph_.restore_subtree(target);
+            scene_graph_.update_transforms();
+            select(target);
+        },
+        [this, target]() {
+            select(gpu::NodeHandle{});
+            scene_graph_.remove_subtree(target);
+        });
+
+    SAGE_LOG_INFO("Deleted subtree; {} of {} slots live", scene_graph_.live_size(),
+                  scene_graph_.size());
+}
+
+void Application::service_pending_light() {
+    if (!pending_light_.has_value()) {
+        return;
+    }
+    const PendingLight pending = *pending_light_;
+    pending_light_.reset();
+
+    if (!add_light(pending.type, pending.position)) {
+        SAGE_LOG_ERROR("Could not add light: out of geometry capacity for its icon");
+    }
+}
+
+void Application::service_pending_primitive() {
+    if (!pending_primitive_.has_value()) {
+        return;
+    }
+    const PendingPrimitive pending = *pending_primitive_;
+    pending_primitive_.reset();
+
+    if (!add_primitive(pending.kind, pending.position)) {
+        SAGE_LOG_ERROR("Could not add {}: out of geometry capacity",
+                       gpu::primitive_name(pending.kind));
+    }
+}
+
+glm::vec3 Application::placement_point(float window_x, float window_y) const {
+    const CameraMatrices matrices = camera_matrices();
+    const glm::vec3 origin = camera_.position();
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const VkExtent2D extent = swapchain_.extent();
+    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F || viewport_rect_.extent.width == 0 ||
+        viewport_rect_.extent.height == 0) {
+        return origin + (camera_.forward() * k_fallback_placement_distance);
+    }
+
+    // ImGui reports logical coordinates; viewport_rect_ is framebuffer pixels.
+    // Same conversion as central_node_rect, for the same reason.
+    const float pixel_x = window_x * (static_cast<float>(extent.width) / viewport->Size.x);
+    const float pixel_y = window_y * (static_cast<float>(extent.height) / viewport->Size.y);
+
+    // Normalised within the 3D view, then to NDC. No Y negation: the
+    // projection is already Vulkan's, whose NDC Y runs down the screen exactly
+    // as framebuffer rows do.
+    const float ndc_x = (2.0F * (pixel_x - static_cast<float>(viewport_rect_.offset.x)) /
+                         static_cast<float>(viewport_rect_.extent.width)) -
+                        1.0F;
+    const float ndc_y = (2.0F * (pixel_y - static_cast<float>(viewport_rect_.offset.y)) /
+                         static_cast<float>(viewport_rect_.extent.height)) -
+                        1.0F;
+
+    // Unprojecting the far plane alone is enough for a direction: the near
+    // point is the camera position, which is already known exactly.
+    const glm::mat4 inverse_view_projection = glm::inverse(matrices.projection * matrices.view);
+    const glm::vec4 far_point = inverse_view_projection * glm::vec4(ndc_x, ndc_y, 1.0F, 1.0F);
+    if (std::abs(far_point.w) < 1e-6F) {
+        return origin + (camera_.forward() * k_fallback_placement_distance);
+    }
+    const glm::vec3 direction = glm::normalize(glm::vec3(far_point) / far_point.w - origin);
+
+    // Intersect the ground plane. A ray running along it, or pointing away
+    // from it, has no useful answer -- which is most of the time when the
+    // camera is below the horizon -- so fall back to a fixed distance ahead.
+    if (std::abs(direction.y) > 1e-4F) {
+        const float distance = -origin.y / direction.y;
+        if (distance > 0.0F && distance < k_max_placement_distance) {
+            return origin + (direction * distance);
+        }
+    }
+    return origin + (direction * k_fallback_placement_distance);
+}
+
+void Application::draw_context_menu() {
+    if (ImGui::BeginPopup("viewport_context")) {
+        ImGui::TextDisabled("Add at %.2f, %.2f, %.2f", static_cast<double>(context_menu_point_.x),
+                            static_cast<double>(context_menu_point_.y),
+                            static_cast<double>(context_menu_point_.z));
+        ImGui::Separator();
+        if (ImGui::MenuItem("Mesh (glTF)...")) {
+            // Deferred: a popup cannot be opened from inside one that is about
+            // to close, so this only records the intent. draw_file_dialog,
+            // which runs outside any menu, opens it.
+            file_dialog_open_ = true;
+            // No replace or clear from here, and the load lands at the click.
+            file_dialog_scene_actions_ = false;
+            file_dialog_placement_ = context_menu_point_;
+        }
+        if (ImGui::BeginMenu("Primitive")) {
+            constexpr std::array<gpu::PrimitiveKind, 5> k_kinds{
+                gpu::PrimitiveKind::plane, gpu::PrimitiveKind::cube, gpu::PrimitiveKind::sphere,
+                gpu::PrimitiveKind::cone, gpu::PrimitiveKind::cylinder};
+            for (const gpu::PrimitiveKind kind : k_kinds) {
+                if (ImGui::MenuItem(gpu::primitive_name(kind))) {
+                    // Queued, not built here: the upload blocks on a transfer
+                    // submission, and this is the middle of a frame.
+                    pending_primitive_ = PendingPrimitive{kind, context_menu_point_};
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Light")) {
+            if (ImGui::MenuItem("Directional")) {
+                pending_light_ = PendingLight{gpu::LightType::directional, context_menu_point_};
+            }
+            if (ImGui::MenuItem("Point")) {
+                pending_light_ = PendingLight{gpu::LightType::point, context_menu_point_};
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void Application::draw_lighting_menu() {
+    // Lights live in the scene graph now, so this panel holds only what is
+    // global. Editing one light happens in Properties, with that light
+    // selected -- the same place every other node is edited.
+    std::uint32_t directional = 0;
+    std::uint32_t point = 0;
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.alive || !node.has_light) {
+            continue;
+        }
+        (node.light.type == gpu::LightType::directional ? directional : point) += 1;
+    }
+    ImGui::SeparatorText("Scene lights");
+    ImGui::Text("%u directional, %u point", directional, point);
+    if (directional + point > gpu::k_max_lights) {
+        ImGui::TextDisabled("Over the %u the shader reads; the rest are ignored.",
+                            gpu::k_max_lights);
+    }
+    if (directional == 0) {
+        ImGui::TextDisabled("No directional light: nothing casts a shadow.");
+    }
+    ImGui::TextDisabled("Right-click the viewport to add one.");
 
     ImGui::SeparatorText("Ambient");
     ImGui::DragFloat("Intensity##ambient", &ambient_intensity_, 0.002F, 0.0F, 1.0F, "%.3f");
@@ -1659,8 +2439,6 @@ void Application::draw_lighting_panel() {
     const int taps = ((2 * shadow_pcf_radius_) + 1) * ((2 * shadow_pcf_radius_) + 1);
     ImGui::TextDisabled("%ux%u map, %d taps", shadow_map_.resolution(), shadow_map_.resolution(),
                         taps);
-
-    ImGui::End();
 }
 
 void Application::draw_properties_panel() {
@@ -1689,9 +2467,24 @@ void Application::draw_properties_panel() {
                                           glm::value_ptr(rotation), glm::value_ptr(scale));
 
     bool edited = false;
+    bool activated = false;
+    bool released = false;
+
     edited |= ImGui::DragFloat3("Position", glm::value_ptr(translation), 0.01F);
+    activated |= ImGui::IsItemActivated();
+    released |= ImGui::IsItemDeactivatedAfterEdit();
     edited |= ImGui::DragFloat3("Rotation", glm::value_ptr(rotation), 0.5F);
+    activated |= ImGui::IsItemActivated();
+    released |= ImGui::IsItemDeactivatedAfterEdit();
     edited |= ImGui::DragFloat3("Scale", glm::value_ptr(scale), 0.01F);
+    activated |= ImGui::IsItemActivated();
+    released |= ImGui::IsItemDeactivatedAfterEdit();
+
+    // Recorded before the edit is written below, so the stored value is the one
+    // the drag began from.
+    if (activated && !transform_edit_.has_value()) {
+        transform_edit_ = std::make_pair(selected_, node->local_transform);
+    }
 
     if (edited) {
         // A zero on any axis makes the matrix singular, which the next
@@ -1703,8 +2496,54 @@ void Application::draw_properties_panel() {
         scene_graph_.set_local_transform(selected_, local);
         scene_graph_.update_transforms();
     }
+    if (released) {
+        commit_transform_edit();
+    }
 
     ImGui::Separator();
+    if (node->has_light) {
+        ImGui::SeparatorText("Light");
+        gpu::SceneLight light = node->light;
+
+        int type = static_cast<int>(light.type);
+        const bool type_changed = ImGui::Combo("Type", &type, "Directional\0Point\0");
+        bool light_edited = type_changed;
+        light.type = static_cast<gpu::LightType>(type);
+
+        bool light_activated = false;
+        bool light_released = false;
+        light_edited |= ImGui::ColorEdit3("Colour", glm::value_ptr(light.color));
+        light_activated |= ImGui::IsItemActivated();
+        light_released |= ImGui::IsItemDeactivatedAfterEdit();
+        light_edited |= ImGui::DragFloat("Intensity", &light.intensity, 0.1F, 0.0F, 500.0F);
+        light_activated |= ImGui::IsItemActivated();
+        light_released |= ImGui::IsItemDeactivatedAfterEdit();
+        if (light.type == gpu::LightType::point) {
+            light_edited |= ImGui::DragFloat("Range", &light.range, 0.05F, 0.01F, 500.0F);
+            light_activated |= ImGui::IsItemActivated();
+            light_released |= ImGui::IsItemDeactivatedAfterEdit();
+        } else {
+            // A directional light has no position, only a bearing, and the
+            // rotate gizmo is how that is set.
+            ImGui::TextDisabled("Rotate to aim; position is only the icon's.");
+        }
+        // The type combo commits in one go, so it is its own command rather
+        // than the start of a drag.
+        if (type_changed) {
+            push_light_command("Change light type", selected_, node->light, light);
+        }
+        if (light_activated && !light_edit_.has_value()) {
+            light_edit_ = std::make_pair(selected_, node->light);
+        }
+        if (light_edited) {
+            scene_graph_.set_light(selected_, light);
+        }
+        if (light_released) {
+            commit_light_edit();
+        }
+        ImGui::Separator();
+    }
+
     ImGui::Text("Mesh: %s", node->has_mesh ? "yes" : "no");
     if (node->has_mesh) {
         ImGui::Text("Indices: %u", node->mesh.index_count);
@@ -1764,6 +2603,16 @@ bool Application::draw_gizmo() {
         static_cast<ImGuizmo::OPERATION>(gizmo_operation_),
         gizmo_local_space_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD, glm::value_ptr(world));
 
+    // A drag runs over many frames and writes a transform on each. Recording
+    // where it started and pushing once on release is what makes Ctrl+Z undo
+    // the drag rather than one frame of it.
+    if (ImGuizmo::IsUsing() && !transform_edit_.has_value()) {
+        transform_edit_ = std::make_pair(selected_, node->local_transform);
+    }
+    if (!ImGuizmo::IsUsing()) {
+        commit_transform_edit();
+    }
+
     if (changed) {
         // Back out of world space into the parent's. The parent's world
         // transform is already final this frame -- parents precede children --
@@ -1782,6 +2631,13 @@ bool Application::draw_gizmo() {
 void Application::draw_hierarchy_panel() {
     ImGui::Begin("Hierarchy");
 
+    // Inside Begin, because GetStateStorage() returns the *current* window's,
+    // and this one holds every tree node's open flag keyed by node index.
+    if (hierarchy_state_stale_) {
+        ImGui::GetStateStorage()->Clear();
+        hierarchy_state_stale_ = false;
+    }
+
     const std::span<const gpu::SceneNode> nodes = scene_graph_.nodes();
 
     if (nodes.empty()) {
@@ -1797,6 +2653,9 @@ void Application::draw_hierarchy_panel() {
     ChildTable children(nodes.size());
     std::vector<std::uint32_t> roots;
     for (std::uint32_t i = 0; i < nodes.size(); ++i) {
+        if (!nodes[i].alive) {
+            continue;
+        }
         if (nodes[i].parent.valid()) {
             children[nodes[i].parent.index()].push_back(i);
         } else {
@@ -1814,8 +2673,10 @@ void Application::draw_hierarchy_panel() {
 void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& children) {
     const gpu::SceneNode& node = scene_graph_.nodes()[index];
 
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
-                               ImGuiTreeNodeFlags_DefaultOpen;
+    // No DefaultOpen: a loaded file arrives collapsed to a single row named
+    // after it, and is expanded on demand. A chess set is 50 nodes and a real
+    // scene is more, which is a wall of names rather than an overview.
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     // Compared by handle rather than index: a stale handle from before a scene
     // reload must not light up whatever now occupies that slot.
     if (selected_.valid() && scene_graph_.handle_at(index) == selected_) {
@@ -1929,6 +2790,8 @@ void Application::run() {
         // and no ImGui frame is open, so a wait_idle and a blocking upload here
         // disturb nothing. Costs the picker one frame of latency.
         service_pending_load();
+        service_pending_primitive();
+        service_pending_light();
         service_selection();
 
         const auto now = std::chrono::steady_clock::now();
@@ -2006,6 +2869,22 @@ void Application::run() {
         if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
             request_screenshot();
         }
+        // Gated on the keyboard, so Delete typed into the file dialog's path
+        // field edits the text rather than the scene.
+        if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+            delete_selected();
+        }
+        if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::GetIO().KeyCtrl) {
+            // Ctrl+Y and Ctrl+Shift+Z both redo. The first is what was asked
+            // for; the second is what a hand trained on other editors reaches
+            // for, and supporting one does not cost the other.
+            if (ImGui::IsKeyPressed(ImGuiKey_Y) ||
+                (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))) {
+                redo();
+            } else if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
+                undo();
+            }
+        }
         // Before picking: a drag that ends over a different object must not
         // also reselect it, and ImGuizmo only reports IsUsing() once drawn.
         const bool gizmo_active = draw_gizmo();
@@ -2016,12 +2895,28 @@ void Application::run() {
             handle_picking_input();
         }
 
+        // A right click that never became a camera drag. Gated the same way
+        // picking is: a panel under the pointer wins, and a click outside the
+        // 3D view is not a click in it.
+        if (input.context_click && !gpu::ImGuiLayer::wants_mouse() &&
+            viewport_texel(input.context_click_x, input.context_click_y).has_value()) {
+            context_menu_point_ = placement_point(input.context_click_x, input.context_click_y);
+            ImGui::OpenPopup("viewport_context");
+        }
+        // Outside the ui_hidden_ block: the menu is how things get added, and
+        // hiding the panels for a capture should not take that away.
+        draw_context_menu();
+
         if (!ui_hidden_) {
-            draw_ui();
+            draw_menu_bar();
+            draw_stats_overlay();
             draw_hierarchy_panel();
             draw_properties_panel();
-            draw_lighting_panel();
         }
+        // Outside the block, like the context menu: the dialog is reachable
+        // from both, and a menu that cannot open what it offers is worse than
+        // no menu.
+        draw_file_dialog();
 
         // Pass order is load-bearing. The shadow map is filled first, since the
         // scene samples it; the scene shades into the HDR target; the tonemap

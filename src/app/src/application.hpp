@@ -17,6 +17,7 @@
 #include <sage/gpu/material_registry.hpp>
 #include <sage/gpu/pipeline.hpp>
 #include <sage/gpu/pipeline_cache.hpp>
+#include <sage/gpu/primitives.hpp>
 #include <sage/gpu/sampler.hpp>
 #include <sage/gpu/scene.hpp>
 #include <sage/gpu/selection_buffer.hpp>
@@ -29,8 +30,11 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "file_picker.hpp"
@@ -80,16 +84,30 @@ private:
     // panels into it. Panels place themselves by name from then on, which is
     // what stops a new one landing on top of an existing one.
     void draw_dockspace();
-    void draw_ui();
-    // Tonemap controls and the capture button. Grouped because both are about
-    // how the frame is presented rather than what is in it.
+    // The application menu bar across the top. Holds everything global -- what
+    // to load, how the frame is presented, how the scene is lit -- so those
+    // stop occupying a docked panel each and the 3D view gets the width back.
+    // Keeps the logical-coordinate copy of the 3D view's rect in step with the
+    // pixel one. Takes the dockspace id as unsigned int rather than ImGuiID to
+    // keep imgui out of this header.
+    void update_viewport_logical_rect(unsigned int dockspace);
+    void draw_menu_bar();
+    // The read-out, floating over the top-right of the 3D view rather than
+    // docked. It is a heads-up display: always wanted, never interacted with,
+    // and a panel's worth of screen is too much to pay for it.
+    void draw_stats_overlay();
+    // The modal glTF browser. One dialog, two callers: the File menu opens it
+    // over the whole scene, the context menu opens it to add at a point.
+    void draw_file_dialog();
+    // Tonemap, anti-aliasing and capture. Drawn as menu content rather than a
+    // panel, so it lives wherever it is opened from.
     void draw_presentation_controls();
     // Lights and shadow tuning. A panel rather than constants because the
     // values that suit one model suit no other -- a point light placed for the
     // lantern is inside the board of a chess set -- and because shadow bias is
     // found by dragging a slider until acne stops without the contact shadow
     // detaching, which is not a thing to do one rebuild at a time.
-    void draw_lighting_panel();
+    void draw_lighting_menu();
     void draw_hierarchy_panel();
     void draw_properties_panel();
     // Draws the manipulator and writes any drag back into the scene graph.
@@ -111,6 +129,10 @@ private:
     // Turns a click in the 3D view into a pending object-id readback. No-op
     // when a panel has the pointer or the cursor is outside the viewport.
     void handle_picking_input();
+    // A window position in ImGui's logical coordinates as a framebuffer texel,
+    // or nothing when it falls outside the 3D view. Shared by picking and by
+    // the context menu, which need the identical test.
+    [[nodiscard]] std::optional<VkOffset2D> viewport_texel(float window_x, float window_y) const;
     // W/E/R switch the manipulator, as in Unreal and Blender.
     void handle_gizmo_keys();
     // Copies the picked texel out of the id attachment. Recorded after the
@@ -143,10 +165,96 @@ private:
     // does: the upload blocks and submits work of its own.
     void service_selection();
 
+    // A queued load. Separate from FilePicker::Request because the context menu
+    // raises these too, and it places what it adds where the click landed.
+    struct PendingLoad {
+        std::filesystem::path path;
+        bool replace = true;
+        // Absent means "wherever the file says", which is what the panel and
+        // the command line want. Set, it moves the load's root node there.
+        std::optional<glm::vec3> placement;
+    };
+
     // Loads a file into the registries and the graph. Returns false when the
     // file could not be read; the scene is left as it was in that case, unless
     // `replace` already emptied it.
-    bool load_model(const std::filesystem::path& path, bool replace);
+    bool load_model(const PendingLoad& load);
+
+    // Where a right click in the viewport points, as a world position: the
+    // cursor ray intersected with the ground plane. Objects added from the
+    // context menu land here.
+    [[nodiscard]] glm::vec3 placement_point(float window_x, float window_y) const;
+
+    struct PendingPrimitive {
+        gpu::PrimitiveKind kind = gpu::PrimitiveKind::plane;
+        glm::vec3 position{0.0F};
+    };
+    // Queued for the same reason a load is: generating one is cheap, but
+    // uploading it blocks on a transfer submission, which is not a thing to do
+    // with a command buffer already recording.
+    std::optional<PendingPrimitive> pending_primitive_;
+    void service_pending_primitive();
+
+    struct PendingLight {
+        gpu::LightType type = gpu::LightType::directional;
+        glm::vec3 position{0.0F};
+    };
+    // Queued for the same reason: adding one uploads its icon mesh.
+    std::optional<PendingLight> pending_light_;
+    void service_pending_light();
+    // Deletes the selection and everything beneath it. Immediate rather than
+    // queued: nothing is freed, so no in-flight command buffer is invalidated.
+    void delete_selected();
+
+    // One reversible edit.
+    //
+    // Closures rather than a variant of command types: every operation here is
+    // a handful of captured values and two calls into the scene graph, and a
+    // class hierarchy for that would be more machinery than the thing it
+    // describes. They capture by value and `this`, which outlives the stack.
+    struct Command {
+        std::string name;
+        std::function<void()> undo;
+        std::function<void()> redo;
+    };
+    // Pushes a command, discarding anything that had been undone past the
+    // cursor -- the usual rule: a new edit after an undo forks the history and
+    // the abandoned branch goes.
+    // Records an addition, which undo tombstones and redo restores.
+    void push_add_command(std::string name, gpu::NodeHandle added,
+                          gpu::NodeHandle previous_selection);
+    // Closes a transform drag, pushing one command for the whole gesture.
+    // Does nothing when the value came back unchanged.
+    void commit_transform_edit();
+    void commit_light_edit();
+    void push_light_command(std::string name, gpu::NodeHandle node, const gpu::SceneLight& before,
+                            const gpu::SceneLight& after);
+    void push_command(std::string name, std::function<void()> undo, std::function<void()> redo);
+    void undo();
+    void redo();
+    [[nodiscard]] bool can_undo() const { return undo_cursor_ > 0; }
+    [[nodiscard]] bool can_redo() const { return undo_cursor_ < undo_stack_.size(); }
+    // Drops the history. Called when the registries rewind, which is the one
+    // thing here that genuinely cannot be reversed.
+    void clear_history();
+
+    std::vector<Command> undo_stack_;
+    // How many commands are currently applied. Undo steps it back, redo
+    // forward; everything at or past it has been undone.
+    std::size_t undo_cursor_ = 0;
+
+    // A transform edit in progress, and the value it started from. Both the
+    // gizmo and the Properties drags run across many frames, so the command is
+    // pushed on release -- otherwise one drag would leave a hundred entries and
+    // Ctrl+Z would rewind a frame at a time.
+    std::optional<std::pair<gpu::NodeHandle, glm::mat4>> transform_edit_;
+    // The same, for the light fields in the Properties panel.
+    std::optional<std::pair<gpu::NodeHandle, gpu::SceneLight>> light_edit_;
+    // Builds a primitive, sizes it against the scene, and drops it in. Returns
+    // false when the geometry did not fit.
+    bool add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position);
+    // The right-click menu over the 3D view, and the modal browser it can open.
+    void draw_context_menu();
     // Rewinds all three registries and empties the graph. Waits for the device
     // to go idle first: in-flight command buffers still name this geometry, and
     // TextureRegistry::reset destroys live images.
@@ -182,9 +290,41 @@ private:
     // light has no position, so the frustum is placed by the scene rather than
     // by the light: it is centred on the bounds and pulled back far enough
     // along the light direction to enclose them.
-    [[nodiscard]] LightFit fit_light(const Bounds& bounds) const;
+    [[nodiscard]] LightFit fit_light(const Bounds& bounds, const glm::vec3& light_direction) const;
+
+    // Fills the frame's light array from the graph, returning how many were
+    // written. Lights past the shader's fixed capacity are dropped.
+    [[nodiscard]] std::uint32_t collect_lights(
+        std::array<gpu::Light, gpu::k_max_lights>& lights) const;
+    // The light the shadow map is fitted to: the first directional one in the
+    // graph, which is also the one the shader shadows. Invalid when there is
+    // none, in which case nothing casts.
+    [[nodiscard]] gpu::NodeHandle first_directional_light() const;
+    // Creates the default key light. Called at startup and after a clear, since
+    // a light is a node and clearing the graph removes it -- without this, an
+    // empty scene would load the next model into the dark.
+    void add_default_light();
+    // Moves the default light to suit the scene, once there is one to measure.
+    // Does nothing once the light has been touched: from that point it is the
+    // user's, not a default.
+    void reposition_default_light();
+    // Adds a light node, with the small mesh that makes it visible and
+    // clickable, at `position`.
+    // `record` false for the default light, which is setup rather than an edit
+    // and must not be the first thing Ctrl+Z reaches for.
+    bool add_light(gpu::LightType type, const glm::vec3& position, bool record = true);
+
+    // The light add_default_light created, and the transform it was left with.
+    // Comparing against that transform is how "still a default" is decided --
+    // cheaper and more honest than a dirty flag, which every edit path would
+    // have to remember to set.
+    gpu::NodeHandle default_light_;
+    glm::mat4 default_light_transform_{1.0F};
 
     bool dock_layout_built_ = false;
+    // Set when node indices are about to be reused, so the hierarchy panel
+    // drops ImGui's remembered tree open/closed state on its next draw.
+    bool hierarchy_state_stale_ = false;
 
     // The 3D view's rect within the swapchain image: the dockspace's central
     // node, in framebuffer pixels. The scene is drawn here rather than across
@@ -217,35 +357,6 @@ private:
     int gizmo_operation_ = 0;
     bool gizmo_local_space_ = false;
 
-    // Scene lighting, editable rather than hardcoded. Two lights: a key
-    // directional one, which is the only one that casts a shadow, and an
-    // optional point light for fill.
-    struct DirectionalLightState {
-        // Pointing direction, i.e. the way the light travels. Normalised before
-        // upload; the UI edits it as a raw vector because a pair of angles is
-        // harder to reason about when matching a reference image.
-        // Angled rather than near-vertical. The old default was mostly
-        // straight down, which puts every shadow directly underneath the thing
-        // casting it -- correct, and invisible from any normal camera.
-        glm::vec3 direction{-0.6F, -0.55F, -0.6F};
-        glm::vec3 color{1.0F, 0.96F, 0.9F};
-        // 2.0 was the M5 value and leaves a typical glTF sitting around a
-        // quarter of the display range, where a shadow has no room to be
-        // darker than its surroundings. Measured on the chess set: at 2 the
-        // subject averages 45/255, at 25 it averages 124 with shadows a clear
-        // 98 levels below. This is a middle that suits most files; the slider
-        // is there for the ones it does not.
-        float intensity = 8.0F;
-    };
-    struct PointLightState {
-        glm::vec3 position{0.0F, 1.0F, 0.0F};
-        glm::vec3 color{1.0F, 0.7F, 0.35F};
-        float intensity = 4.0F;
-        float range = 4.0F;
-        bool enabled = false;
-    };
-    DirectionalLightState key_light_;
-    PointLightState fill_light_;
     // Replaces the 0.03 that was compiled into the shader. Without ambient
     // occlusion or IBL this is the only thing keeping unlit faces off pure
     // black, so it is the difference between "dramatic" and "half the model is
@@ -309,8 +420,28 @@ private:
     VkExtent2D screenshot_extent_{};
 
     FilePicker file_picker_;
-    std::optional<FilePicker::Request> pending_load_;
+    std::optional<PendingLoad> pending_load_;
     bool pending_clear_ = false;
+    // Where the context menu was opened, in world space. Held for as long as
+    // the menu and any modal it spawns are up, so what gets added lands where
+    // the user clicked rather than where the camera happens to be by then.
+    glm::vec3 context_menu_point_{0.0F};
+    // The glTF browser's state. Opened from either menu, and outliving the one
+    // that opened it -- a popup cannot be nested inside one that is closing.
+    bool file_dialog_open_ = false;
+    // Whether the dialog offers Replace and Clear. The File menu is operating
+    // on the scene as a whole and wants them; the context menu's verb is
+    // "add", where replacing the scene is not an answer to anything.
+    bool file_dialog_scene_actions_ = false;
+    // Where the load lands, when it was asked for at a point.
+    std::optional<glm::vec3> file_dialog_placement_;
+
+    // The 3D view again, in ImGui's logical coordinates rather than framebuffer
+    // pixels. The overlay is placed with it, and ImGui positions windows in
+    // logical units -- converting viewport_rect_ back every frame would be
+    // undoing a conversion that was made three lines earlier.
+    glm::vec2 viewport_logical_pos_{0.0F};
+    glm::vec2 viewport_logical_size_{0.0F};
 
     core::Camera camera_;
     gpu::Window window_;

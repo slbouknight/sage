@@ -82,23 +82,40 @@ Window::InputState Window::sample_input() {
     const bool right_mouse_down =
         glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
 
-    if (right_mouse_down && !look_active_) {
-        // Entering look mode. Hide and unbound the cursor, the re-read its
-        // position: GLFW_CURSOR_DISABLED can report a large jump on the first
-        // read afterwards, which would snape the camera around.
-        glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-        glfwGetCursorPos(window_, &last_cursor_x_, &last_cursor_y_);
-    } else if (!right_mouse_down && look_active_) {
-        glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-    }
-    look_active_ = right_mouse_down;
-    state.look_active = look_active_;
-
     double cursor_x = 0.0;
     double cursor_y = 0.0;
     glfwGetCursorPos(window_, &cursor_x, &cursor_y);
 
-    if (look_active_) {
+    // The right button means two things, and which one is only knowable at the
+    // end: dragged, it flies the camera; clicked, it opens a context menu.
+    //
+    // Committing to look mode on press -- which is what this used to do --
+    // makes that undecidable. GLFW_CURSOR_DISABLED unbinds the pointer the
+    // instant the button goes down, so every position after it is a virtual
+    // free-running coordinate rather than a screen one, and the distance the
+    // user actually moved is gone. It also hides the cursor on a plain click.
+    // DragGesture holds the press undecided; this only carries out the grab.
+    const DragGesture::Update gesture = right_button_.update(right_mouse_down, cursor_x, cursor_y);
+
+    if (gesture.began_look) {
+        glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        // Re-read after disabling: GLFW_CURSOR_DISABLED can report a large
+        // jump on the first read afterwards, which would snap the camera
+        // around. Rebaselining here makes this frame's delta zero.
+        glfwGetCursorPos(window_, &cursor_x, &cursor_y);
+        last_cursor_x_ = cursor_x;
+        last_cursor_y_ = cursor_y;
+    }
+    if (gesture.ended_look) {
+        glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    }
+
+    state.context_click = gesture.click;
+    state.context_click_x = static_cast<float>(gesture.click_x);
+    state.context_click_y = static_cast<float>(gesture.click_y);
+    state.look_active = gesture.look_active;
+
+    if (state.look_active) {
         state.cursor_delta_x = static_cast<float>(cursor_x - last_cursor_x_);
         state.cursor_delta_y = static_cast<float>(cursor_y - last_cursor_y_);
     }

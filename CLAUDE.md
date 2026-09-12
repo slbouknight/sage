@@ -109,10 +109,33 @@ documented reasoning matter as much as features. CUDA was cut after M5; see
   panels, and a capture mode that includes the editor. Done — see
   [ADR 0029](docs/adr/0029-shadow-mapping-and-fxaa.md).
 
-**v1.0 is done.** Past this point, pick one of the items below and finish it
-rather than starting several.
+**v1.0 is done.** Everything past here is an editor that can build a scene
+rather than only look at one.
 
-In no committed order:
+- **M10** — Scene authoring: a right-click context menu, procedural primitives,
+  and lights promoted from `Application` members to scene nodes. The right
+  button already meant "fly the camera", so a press now only arms look mode and
+  four pixels of movement commit to it — committing on press makes click and
+  drag undecidable, because `GLFW_CURSOR_DISABLED` unbinds the pointer and the
+  distance moved is gone. New objects land where the cursor ray meets the
+  ground plane; there is no CPU geometry to raycast and the depth buffer is
+  neither stored nor sampleable. Primitives are pure functions so they can be
+  tested, which caught a cylinder wound inside out and 64 degenerate triangles
+  at the sphere's poles. Lights carry an icon mesh so they can be picked and
+  outlined, flagged `editor_only` to stay out of the shadow pass and captures.
+  Done — see [ADR 0030](docs/adr/0030-scene-authoring.md).
+- **M11** — Deleting and undo. Deletion tombstones rather than compacts:
+  handles carry an index, and so do object ids, selection flags and parent
+  references, so erasing a slot would silently repoint all four. That same
+  choice is what makes undo cheap — undoing an add is tombstoning and undoing a
+  delete is un-tombstoning, with nothing re-uploaded. Ctrl+Z / Ctrl+Y over
+  transforms, adds, deletes and light edits; drags coalesce into one command
+  per gesture. `Clear scene` is not undoable and clears the history, because it
+  rewinds the registries. Done — see
+  [ADR 0031](docs/adr/0031-deletion-and-undo.md).
+
+Past this point, pick one of the items below and finish it rather than starting
+several. In no committed order:
 
 - **v2 — Forward and deferred paths.** A G-buffer and full-screen lighting pass,
   reusing M8's offscreen-target machinery. Needs material identity resolvable
@@ -123,6 +146,10 @@ In no committed order:
   which `Texture` does not do. The prefilter needs the IBL roughness remap
   `k = r^2/2`, not `geometry_smith`'s direct-lighting one. Until then a constant
   ambient stands in; a hemisphere term is ~20 lines if it needs to look better.
+  Sponza is fetched and is the thing to point this at: it loads and runs clean
+  but its atrium is lit by bounce in a real render, so today it comes out dark.
+  It is the one asset here whose appearance is limited by this rather than by
+  anything in the raster path.
 - **v2 — Ray tracing and hybrid.** `VK_KHR_ray_query` for shadows, AO or
   reflections over the raster path. The bindless set and BDA vertex access
   already suit it; the geometry buffer needs

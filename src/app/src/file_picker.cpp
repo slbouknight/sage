@@ -107,11 +107,9 @@ void FilePicker::refresh() {
     entries_.insert(entries_.end(), files.begin(), files.end());
 }
 
-std::optional<FilePicker::Request> FilePicker::draw() {
+std::optional<FilePicker::Request> FilePicker::draw_contents(bool show_scene_actions) {
     clear_requested_ = false;
     std::optional<Request> request;
-
-    ImGui::Begin("Load glTF");
 
     // Chosen on this frame, resolved after the list so a navigation does not
     // invalidate the entry being read out from under the loop.
@@ -121,11 +119,16 @@ std::optional<FilePicker::Request> FilePicker::draw() {
     if (ImGui::Button("Refresh")) {
         refresh();
     }
-    ImGui::SameLine();
-    ImGui::Checkbox("Replace scene", &replace_);
-    ImGui::SameLine();
-    if (ImGui::Button("Clear")) {
-        clear_requested_ = true;
+    // Only the docked panel offers these. Reached from the context menu the
+    // verb is "add", so replacing or emptying the scene from the same popup
+    // would be answering a question nobody asked.
+    if (show_scene_actions) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Replace scene", &replace_);
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            clear_requested_ = true;
+        }
     }
 
     ImGui::BeginChild("entries", {0.0F, k_list_height}, ImGuiChildFlags_Borders);
@@ -142,7 +145,7 @@ std::optional<FilePicker::Request> FilePicker::draw() {
                 if (entry.is_directory) {
                     chosen_directory = entry.path;
                 } else {
-                    request = Request{entry.path, replace_};
+                    request = Request{entry.path, show_scene_actions && replace_};
                 }
             }
         }
@@ -164,10 +167,11 @@ std::optional<FilePicker::Request> FilePicker::draw() {
         } else if (is_gltf(typed)) {
             // Existence is not checked here; the loader reports a bad path with
             // the parser's own message, which says more than "not found".
-            request = Request{typed, replace_};
+            request = Request{typed, show_scene_actions && replace_};
         } else if (selected_ >= 0 && !entries_[static_cast<std::size_t>(selected_)].is_directory) {
             // The field was left on a directory, so fall back to the selection.
-            request = Request{entries_[static_cast<std::size_t>(selected_)].path, replace_};
+            request = Request{entries_[static_cast<std::size_t>(selected_)].path,
+                              show_scene_actions && replace_};
         } else {
             status_ = "Not a glTF file or directory: " + path_input_;
         }
@@ -176,8 +180,6 @@ std::optional<FilePicker::Request> FilePicker::draw() {
     if (!status_.empty()) {
         ImGui::TextWrapped("%s", status_.c_str());
     }
-
-    ImGui::End();
 
     if (chosen_directory.has_value()) {
         navigate_to(*chosen_directory);
