@@ -17,6 +17,7 @@
 #include <sage/gpu/material_registry.hpp>
 #include <sage/gpu/pipeline.hpp>
 #include <sage/gpu/pipeline_cache.hpp>
+#include <sage/gpu/primitives.hpp>
 #include <sage/gpu/sampler.hpp>
 #include <sage/gpu/scene.hpp>
 #include <sage/gpu/selection_buffer.hpp>
@@ -166,6 +167,19 @@ private:
     // cursor ray intersected with the ground plane. Objects added from the
     // context menu land here.
     [[nodiscard]] glm::vec3 placement_point(float window_x, float window_y) const;
+
+    struct PendingPrimitive {
+        gpu::PrimitiveKind kind = gpu::PrimitiveKind::plane;
+        glm::vec3 position{0.0F};
+    };
+    // Queued for the same reason a load is: generating one is cheap, but
+    // uploading it blocks on a transfer submission, which is not a thing to do
+    // with a command buffer already recording.
+    std::optional<PendingPrimitive> pending_primitive_;
+    void service_pending_primitive();
+    // Builds a primitive, sizes it against the scene, and drops it in. Returns
+    // false when the geometry did not fit.
+    bool add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position);
     // The right-click menu over the 3D view, and the modal browser it can open.
     void draw_context_menu();
     // Rewinds all three registries and empties the graph. Waits for the device

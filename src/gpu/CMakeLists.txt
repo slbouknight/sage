@@ -32,6 +32,7 @@ add_library(sage_gpu STATIC
     src/material_registry.cpp
     src/physical_device.cpp
     src/pipeline.cpp
+    src/primitives.cpp
     src/pipeline_cache.cpp
     src/sampler.cpp
     src/scene.cpp

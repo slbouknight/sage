@@ -269,6 +269,26 @@ constexpr float k_hierarchy_fraction = 0.5F;
 // model does not touch the edges of the view.
 constexpr float k_framing_margin = 1.15F;
 
+// Neutral, slightly rough dielectric. Bright enough to read against the dark
+// background without being the brightest thing in frame.
+constexpr float k_primitive_albedo = 0.8F;
+constexpr float k_primitive_roughness = 0.6F;
+
+// A new primitive's size, as a fraction of the current scene's radius. A plane
+// is ground, so it wants to run past the edge of frame; a solid wants to look
+// like an object sitting next to what is already there.
+//
+// The plane's factor is a trade rather than a taste: the shadow frustum is
+// fitted to the whole scene, so a ground plane several times the model's size
+// spends most of the shadow map on empty floor and coarsens the shadow on the
+// model itself. Three is about where a floor still reads as a floor.
+constexpr float k_plane_scene_fraction = 3.0F;
+// Smaller than it first looks it should be, because a ground plane inflates
+// the scene's diagonal that this is measured against: add a plane and then a
+// sphere, and the sphere is sized against a scene the plane just made half as
+// big again. A third keeps both orders sensible.
+constexpr float k_solid_scene_fraction = 0.3F;
+
 // Where a context-menu placement lands when the cursor ray never meets the
 // ground plane -- looking up, or along it. Far enough to be in front of the
 // camera rather than inside it, near enough to stay in frame.
@@ -1644,6 +1664,80 @@ void Application::draw_presentation_controls() {
     ImGui::TextDisabled("F11 hides the panels");
 }
 
+bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position) {
+    const gpu::PrimitiveMesh mesh = gpu::make_primitive(kind);
+
+    glm::vec3 low{std::numeric_limits<float>::max()};
+    glm::vec3 high{std::numeric_limits<float>::lowest()};
+    for (const gpu::Vertex& vertex : mesh.vertices) {
+        low = glm::min(low, vertex.position);
+        high = glm::max(high, vertex.position);
+    }
+
+    const gpu::GeometryRegistry::MeshView view = geometry_registry_.add_mesh(
+        mesh.vertices.data(), sizeof(gpu::Vertex) * mesh.vertices.size(), mesh.indices.data(),
+        static_cast<std::uint32_t>(mesh.indices.size()), low, high);
+    if (!view.valid()) {
+        return false;
+    }
+
+    // Its own material rather than one shared table entry. A shared one would
+    // have to be rebuilt after every clear_scene, since the registry rewinds,
+    // and giving each primitive its own leaves room to tint them individually.
+    gpu::Material material;
+    material.base_color_factor =
+        glm::vec4(k_primitive_albedo, k_primitive_albedo, k_primitive_albedo, 1.0F);
+    material.metallic = 0.0F;
+    material.roughness = k_primitive_roughness;
+    // The registry's two permanent fallbacks: white multiplies to the factor,
+    // and the flat normal decodes to the geometric one.
+    material.base_color_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.normal_texture = gpu::TextureRegistry::k_flat_normal_slot;
+    material.metallic_roughness_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.emissive_texture = gpu::TextureRegistry::k_fallback_slot;
+    const std::uint32_t material_index = material_registry_.append({material});
+
+    // Sized against what is already here. A fixed size cannot suit both a
+    // chess piece and a street lamp -- the sample models alone span a factor
+    // of 36 -- so an absolute default would be wrong for nearly every scene.
+    const Bounds bounds = scene_bounds();
+    const float radius = bounds.empty() ? 0.0F : glm::length(bounds.max - bounds.min) * 0.5F;
+    const float reference = radius > 1e-4F ? radius : 1.0F;
+    const float scale =
+        (kind == gpu::PrimitiveKind::plane ? k_plane_scene_fraction : k_solid_scene_fraction) *
+        reference;
+
+    // Solids rest on the placement point rather than being buried half in it;
+    // the plane is the ground, so it sits exactly there.
+    const float lift = kind == gpu::PrimitiveKind::plane ? 0.0F : -low.y * scale;
+
+    glm::mat4 transform = glm::translate(glm::mat4(1.0F), position + glm::vec3(0.0F, lift, 0.0F));
+    transform = glm::scale(transform, glm::vec3(scale));
+
+    const gpu::NodeHandle node =
+        scene_graph_.add_node(gpu::NodeHandle{}, transform, gpu::primitive_name(kind));
+    scene_graph_.set_mesh(node, view, material_index);
+    scene_graph_.update_transforms();
+    select(node);
+
+    SAGE_LOG_INFO("Added {} at ({:.3f}, {:.3f}, {:.3f}), scale {:.3f}", gpu::primitive_name(kind),
+                  position.x, position.y, position.z, scale);
+    return true;
+}
+
+void Application::service_pending_primitive() {
+    if (!pending_primitive_.has_value()) {
+        return;
+    }
+    const PendingPrimitive pending = *pending_primitive_;
+    pending_primitive_.reset();
+
+    if (!add_primitive(pending.kind, pending.position)) {
+        SAGE_LOG_ERROR("Could not add {}: out of geometry capacity",
+                       gpu::primitive_name(pending.kind));
+    }
+}
+
 glm::vec3 Application::placement_point(float window_x, float window_y) const {
     const CameraMatrices matrices = camera_matrices();
     const glm::vec3 origin = camera_.position();
@@ -1702,6 +1796,19 @@ void Application::draw_context_menu() {
             // to close, so the menu only records the intent and the modal is
             // opened below.
             add_mesh_popup_open_ = true;
+        }
+        if (ImGui::BeginMenu("Primitive")) {
+            constexpr std::array<gpu::PrimitiveKind, 5> k_kinds{
+                gpu::PrimitiveKind::plane, gpu::PrimitiveKind::cube, gpu::PrimitiveKind::sphere,
+                gpu::PrimitiveKind::cone, gpu::PrimitiveKind::cylinder};
+            for (const gpu::PrimitiveKind kind : k_kinds) {
+                if (ImGui::MenuItem(gpu::primitive_name(kind))) {
+                    // Queued, not built here: the upload blocks on a transfer
+                    // submission, and this is the middle of a frame.
+                    pending_primitive_ = PendingPrimitive{kind, context_menu_point_};
+                }
+            }
+            ImGui::EndMenu();
         }
         ImGui::EndPopup();
     }
@@ -2054,6 +2161,7 @@ void Application::run() {
         // and no ImGui frame is open, so a wait_idle and a blocking upload here
         // disturb nothing. Costs the picker one frame of latency.
         service_pending_load();
+        service_pending_primitive();
         service_selection();
 
         const auto now = std::chrono::steady_clock::now();
