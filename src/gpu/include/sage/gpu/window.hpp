@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sage/gpu/drag_gesture.hpp>
+
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -36,7 +38,7 @@ public:
 
     // One frame of input. Sample once per frame, after poll_events().
     struct InputState {
-        bool look_active = false;     // right mouse button held
+        bool look_active = false;     // right mouse dragged past the threshold
         float cursor_delta_x = 0.0F;  // pixels since last sample
         float cursor_delta_y = 0.0F;
         float scroll_delta = 0.0F;  // ticks accumulated since last sample
@@ -46,6 +48,14 @@ public:
         bool right = false;
         bool up = false;
         bool down = false;
+        // True on the frame a right click is released without having become a
+        // camera drag. The two share a button, so one of them has to be decided
+        // by how far the cursor moved -- see the note in sample_input.
+        bool context_click = false;
+        // Where that click happened, in window pixels. Meaningful only when
+        // context_click is true.
+        float context_click_x = 0.0F;
+        float context_click_y = 0.0F;
     };
 
     // Consumes accumulated scroll and re-baselines the cursor, soo this must be
@@ -58,7 +68,9 @@ private:
 
     GLFWwindow* window_ = nullptr;
     bool resized_ = false;
-    bool look_active_ = false;
+    // Owns the decision about what the right button meant; this class only
+    // acts on it by grabbing or releasing the cursor.
+    DragGesture right_button_;
     double last_cursor_x_ = 0.0;
     double last_cursor_y_ = 0.0;
     float scroll_accumulator_ = 0.0F;

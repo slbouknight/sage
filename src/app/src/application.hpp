@@ -111,6 +111,10 @@ private:
     // Turns a click in the 3D view into a pending object-id readback. No-op
     // when a panel has the pointer or the cursor is outside the viewport.
     void handle_picking_input();
+    // A window position in ImGui's logical coordinates as a framebuffer texel,
+    // or nothing when it falls outside the 3D view. Shared by picking and by
+    // the context menu, which need the identical test.
+    [[nodiscard]] std::optional<VkOffset2D> viewport_texel(float window_x, float window_y) const;
     // W/E/R switch the manipulator, as in Unreal and Blender.
     void handle_gizmo_keys();
     // Copies the picked texel out of the id attachment. Recorded after the
@@ -143,10 +147,27 @@ private:
     // does: the upload blocks and submits work of its own.
     void service_selection();
 
+    // A queued load. Separate from FilePicker::Request because the context menu
+    // raises these too, and it places what it adds where the click landed.
+    struct PendingLoad {
+        std::filesystem::path path;
+        bool replace = true;
+        // Absent means "wherever the file says", which is what the panel and
+        // the command line want. Set, it moves the load's root node there.
+        std::optional<glm::vec3> placement;
+    };
+
     // Loads a file into the registries and the graph. Returns false when the
     // file could not be read; the scene is left as it was in that case, unless
     // `replace` already emptied it.
-    bool load_model(const std::filesystem::path& path, bool replace);
+    bool load_model(const PendingLoad& load);
+
+    // Where a right click in the viewport points, as a world position: the
+    // cursor ray intersected with the ground plane. Objects added from the
+    // context menu land here.
+    [[nodiscard]] glm::vec3 placement_point(float window_x, float window_y) const;
+    // The right-click menu over the 3D view, and the modal browser it can open.
+    void draw_context_menu();
     // Rewinds all three registries and empties the graph. Waits for the device
     // to go idle first: in-flight command buffers still name this geometry, and
     // TextureRegistry::reset destroys live images.
@@ -312,8 +333,15 @@ private:
     VkExtent2D screenshot_extent_{};
 
     FilePicker file_picker_;
-    std::optional<FilePicker::Request> pending_load_;
+    std::optional<PendingLoad> pending_load_;
     bool pending_clear_ = false;
+    // Where the context menu was opened, in world space. Held for as long as
+    // the menu and any modal it spawns are up, so what gets added lands where
+    // the user clicked rather than where the camera happens to be by then.
+    glm::vec3 context_menu_point_{0.0F};
+    // The context menu's browser. Opened from the menu, and outlives it --
+    // a popup cannot be nested inside one that has already closed.
+    bool add_mesh_popup_open_ = false;
 
     core::Camera camera_;
     gpu::Window window_;

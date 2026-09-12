@@ -27,7 +27,14 @@ public:
     explicit FilePicker(const std::filesystem::path& start_directory);
 
     // Returns a request on the frame a file is chosen, nothing otherwise.
+    // Draws its own window.
     [[nodiscard]] std::optional<Request> draw();
+
+    // The same body without the surrounding window, so the browser can also be
+    // put inside a popup. `show_scene_actions` gates the replace/clear
+    // controls, which belong to the docked panel: the context menu's verb is
+    // "add", and a request raised with them hidden is always additive.
+    [[nodiscard]] std::optional<Request> draw_contents(bool show_scene_actions);
 
     // True on the frame the user asks for an empty scene.
     [[nodiscard]] bool clear_requested() const { return clear_requested_; }

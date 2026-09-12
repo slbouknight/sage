@@ -269,6 +269,14 @@ constexpr float k_hierarchy_fraction = 0.5F;
 // model does not touch the edges of the view.
 constexpr float k_framing_margin = 1.15F;
 
+// Where a context-menu placement lands when the cursor ray never meets the
+// ground plane -- looking up, or along it. Far enough to be in front of the
+// camera rather than inside it, near enough to stay in frame.
+constexpr float k_fallback_placement_distance = 5.0F;
+// Past this, a ray that technically does hit the ground is hitting it so far
+// away that the object would be invisible. Treated as a miss.
+constexpr float k_max_placement_distance = 1000.0F;
+
 // The dockspace's central node in framebuffer pixels, or the whole image when
 // there is no layout yet. Free rather than a member so ImGuiID stays out of
 // application.hpp.
@@ -429,20 +437,28 @@ Application::Application(const std::filesystem::path& model_path)
     // Through the same path a picker click takes, so a command-line model gets
     // no special handling and a bad argument is a message rather than a crash
     // before the window is ever useful.
-    if (!load_model(model_path, true)) {
+    if (!load_model(PendingLoad{model_path, true, std::nullopt})) {
         SAGE_LOG_WARN("Starting with an empty scene");
     }
 }
 
-bool Application::load_model(const std::filesystem::path& path, bool replace) {
-    if (replace) {
+bool Application::load_model(const PendingLoad& load) {
+    if (load.replace) {
         clear_scene();
     }
 
     const std::optional<gpu::LoadedScene> loaded = gpu::load_gltf(
-        path, geometry_registry_, texture_registry_, material_registry_, scene_graph_);
+        load.path, geometry_registry_, texture_registry_, material_registry_, scene_graph_);
     if (!loaded.has_value()) {
         return false;
+    }
+
+    // Everything from a file hangs off one root, so placing the load is one
+    // transform rather than a walk.
+    if (load.placement.has_value()) {
+        scene_graph_.set_local_transform(loaded->root,
+                                         glm::translate(glm::mat4(1.0F), *load.placement));
+        scene_graph_.update_transforms();
     }
 
     // Only when the load actually drew something and had the viewport to
@@ -452,7 +468,7 @@ bool Application::load_model(const std::filesystem::path& path, bool replace) {
     // Queued rather than applied: framing needs the central node's aspect, and
     // the dockspace does not exist yet when the constructor loads a model named
     // on the command line.
-    if (replace && loaded->mesh_count > 0) {
+    if (load.replace && loaded->mesh_count > 0) {
         pending_frame_ = SceneBounds{loaded->bounds_min, loaded->bounds_max};
     }
     return true;
@@ -490,11 +506,11 @@ void Application::service_pending_load() {
         return;
     }
 
-    const FilePicker::Request request = *pending_load_;
+    const PendingLoad load = *pending_load_;
     pending_load_.reset();
 
-    if (!load_model(request.path, request.replace)) {
-        SAGE_LOG_ERROR("Could not load {}", request.path.string());
+    if (!load_model(load)) {
+        SAGE_LOG_ERROR("Could not load {}", load.path.string());
     }
 }
 
@@ -1086,33 +1102,37 @@ void Application::handle_picking_input() {
         return;
     }
 
+    const ImVec2 mouse = ImGui::GetMousePos();
+    pending_pick_ = viewport_texel(mouse.x, mouse.y);
+}
+
+std::optional<VkOffset2D> Application::viewport_texel(float window_x, float window_y) const {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
-        return;
+        return std::nullopt;
     }
 
-    // ImGui reports logical coordinates; the id attachment is framebuffer
+    // ImGui reports logical coordinates; the attachments are framebuffer
     // pixels. Same conversion as central_node_rect, for the same reason.
-    const VkExtent2D extent = id_buffer_.extent();
-    const ImVec2 mouse = ImGui::GetMousePos();
+    const VkExtent2D extent = swapchain_.extent();
     const float x =
-        (mouse.x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
+        (window_x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
     const float y =
-        (mouse.y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
+        (window_y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
 
     const auto texel_x = static_cast<std::int32_t>(x);
     const auto texel_y = static_cast<std::int32_t>(y);
 
-    // Outside the 3D view is not a miss, it is not a pick at all -- clicking
-    // the dockspace border should leave the selection alone.
+    // Outside the 3D view is not a miss, it is not a click in it at all --
+    // clicking the dockspace border should leave the selection alone, and
+    // should not offer to add anything either.
     const VkRect2D& rect = viewport_rect_;
     if (texel_x < rect.offset.x || texel_y < rect.offset.y ||
         texel_x >= rect.offset.x + static_cast<std::int32_t>(rect.extent.width) ||
         texel_y >= rect.offset.y + static_cast<std::int32_t>(rect.extent.height)) {
-        return;
+        return std::nullopt;
     }
-
-    pending_pick_ = VkOffset2D{texel_x, texel_y};
+    return VkOffset2D{texel_x, texel_y};
 }
 
 void Application::handle_gizmo_keys() {
@@ -1569,7 +1589,7 @@ void Application::draw_ui() {
     // load blocks, waits for the device and destroys images the command buffer
     // being recorded would still reference.
     if (std::optional<FilePicker::Request> request = file_picker_.draw(); request.has_value()) {
-        pending_load_ = std::move(request);
+        pending_load_ = PendingLoad{request->path, request->replace, std::nullopt};
     }
     if (file_picker_.clear_requested()) {
         // Same reasoning: clear_scene waits for the device to be idle, which is
@@ -1622,6 +1642,94 @@ void Application::draw_presentation_controls() {
                             viewport_rect_.extent.height);
     }
     ImGui::TextDisabled("F11 hides the panels");
+}
+
+glm::vec3 Application::placement_point(float window_x, float window_y) const {
+    const CameraMatrices matrices = camera_matrices();
+    const glm::vec3 origin = camera_.position();
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const VkExtent2D extent = swapchain_.extent();
+    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F || viewport_rect_.extent.width == 0 ||
+        viewport_rect_.extent.height == 0) {
+        return origin + (camera_.forward() * k_fallback_placement_distance);
+    }
+
+    // ImGui reports logical coordinates; viewport_rect_ is framebuffer pixels.
+    // Same conversion as central_node_rect, for the same reason.
+    const float pixel_x = window_x * (static_cast<float>(extent.width) / viewport->Size.x);
+    const float pixel_y = window_y * (static_cast<float>(extent.height) / viewport->Size.y);
+
+    // Normalised within the 3D view, then to NDC. No Y negation: the
+    // projection is already Vulkan's, whose NDC Y runs down the screen exactly
+    // as framebuffer rows do.
+    const float ndc_x = (2.0F * (pixel_x - static_cast<float>(viewport_rect_.offset.x)) /
+                         static_cast<float>(viewport_rect_.extent.width)) -
+                        1.0F;
+    const float ndc_y = (2.0F * (pixel_y - static_cast<float>(viewport_rect_.offset.y)) /
+                         static_cast<float>(viewport_rect_.extent.height)) -
+                        1.0F;
+
+    // Unprojecting the far plane alone is enough for a direction: the near
+    // point is the camera position, which is already known exactly.
+    const glm::mat4 inverse_view_projection = glm::inverse(matrices.projection * matrices.view);
+    const glm::vec4 far_point = inverse_view_projection * glm::vec4(ndc_x, ndc_y, 1.0F, 1.0F);
+    if (std::abs(far_point.w) < 1e-6F) {
+        return origin + (camera_.forward() * k_fallback_placement_distance);
+    }
+    const glm::vec3 direction = glm::normalize(glm::vec3(far_point) / far_point.w - origin);
+
+    // Intersect the ground plane. A ray running along it, or pointing away
+    // from it, has no useful answer -- which is most of the time when the
+    // camera is below the horizon -- so fall back to a fixed distance ahead.
+    if (std::abs(direction.y) > 1e-4F) {
+        const float distance = -origin.y / direction.y;
+        if (distance > 0.0F && distance < k_max_placement_distance) {
+            return origin + (direction * distance);
+        }
+    }
+    return origin + (direction * k_fallback_placement_distance);
+}
+
+void Application::draw_context_menu() {
+    if (ImGui::BeginPopup("viewport_context")) {
+        ImGui::TextDisabled("Add at %.2f, %.2f, %.2f", static_cast<double>(context_menu_point_.x),
+                            static_cast<double>(context_menu_point_.y),
+                            static_cast<double>(context_menu_point_.z));
+        ImGui::Separator();
+        if (ImGui::MenuItem("Mesh (glTF)...")) {
+            // Deferred: a popup cannot be opened from inside one that is about
+            // to close, so the menu only records the intent and the modal is
+            // opened below.
+            add_mesh_popup_open_ = true;
+        }
+        ImGui::EndPopup();
+    }
+
+    if (add_mesh_popup_open_ && !ImGui::IsPopupOpen("Add mesh")) {
+        ImGui::OpenPopup("Add mesh");
+    }
+
+    // Centred rather than at the cursor: the browser is a good deal larger than
+    // a menu, and anchoring it to a click near an edge would push it off-screen.
+    const ImVec2 centre = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+    if (ImGui::BeginPopupModal("Add mesh", &add_mesh_popup_open_,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        // show_scene_actions false: reached this way the verb is "add", so the
+        // request comes back additive and the replace/clear controls are gone.
+        if (const std::optional<FilePicker::Request> request = file_picker_.draw_contents(false);
+            request.has_value()) {
+            pending_load_ = PendingLoad{request->path, false, context_menu_point_};
+            add_mesh_popup_open_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::Button("Cancel")) {
+            add_mesh_popup_open_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void Application::draw_lighting_panel() {
@@ -2032,6 +2140,18 @@ void Application::run() {
         if (!gizmo_active) {
             handle_picking_input();
         }
+
+        // A right click that never became a camera drag. Gated the same way
+        // picking is: a panel under the pointer wins, and a click outside the
+        // 3D view is not a click in it.
+        if (input.context_click && !gpu::ImGuiLayer::wants_mouse() &&
+            viewport_texel(input.context_click_x, input.context_click_y).has_value()) {
+            context_menu_point_ = placement_point(input.context_click_x, input.context_click_y);
+            ImGui::OpenPopup("viewport_context");
+        }
+        // Outside the ui_hidden_ block: the menu is how things get added, and
+        // hiding the panels for a capture should not take that away.
+        draw_context_menu();
 
         if (!ui_hidden_) {
             draw_ui();

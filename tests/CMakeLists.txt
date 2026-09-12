@@ -4,6 +4,7 @@ include(Catch)
 add_executable(sage_tests
     core/test_camera.cpp
     core/test_handle.cpp
+    gpu/test_drag_gesture.cpp
     gpu/test_physical_device_selection.cpp
     gpu/test_scene_graph.cpp
 )

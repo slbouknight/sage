@@ -21,6 +21,7 @@ add_library(sage_gpu STATIC
     src/buffer.cpp
     src/depth_buffer.cpp
     src/device.cpp
+    src/drag_gesture.cpp
     src/frame_pacer.cpp
     src/geometry_registry.cpp
     src/gltf_loader.cpp
