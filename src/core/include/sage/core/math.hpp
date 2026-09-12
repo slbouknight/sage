@@ -28,4 +28,22 @@ namespace sage::core {
     return glm::perspective(fov_y_radians, aspect, near_plane, far_plane);
 }
 
+// Orthographic, with the same Y negation as perspective_vk and for the same
+// reason. A directional light has no viewpoint, so its shadow pass projects in
+// parallel rather than from a position.
+//
+// The flip matters more here than it looks. A shadow lookup converts NDC to
+// texture coordinates by hand rather than letting the viewport do it, so the
+// projection used to *rasterise* the map and the one used to *read* it must
+// agree on which way Y points. Flipping here makes both sides Vulkan's
+// convention; flipping in neither place would also work, and flipping in one
+// puts every shadow upside down in a way that looks almost plausible on a
+// symmetric model.
+[[nodiscard]] inline glm::mat4 ortho_vk(float left, float right, float bottom, float top,
+                                        float near_plane, float far_plane) {
+    glm::mat4 projection = glm::ortho(left, right, bottom, top, near_plane, far_plane);
+    projection[1][1] *= -1.0F;
+    return projection;
+}
+
 }  // namespace sage::core

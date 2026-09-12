@@ -32,6 +32,27 @@ void write_single_image(VkDevice device, VkDescriptorSet set, std::uint32_t bind
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
+// The same, for the bindings whose view has to travel with a particular
+// sampler. `layout` differs between them because one is a depth image.
+void write_single_combined_image(VkDevice device, VkDescriptorSet set, std::uint32_t binding,
+                                 VkImageView view, VkSampler sampler, VkImageLayout layout) {
+    VkDescriptorImageInfo image_info{};
+    image_info.sampler = sampler;
+    image_info.imageView = view;
+    image_info.imageLayout = layout;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_info;
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+}
+
 }  // namespace
 
 BindlessSet::BindlessSet(const Device& device) : device_(device) {
@@ -48,7 +69,7 @@ BindlessSet::BindlessSet(const Device& device) : device_(device) {
     SAGE_VERIFY(props12.maxDescriptorSetUpdateAfterBindSampledImages >= k_max_sampled_images,
                 "GPU cannot back the requested bindless sampled-image array");
 
-    std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
     bindings[0].binding = k_storage_buffer_binding;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = k_max_storage_buffers;
@@ -70,10 +91,21 @@ BindlessSet::BindlessSet(const Device& device) : device_(device) {
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_ALL;
 
+    bindings[4].binding = k_shadow_map_binding;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_ALL;
+
+    bindings[5].binding = k_ldr_color_binding;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_ALL;
+
     constexpr VkDescriptorBindingFlags k_binding_flags =
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
         VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
-    constexpr std::array<VkDescriptorBindingFlags, 4> k_flags{k_binding_flags, k_binding_flags,
+    constexpr std::array<VkDescriptorBindingFlags, 6> k_flags{k_binding_flags, k_binding_flags,
+                                                              k_binding_flags, k_binding_flags,
                                                               k_binding_flags, k_binding_flags};
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{};
@@ -91,7 +123,10 @@ BindlessSet::BindlessSet(const Device& device) : device_(device) {
 
     const std::array<VkDescriptorPoolSize, 3> pool_sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, k_max_storage_buffers},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, k_max_sampled_images},
+        // Plus two for the shadow map and the tonemapped image, which share
+        // this descriptor type with the colour-texture array but not its
+        // binding.
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, k_max_sampled_images + 2},
         // Two: the object-id attachment and the HDR colour target.
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2}};
 
@@ -141,6 +176,18 @@ void BindlessSet::write_object_id_image(VkImageView view) const {
 
 void BindlessSet::write_hdr_color_image(VkImageView view) const {
     write_single_image(device_.handle(), set_, k_hdr_color_binding, view);
+}
+
+void BindlessSet::write_shadow_map(VkImageView view, VkSampler sampler) const {
+    // DEPTH_READ_ONLY rather than SHADER_READ_ONLY: this is a depth image, and
+    // the read-only depth layout is what the shadow pass leaves it in.
+    write_single_combined_image(device_.handle(), set_, k_shadow_map_binding, view, sampler,
+                                VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL);
+}
+
+void BindlessSet::write_ldr_color_image(VkImageView view, VkSampler sampler) const {
+    write_single_combined_image(device_.handle(), set_, k_ldr_color_binding, view, sampler,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void BindlessSet::write_sampled_image(std::uint32_t index, VkImageView view,

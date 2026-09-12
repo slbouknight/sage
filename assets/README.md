@@ -4,7 +4,7 @@ Test models are **fetched, not vendored**. This directory holds only this file
 in a fresh clone; everything else here is gitignored.
 
 ```bash
-python3 tools/fetch_assets.py            # all three models, ~61 MB
+python3 tools/fetch_assets.py            # all four models, ~91 MB
 python3 tools/fetch_assets.py lantern    # just one
 python3 tools/fetch_assets.py --list     # names and upstream URLs
 ```
@@ -47,12 +47,13 @@ view, which the loader reports and falls back to white for.
 | `lantern/` | Lantern | 9.6 MB | 1 | A parent node with a rotation over three translated children, so it exercises hierarchy rather than single-mesh loading. `TANGENT` throughout. 25.85 units tall. |
 | `flight_helmet/` | FlightHelmet | 48.4 MB | 6 | The multi-material case: six materials over six meshes sharing five texture groups, since `HoseMat` reuses `RubberWoodMat`'s maps. `TANGENT` throughout. 0.72 units tall. |
 | `damaged_helmet/` | DamagedHelmet | 3.8 MB | 1 | The only JPEG-textured model here, and the only one **without `TANGENT`** — the loader substitutes an arbitrary tangent and warns, so its normal map does not shade correctly. 3.3 units tall. |
+| `chess/` | ABeautifulGame | 29.8 MB | 15 | The v1.0 hero scene, and the reason it is here: 49 meshes standing on a board that is part of the same file, so shadows have something of their own to fall on. 0.70 units across, which is small enough that a bias measured in world units rather than shadow-map texels visibly fails on it. |
 
 Two things worth knowing before comparing them.
 
-**Scale varies by a factor of 36.** Every load lands at the world origin with an
+**Scale varies by a factor of 37.** Every load lands at the world origin with an
 identity transform, so loading the lantern and the flight helmet together puts a
-speck at the foot of a street lamp. M7's gizmos are what fix that.
+speck at the foot of a street lamp. The gizmo is what fixes that.
 
 **Occlusion is never read.** glTF packs occlusion, roughness and metallic into
 one image's R, G and B, and the renderer samples only G and B. Ambient occlusion

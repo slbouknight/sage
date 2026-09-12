@@ -34,6 +34,11 @@ MODELS = {
     "lantern": "Lantern",
     "flight_helmet": "FlightHelmet",
     "damaged_helmet": "DamagedHelmet",
+    # The v1.0 hero scene. Chess pieces on a board give what a single model
+    # cannot: many objects casting shadows onto a surface that is part of the
+    # same file, so the shadow pass has something to land on without a
+    # procedural ground plane.
+    "chess": "ABeautifulGame",
 }
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"

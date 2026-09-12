@@ -25,6 +25,16 @@ struct GraphicsPipelineDesc {
     // A full-screen triangle has no back face to cull, and culling one would
     // silently draw nothing.
     bool cull_backfaces = true;
+    // No fragment stage and no colour attachments: the shadow pass exists only
+    // to fill a depth buffer, and rasterising colour it then discards would be
+    // paying twice for nothing. The SPIR-V must have no fragment entry point.
+    bool depth_only = false;
+    // Enables depth bias with the values supplied dynamically by
+    // vkCmdSetDepthBias. Dynamic rather than baked in so the constant and
+    // slope-scaled terms stay tunable from the UI -- shadow acne and peter-
+    // panning are two ends of one slider, and finding the middle is an
+    // interactive job, not a rebuild-per-guess one.
+    bool depth_bias = false;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;
 };

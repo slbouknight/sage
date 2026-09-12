@@ -26,6 +26,26 @@ struct FrameData
     float3 camera_position;
     uint light_count;
     Light lights[k_max_lights];
+    // Shadows cover the first directional light only. A second shadowed light
+    // needs a second map and a second depth pass, which is a scene-complexity
+    // decision rather than a shader one.
+    float4x4 light_view_projection;
+    // World-space distance to push a sample point along its normal before
+    // projecting into light space. Works where a pure depth bias struggles:
+    // depth bias is measured perpendicular to the light, so on a surface nearly
+    // edge-on to it the offset needed grows without bound, while moving along
+    // the normal is the direction the error actually lies in.
+    float shadow_normal_bias;
+    // Half-width of the PCF kernel, in shadow-map texels. 0 is a single tap.
+    int shadow_pcf_radius;
+    // 1 / resolution. Passed rather than derived so the shader never needs to
+    // know how big the map is.
+    float shadow_texel_size;
+    uint shadow_enabled;
+    // Flat ambient. The only thing between an unlit face and pure black while
+    // there is no IBL and no occlusion term, so how much of it there is is a
+    // look decision rather than a constant worth compiling in.
+    float ambient_intensity;
 };
 
 struct Material
@@ -72,6 +92,15 @@ Sampler2D textures[];
 
 // Slot 0 while there is one texture; becomes a push-constant index later.
 static const uint k_base_color_slot = 0;
+
+// Binding 4 of set 0: the directional light's shadow map, paired with a
+// comparison sampler. Sampler2DShadow rather than Sampler2D -- the extra
+// coordinate is the depth to test against, and what comes back is not a stored
+// depth but the filtered result of the test, so a LINEAR filter blends four
+// lit/shadowed answers instead of four depths. Averaging depths would compare
+// against a surface that exists nowhere in the scene.
+[vk::binding(4, 0)]
+Sampler2DShadow shadow_map;
 
 
 struct VertexOutput
@@ -194,6 +223,59 @@ float3 apply_normal_map(float3 world_normal, float4 world_tangent, uint normal_t
     return normalize(sampled.x * t + sampled.y * b + sampled.z * n);
 }
 
+// How much of the directional light reaches this point: 1 fully lit, 0 fully
+// shadowed, fractions in between from filtering.
+float shadow_factor(float3 world_position, float3 normal)
+{
+    if (pc.frame.shadow_enabled == 0)
+    {
+        return 1.0;
+    }
+
+    const float3 biased = world_position + normal * pc.frame.shadow_normal_bias;
+    const float4 light_space = mul(pc.frame.light_view_projection, float4(biased, 1.0));
+
+    // The divide is a no-op for an orthographic projection, where w is always
+    // 1. Kept so this function does not silently become wrong the day a
+    // spotlight with a perspective projection wants it.
+    const float3 ndc = light_space.xyz / light_space.w;
+
+    // NDC xy is [-1, 1] and texture coordinates are [0, 1]. No Y negation here:
+    // ortho_vk already applied Vulkan's flip when the map was rasterised, so
+    // both sides of this lookup share one convention.
+    const float2 uv = ndc.xy * 0.5 + 0.5;
+
+    // Beyond the far plane of the light's frustum there is nothing recorded to
+    // be occluded by. The sampler's opaque-white border handles xy outside the
+    // map; z has no border to fall back on.
+    if (ndc.z > 1.0)
+    {
+        return 1.0;
+    }
+
+    // A square kernel of comparison taps. Each one is already bilinear across
+    // four texels thanks to the comparison sampler, so radius 1 is a 3x3 grid
+    // of 2x2 filtered tests -- considerably softer than nine hard ones.
+    const int radius = pc.frame.shadow_pcf_radius;
+    const float texel = pc.frame.shadow_texel_size;
+
+    float sum = 0.0;
+    int taps = 0;
+    for (int y = -radius; y <= radius; ++y)
+    {
+        for (int x = -radius; x <= radius; ++x)
+        {
+            const float2 offset = float2(x, y) * texel;
+            // LevelZero, not plain SampleCmp: the map has one mip, and this
+            // lookup sits inside a branch, where the implicit derivatives a
+            // mip selection would need are not well defined.
+            sum += shadow_map.SampleCmpLevelZero(uv + offset, ndc.z);
+            ++taps;
+        }
+    }
+    return sum / float(taps);
+}
+
 // Two render targets: shaded colour, and the object id that lets the cursor
 // and the outline pass work out what a pixel belongs to.
 struct FragmentOutput
@@ -225,7 +307,12 @@ FragmentOutput fragment_main(VertexOutput input)
 
     // Flat ambient so faces with no light on them are not pure black.
     // Replace with an irradiance probe in future IBL work.
-    float3 lit = base_color.rgb * 0.03;
+    float3 lit = base_color.rgb * pc.frame.ambient_intensity;
+
+    // The shadow map is fitted to one directional light, so only the first one
+    // consumes it. Later directional lights are treated as fill and stay
+    // unshadowed rather than reusing a map fitted to a different direction.
+    bool shadow_spent = false;
 
     for (uint i=0; i < pc.frame.light_count; ++i)
     {
@@ -251,6 +338,15 @@ FragmentOutput fragment_main(VertexOutput input)
         else
         {
             to_light = -normalize(light.direction);
+            if (!shadow_spent)
+            {
+                // The geometric normal, not the mapped one: a normal map's
+                // detail has no bearing on whether the light is occluded, and
+                // offsetting along it pushes the sample sideways into
+                // neighbouring texels for no gain.
+                attenuation *= shadow_factor(input.world_position, normalize(input.world_normal));
+                shadow_spent = true;
+            }
         }
 
         const float3 radiance = light.color * (light.intensity * attenuation);

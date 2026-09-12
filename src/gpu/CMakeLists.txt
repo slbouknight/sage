@@ -26,6 +26,7 @@ add_library(sage_gpu STATIC
     src/gltf_loader.cpp
     src/hdr_target.cpp
     src/imgui_layer.cpp
+    src/ldr_target.cpp
     src/instance.cpp
     src/material_registry.cpp
     src/physical_device.cpp
@@ -35,6 +36,7 @@ add_library(sage_gpu STATIC
     src/scene.cpp
     src/screenshot.cpp
     src/selection_buffer.cpp
+    src/shadow_map.cpp
     src/id_buffer.cpp
     src/shader_module.cpp
     src/surface.cpp
