@@ -4,7 +4,7 @@ Test models are **fetched, not vendored**. This directory holds only this file
 in a fresh clone; everything else here is gitignored.
 
 ```bash
-python3 tools/fetch_assets.py            # all four models, ~91 MB
+python3 tools/fetch_assets.py            # all seven models, ~191 MB
 python3 tools/fetch_assets.py lantern    # just one
 python3 tools/fetch_assets.py --list     # names and upstream URLs
 ```
@@ -48,6 +48,9 @@ view, which the loader reports and falls back to white for.
 | `flight_helmet/` | FlightHelmet | 48.4 MB | 6 | The multi-material case: six materials over six meshes sharing five texture groups, since `HoseMat` reuses `RubberWoodMat`'s maps. `TANGENT` throughout. 0.72 units tall. |
 | `damaged_helmet/` | DamagedHelmet | 3.8 MB | 1 | The only JPEG-textured model here, and the only one **without `TANGENT`** — the loader substitutes an arbitrary tangent and warns, so its normal map does not shade correctly. 3.3 units tall. |
 | `chess/` | ABeautifulGame | 29.8 MB | 15 | The v1.0 hero scene, and the reason it is here: 49 meshes standing on a board that is part of the same file, so shadows have something of their own to fall on. 0.70 units across, which is small enough that a bias measured in world units rather than shadow-map texels visibly fails on it. |
+| `sci_fi_helmet/` | SciFiHelmet | 30.3 MB | 1 | One mesh, one material, 2K maps, and — unlike `DamagedHelmet` — it ships `TANGENT`, so its normal mapping actually shades correctly. The best single-object subject here. |
+| `antique_camera/` | AntiqueCamera | 17.5 MB | 2 | Wood, brass and leather over core metallic-roughness. A tall, thin silhouette, which makes it the clearest test that the shadow pass handles more than a blob. |
+| `sponza/` | Sponza | 52.7 MB | 25 | The architectural classic, 103 meshes over 67 textures. Loads and runs clean, and **looks wrong**: its atrium is lit by bounce in a real render, and sage has neither GI nor IBL, so the interior comes out dark. It is here as the thing to point an IBL implementation at, and as the one asset large enough to show what a single shadow map fitted to a whole scene costs. |
 
 Two things worth knowing before comparing them.
 

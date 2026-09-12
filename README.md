@@ -10,11 +10,12 @@ a tonemap. Linux-only, C++20, Clang-first.
 
 ## Status
 
-**v1.0.** Loads arbitrary glTF at runtime, shades it with a Cook-Torrance BRDF
-under data-driven lights, casts shadows from a directional key light, resolves
-through an HDR target and a selectable tonemap, anti-aliases, and writes the
-result to a PNG. Objects can be picked in the viewport, outlined, and moved with
-a gizmo.
+**v1.0, plus scene authoring.** Loads arbitrary glTF at runtime, shades it with
+a Cook-Torrance BRDF under data-driven lights, casts shadows from a directional
+key light, resolves through an HDR target and a selectable tonemap,
+anti-aliases, and writes the result to a PNG. Scenes are built as well as
+loaded: right-click to add a mesh, a primitive or a light, move it with a gizmo,
+delete it, and undo any of that.
 
 ![The sage editor](docs/images/editor.png)
 
@@ -47,18 +48,24 @@ a gizmo.
   survive to be tonemapped rather than clamping at the attachment, a
   runtime-selectable curve (none / Reinhard / ACES) with exposure in stops, and
   FXAA.
-- **Editor** — dockspace, scene hierarchy, properties, lighting and shadow
-  controls; cursor picking by object-ID readback, subtree outlining from ID
+- **Editor** — menu bar, scene hierarchy, properties, a viewport overlay for the
+  read-out; cursor picking by object-ID readback, subtree outlining from ID
   discontinuity, ImGuizmo for transforms, and screenshot-to-PNG.
+- **Authoring** — a right-click context menu that adds a glTF, a procedural
+  primitive (plane, cube, sphere, cone, cylinder) or a light, placed where the
+  cursor ray meets the ground. Lights are scene nodes, so they are selected,
+  aimed and parented like anything else, with a small icon mesh that picks and
+  outlines but stays out of the shadow pass and out of captures.
+- **Editing** — deletion and an undo stack (Ctrl+Z / Ctrl+Y) over transforms,
+  additions, deletions and light edits. Deletion tombstones rather than
+  compacts, which keeps every handle and object id stable — and is what makes
+  undo cheap, since nothing is ever re-uploaded.
 
-### What it does not
+### Demo
 
-No IBL — ambient is a single constant, so metals have nothing to reflect. No
-global illumination, no ray tracing, no deferred path, no CUDA. Those are
-recorded as deliberate scope decisions rather than omissions; see
-[`CLAUDE.md`](CLAUDE.md) for the ladder and the standing prohibitions, and
-[ADR 0024](docs/adr/0024-vulkan-only-cuda-cut.md) for why CUDA interop was
-scoped, seriously considered, and cut.
+Selecting, moving and deleting objects with the gizmo:
+
+<video src="https://github.com/slbouknight/sage/raw/main/docs/videos/sageDemo.mp4" controls muted width="900"></video>
 
 ### Anti-aliasing
 
@@ -81,7 +88,7 @@ That opens on an empty scene. Test models are fetched rather than committed:
 python3 tools/fetch_assets.py
 ```
 
-Then load one from the **Load glTF** panel, or name it on the command line:
+Then open one from **File → Open glTF**, or name it on the command line:
 
 ```bash
 ./build/debug/src/app/sage assets/chess/ABeautifulGame.gltf
@@ -90,7 +97,7 @@ Then load one from the **Load glTF** panel, or name it on the command line:
 See [`assets/README.md`](assets/README.md) for what the models are and why they
 are not in the repository.
 
-![The Damaged Helmet sample model](docs/images/helmet.png)
+![The AntiqueCamera sample model](docs/images/antique-camera.png)
 
 The camera frames itself on whatever it loads. Controls follow Unreal's
 viewport: **hold right mouse** to look, **WASD** to fly, **E**/**Q** for
@@ -99,9 +106,16 @@ up/down, **scroll** to change speed.
 | | |
 |---|---|
 | **Left click** | select an object (the root of whatever was clicked) |
+| **Right click** | context menu: add a mesh, primitive or light at the cursor |
 | **W** / **E** / **R** | move / rotate / scale gizmo |
+| **Del** | delete the selection and everything beneath it |
+| **Ctrl+Z** / **Ctrl+Y** | undo / redo |
 | **F2** | screenshot to `screenshots/` |
 | **F11** | hide the panels and give the render the whole window |
+
+Right-*drag* still flies the camera. The two share a button, so a press only
+arms the camera and the first few pixels of movement commit to it; a release
+before that is a click.
 
 ## Building
 
@@ -179,3 +193,5 @@ what it cost. A few that carry the most of the design:
 | [0027](docs/adr/0027-object-id-selection-and-gizmos.md) | one `R32_UINT` attachment serving both picking and outlining |
 | [0028](docs/adr/0028-hdr-target-tonemap-and-capture.md) | the HDR target, the tonemap, and capture |
 | [0029](docs/adr/0029-shadow-mapping-and-fxaa.md) | shadow mapping, FXAA, and two bias defaults that were wrong in units |
+| [0030](docs/adr/0030-scene-authoring.md) | the context menu, primitives, and lights as scene nodes |
+| [0031](docs/adr/0031-deletion-and-undo.md) | why deletion tombstones, and the undo that falls out of it |
