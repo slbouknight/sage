@@ -253,15 +253,19 @@ std::filesystem::path next_screenshot_path() {
 // Overrunning it drops primitives with a message rather than aborting.
 constexpr VkDeviceSize k_geometry_capacity = 64ULL * 1024 * 1024;
 
-// Default dock layout, as fractions of the node being split. The left column
-// carries the read-out and the file picker, the right the scene tree, and what
-// is left in the middle is the 3D view.
-constexpr float k_left_column_fraction = 0.22F;
-// Of the remainder after the left column, so ~22% of the window.
-constexpr float k_right_column_fraction = 0.28F;
-// The stats read-out is a handful of lines, plus the tonemap and capture
-// controls; the picker below it wants the rest.
-constexpr float k_stats_fraction = 0.5F;
+// The one docked column, as a fraction of the window. It carries the scene
+// tree over the selection's properties; everything else is a menu, an overlay
+// or a dialog, and the rest of the window is the 3D view.
+constexpr float k_right_column_fraction = 0.22F;
+// Inset of the read-out from the 3D view's top-right corner, and how opaque
+// its backing is: enough to stay legible over a bright surface without hiding
+// what is behind it.
+constexpr float k_overlay_margin = 12.0F;
+constexpr float k_overlay_alpha = 0.55F;
+
+// Menu content has no panel to stretch into, so widgets that would otherwise
+// fill the available width need one given to them.
+constexpr float k_menu_item_width = 220.0F;
 // The right column is split between the scene tree and the properties of
 // whatever is selected in it.
 constexpr float k_hierarchy_fraction = 0.5F;
@@ -1652,6 +1656,9 @@ void Application::draw_dockspace() {
     // the layout gave it, so the rect would be a frame behind at best.
     if (ui_hidden_) {
         viewport_rect_ = VkRect2D{{0, 0}, swapchain_.extent()};
+        const ImGuiViewport* whole = ImGui::GetMainViewport();
+        viewport_logical_pos_ = glm::vec2(whole->Pos.x, whole->Pos.y);
+        viewport_logical_size_ = glm::vec2(whole->Size.x, whole->Size.y);
         return;
     }
 
@@ -1664,6 +1671,7 @@ void Application::draw_dockspace() {
         ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_NoDockingOverCentralNode);
 
     viewport_rect_ = central_node_rect(dockspace, swapchain_.extent());
+    update_viewport_logical_rect(dockspace);
 
     if (dock_layout_built_) {
         return;
@@ -1679,70 +1687,167 @@ void Application::draw_dockspace() {
     // and a node that has not been sized yet splits unpredictably.
     ImGui::DockBuilderSetNodeSize(dockspace, ImGui::GetMainViewport()->Size);
 
-    ImGuiID left = 0;
-    ImGuiID centre = 0;
-    ImGui::DockBuilderSplitNode(dockspace, ImGuiDir_Left, k_left_column_fraction, &left, &centre);
-
+    // One column, on the right. The left one is gone: the read-out it held is
+    // now an overlay inside the 3D view and the browser it held is a dialog off
+    // the File menu, so a whole column of screen was being spent on two things
+    // that needed no permanent home.
     ImGuiID right = 0;
-    ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, k_right_column_fraction, &right, &centre);
+    ImGuiID centre = 0;
+    ImGui::DockBuilderSplitNode(dockspace, ImGuiDir_Right, k_right_column_fraction, &right,
+                                &centre);
 
-    ImGuiID left_top = 0;
-    ImGuiID left_bottom = 0;
-    ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, k_stats_fraction, &left_top, &left_bottom);
-
-    ImGui::DockBuilderDockWindow("sage", left_top);
-    ImGui::DockBuilderDockWindow("Load glTF", left_bottom);
     ImGuiID right_top = 0;
     ImGuiID right_bottom = 0;
     ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, k_hierarchy_fraction, &right_top,
                                 &right_bottom);
 
     ImGui::DockBuilderDockWindow("Hierarchy", right_top);
-    // Lighting shares a node with Properties rather than taking a third row.
-    // The two are rarely wanted at once -- Properties describes a selection,
-    // Lighting describes the scene -- and tabs beat three panels each too short
-    // to show their contents. Either can be dragged out at runtime.
-    ImGui::DockBuilderDockWindow("Lighting", right_bottom);
     ImGui::DockBuilderDockWindow("Properties", right_bottom);
     ImGui::DockBuilderFinish(dockspace);
 
     // The split above changed the central node, so the rect taken before it is
     // stale for this frame.
     viewport_rect_ = central_node_rect(dockspace, swapchain_.extent());
+    update_viewport_logical_rect(dockspace);
 }
 
-void Application::draw_ui() {
-    const ImGuiIO& io = ImGui::GetIO();
+void Application::update_viewport_logical_rect(unsigned int dockspace) {
+    const ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace);
+    const ImGuiViewport* whole = ImGui::GetMainViewport();
+    if (central == nullptr || central->Size.x <= 0.0F || central->Size.y <= 0.0F) {
+        viewport_logical_pos_ = glm::vec2(whole->Pos.x, whole->Pos.y);
+        viewport_logical_size_ = glm::vec2(whole->Size.x, whole->Size.y);
+        return;
+    }
+    viewport_logical_pos_ = glm::vec2(central->Pos.x, central->Pos.y);
+    viewport_logical_size_ = glm::vec2(central->Size.x, central->Size.y);
+}
 
-    ImGui::Begin("sage");
-    ImGui::Text("%.1f fps (%.2f ms)", static_cast<double>(io.Framerate),
+void Application::draw_stats_overlay() {
+    // Pinned inside the 3D view rather than to the window, so it tracks the
+    // central node as panels resize and follows the whole screen once they are
+    // hidden.
+    const ImVec2 corner{viewport_logical_pos_.x + viewport_logical_size_.x - k_overlay_margin,
+                        viewport_logical_pos_.y + k_overlay_margin};
+    ImGui::SetNextWindowPos(corner, ImGuiCond_Always, ImVec2(1.0F, 0.0F));
+    ImGui::SetNextWindowBgAlpha(k_overlay_alpha);
+
+    // NoInputs is the one that matters: without it the overlay would swallow
+    // clicks meant for whatever is behind it, and picking would go dead in one
+    // corner of the viewport for no visible reason.
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoInputs;
+
+    ImGui::Begin("##stats", nullptr, flags);
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::Text("%.1f fps  %.2f ms", static_cast<double>(io.Framerate),
                 1000.0 / static_cast<double>(io.Framerate));
     ImGui::Separator();
-    ImGui::Text("Scene: %zu nodes", scene_graph_.size());
-    ImGui::Text("Geometry: %llu / %llu KiB",
+    ImGui::Text("%zu nodes", scene_graph_.size());
+    ImGui::Text("Geometry  %llu / %llu KiB",
                 static_cast<unsigned long long>(geometry_registry_.used() / 1024),
                 static_cast<unsigned long long>(geometry_registry_.capacity() / 1024));
-    ImGui::Text("Materials: %u / %u", material_registry_.count(), material_registry_.capacity());
-    ImGui::Text("Textures: %u", texture_registry_.count());
+    ImGui::Text("Materials %u / %u", material_registry_.count(), material_registry_.capacity());
+    ImGui::Text("Textures  %u", texture_registry_.count());
+    ImGui::Separator();
     const gpu::SceneNode* selected = scene_graph_.find(selected_);
-    ImGui::Text("Selected: %s", selected != nullptr ? selected->name.c_str() : "(none)");
+    ImGui::Text("Selected  %s", selected != nullptr ? selected->name.c_str() : "(none)");
     const glm::vec3 position = camera_.position();
-    ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
+    ImGui::Text("Camera    %.1f, %.1f, %.1f", static_cast<double>(position.x),
                 static_cast<double>(position.y), static_cast<double>(position.z));
-    draw_presentation_controls();
     ImGui::End();
+}
 
-    // Queued rather than serviced here: this is the middle of a frame, and the
-    // load blocks, waits for the device and destroys images the command buffer
-    // being recorded would still reference.
-    if (std::optional<FilePicker::Request> request = file_picker_.draw(); request.has_value()) {
-        pending_load_ = PendingLoad{request->path, request->replace, std::nullopt};
+void Application::draw_menu_bar() {
+    if (!ImGui::BeginMainMenuBar()) {
+        return;
+    }
+
+    if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Open glTF...")) {
+            file_dialog_open_ = true;
+            file_dialog_scene_actions_ = true;
+            // Absent, so the file lands where it says it does. Only the context
+            // menu places a load.
+            file_dialog_placement_.reset();
+        }
+        if (ImGui::MenuItem("Clear scene")) {
+            // Queued: clear_scene waits for the device to go idle and destroys
+            // images a recording command buffer still names.
+            pending_clear_ = true;
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Include UI in captures", nullptr, &screenshot_include_ui_);
+        if (ImGui::MenuItem("Screenshot", "F2", false, !pending_screenshot_.has_value())) {
+            request_screenshot();
+        }
+        // What the next capture will actually contain, which the toggle above
+        // decides and is otherwise only discoverable by taking one.
+        if (screenshot_include_ui_) {
+            ImGui::TextDisabled("%ux%u, whole window", swapchain_.extent().width,
+                                swapchain_.extent().height);
+        } else {
+            ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
+                                viewport_rect_.extent.height);
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Render")) {
+        draw_presentation_controls();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Lighting")) {
+        draw_lighting_menu();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("Hide panels", "F11", &ui_hidden_);
+        ImGui::EndMenu();
+    }
+
+    ImGui::EndMainMenuBar();
+}
+
+void Application::draw_file_dialog() {
+    if (file_dialog_open_ && !ImGui::IsPopupOpen("Load glTF")) {
+        ImGui::OpenPopup("Load glTF");
+    }
+
+    // Centred rather than at the cursor: the browser is a good deal larger than
+    // a menu, and anchoring it to a click near an edge would push it off-screen.
+    const ImVec2 centre = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+    if (!ImGui::BeginPopupModal("Load glTF", &file_dialog_open_,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    if (const std::optional<FilePicker::Request> request =
+            file_picker_.draw_contents(file_dialog_scene_actions_);
+        request.has_value()) {
+        // Queued rather than loaded here: this is the middle of a frame, and a
+        // load blocks, waits for the device and destroys images the command
+        // buffer being recorded would still reference.
+        pending_load_ = PendingLoad{request->path, request->replace, file_dialog_placement_};
+        file_dialog_open_ = false;
+        ImGui::CloseCurrentPopup();
     }
     if (file_picker_.clear_requested()) {
-        // Same reasoning: clear_scene waits for the device to be idle, which is
-        // not something to do with a frame half-recorded.
         pending_clear_ = true;
+        file_dialog_open_ = false;
+        ImGui::CloseCurrentPopup();
     }
+    if (ImGui::Button("Cancel")) {
+        file_dialog_open_ = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 void Application::draw_presentation_controls() {
@@ -1751,7 +1856,7 @@ void Application::draw_presentation_controls() {
     // Selectable at runtime rather than baked in, because the difference between
     // two curves is only legible on the same frame -- comparing across a rebuild
     // compares two memories of an image.
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(k_menu_item_width);
     ImGui::Combo("##tonemap", &tonemap_operator_, k_tonemap_names.data(),
                  static_cast<int>(k_tonemap_names.size()));
     if (tonemap_operator_ == static_cast<int>(TonemapOperator::none)) {
@@ -1771,24 +1876,6 @@ void Application::draw_presentation_controls() {
     ImGui::SliderFloat("Dark floor", &fxaa_edge_threshold_min_, 0.005F, 0.1F, "%.4f");
     ImGui::SliderFloat("Subpixel", &fxaa_subpixel_quality_, 0.0F, 1.0F, "%.2f");
     ImGui::EndDisabled();
-
-    ImGui::SeparatorText("Capture");
-    ImGui::Checkbox("Include UI", &screenshot_include_ui_);
-    // Disabled rather than hidden while one is in flight: the button vanishing
-    // for a frame reads as a misclick.
-    ImGui::BeginDisabled(pending_screenshot_.has_value());
-    if (ImGui::Button("Screenshot (F2)", ImVec2(-FLT_MIN, 0.0F))) {
-        request_screenshot();
-    }
-    ImGui::EndDisabled();
-    if (screenshot_include_ui_) {
-        ImGui::TextDisabled("%ux%u, whole window", swapchain_.extent().width,
-                            swapchain_.extent().height);
-    } else {
-        ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
-                            viewport_rect_.extent.height);
-    }
-    ImGui::TextDisabled("F11 hides the panels");
 }
 
 bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position) {
@@ -2072,9 +2159,12 @@ void Application::draw_context_menu() {
         ImGui::Separator();
         if (ImGui::MenuItem("Mesh (glTF)...")) {
             // Deferred: a popup cannot be opened from inside one that is about
-            // to close, so the menu only records the intent and the modal is
-            // opened below.
-            add_mesh_popup_open_ = true;
+            // to close, so this only records the intent. draw_file_dialog,
+            // which runs outside any menu, opens it.
+            file_dialog_open_ = true;
+            // No replace or clear from here, and the load lands at the click.
+            file_dialog_scene_actions_ = false;
+            file_dialog_placement_ = context_menu_point_;
         }
         if (ImGui::BeginMenu("Primitive")) {
             constexpr std::array<gpu::PrimitiveKind, 5> k_kinds{
@@ -2100,36 +2190,9 @@ void Application::draw_context_menu() {
         }
         ImGui::EndPopup();
     }
-
-    if (add_mesh_popup_open_ && !ImGui::IsPopupOpen("Add mesh")) {
-        ImGui::OpenPopup("Add mesh");
-    }
-
-    // Centred rather than at the cursor: the browser is a good deal larger than
-    // a menu, and anchoring it to a click near an edge would push it off-screen.
-    const ImVec2 centre = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
-    if (ImGui::BeginPopupModal("Add mesh", &add_mesh_popup_open_,
-                               ImGuiWindowFlags_AlwaysAutoResize)) {
-        // show_scene_actions false: reached this way the verb is "add", so the
-        // request comes back additive and the replace/clear controls are gone.
-        if (const std::optional<FilePicker::Request> request = file_picker_.draw_contents(false);
-            request.has_value()) {
-            pending_load_ = PendingLoad{request->path, false, context_menu_point_};
-            add_mesh_popup_open_ = false;
-            ImGui::CloseCurrentPopup();
-        }
-        if (ImGui::Button("Cancel")) {
-            add_mesh_popup_open_ = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
 }
 
-void Application::draw_lighting_panel() {
-    ImGui::Begin("Lighting");
-
+void Application::draw_lighting_menu() {
     // Lights live in the scene graph now, so this panel holds only what is
     // global. Editing one light happens in Properties, with that light
     // selected -- the same place every other node is edited.
@@ -2173,8 +2236,6 @@ void Application::draw_lighting_panel() {
     const int taps = ((2 * shadow_pcf_radius_) + 1) * ((2 * shadow_pcf_radius_) + 1);
     ImGui::TextDisabled("%ux%u map, %d taps", shadow_map_.resolution(), shadow_map_.resolution(),
                         taps);
-
-    ImGui::End();
 }
 
 void Application::draw_properties_panel() {
@@ -2577,11 +2638,15 @@ void Application::run() {
         draw_context_menu();
 
         if (!ui_hidden_) {
-            draw_ui();
+            draw_menu_bar();
+            draw_stats_overlay();
             draw_hierarchy_panel();
             draw_properties_panel();
-            draw_lighting_panel();
         }
+        // Outside the block, like the context menu: the dialog is reachable
+        // from both, and a menu that cannot open what it offers is worse than
+        // no menu.
+        draw_file_dialog();
 
         // Pass order is load-bearing. The shadow map is filled first, since the
         // scene samples it; the scene shades into the HDR target; the tonemap

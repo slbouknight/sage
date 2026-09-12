@@ -107,13 +107,6 @@ void FilePicker::refresh() {
     entries_.insert(entries_.end(), files.begin(), files.end());
 }
 
-std::optional<FilePicker::Request> FilePicker::draw() {
-    ImGui::Begin("Load glTF");
-    std::optional<Request> request = draw_contents(true);
-    ImGui::End();
-    return request;
-}
-
 std::optional<FilePicker::Request> FilePicker::draw_contents(bool show_scene_actions) {
     clear_requested_ = false;
     std::optional<Request> request;

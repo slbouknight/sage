@@ -81,16 +81,30 @@ private:
     // panels into it. Panels place themselves by name from then on, which is
     // what stops a new one landing on top of an existing one.
     void draw_dockspace();
-    void draw_ui();
-    // Tonemap controls and the capture button. Grouped because both are about
-    // how the frame is presented rather than what is in it.
+    // The application menu bar across the top. Holds everything global -- what
+    // to load, how the frame is presented, how the scene is lit -- so those
+    // stop occupying a docked panel each and the 3D view gets the width back.
+    // Keeps the logical-coordinate copy of the 3D view's rect in step with the
+    // pixel one. Takes the dockspace id as unsigned int rather than ImGuiID to
+    // keep imgui out of this header.
+    void update_viewport_logical_rect(unsigned int dockspace);
+    void draw_menu_bar();
+    // The read-out, floating over the top-right of the 3D view rather than
+    // docked. It is a heads-up display: always wanted, never interacted with,
+    // and a panel's worth of screen is too much to pay for it.
+    void draw_stats_overlay();
+    // The modal glTF browser. One dialog, two callers: the File menu opens it
+    // over the whole scene, the context menu opens it to add at a point.
+    void draw_file_dialog();
+    // Tonemap, anti-aliasing and capture. Drawn as menu content rather than a
+    // panel, so it lives wherever it is opened from.
     void draw_presentation_controls();
     // Lights and shadow tuning. A panel rather than constants because the
     // values that suit one model suit no other -- a point light placed for the
     // lantern is inside the board of a chess set -- and because shadow bias is
     // found by dragging a slider until acne stops without the contact shadow
     // detaching, which is not a thing to do one rebuild at a time.
-    void draw_lighting_panel();
+    void draw_lighting_menu();
     void draw_hierarchy_panel();
     void draw_properties_panel();
     // Draws the manipulator and writes any drag back into the scene graph.
@@ -359,9 +373,22 @@ private:
     // the menu and any modal it spawns are up, so what gets added lands where
     // the user clicked rather than where the camera happens to be by then.
     glm::vec3 context_menu_point_{0.0F};
-    // The context menu's browser. Opened from the menu, and outlives it --
-    // a popup cannot be nested inside one that has already closed.
-    bool add_mesh_popup_open_ = false;
+    // The glTF browser's state. Opened from either menu, and outliving the one
+    // that opened it -- a popup cannot be nested inside one that is closing.
+    bool file_dialog_open_ = false;
+    // Whether the dialog offers Replace and Clear. The File menu is operating
+    // on the scene as a whole and wants them; the context menu's verb is
+    // "add", where replacing the scene is not an answer to anything.
+    bool file_dialog_scene_actions_ = false;
+    // Where the load lands, when it was asked for at a point.
+    std::optional<glm::vec3> file_dialog_placement_;
+
+    // The 3D view again, in ImGui's logical coordinates rather than framebuffer
+    // pixels. The overlay is placed with it, and ImGui positions windows in
+    // logical units -- converting viewport_rect_ back every frame would be
+    // undoing a conversion that was made three lines earlier.
+    glm::vec2 viewport_logical_pos_{0.0F};
+    glm::vec2 viewport_logical_size_{0.0F};
 
     core::Camera camera_;
     gpu::Window window_;
