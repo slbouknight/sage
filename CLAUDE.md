@@ -88,10 +88,15 @@ documented reasoning matter as much as features. CUDA was cut after M5; see
 - **M8** — Presentation and capture: HDR offscreen target
   (`R16G16B16A16_SFLOAT`), a full-screen tonemap resolve, and screenshot-to-PNG
   reusing `stb_image_write` from the stb port. Speculars have clamped against the
-  sRGB swapchain since M5; this is where that stops. Note the swapchain is not
+  sRGB swapchain since M5; this is where that stops. The swapchain was not
   created with `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`, which a screenshot copy needs —
-  found while capturing frames to verify M7. ← current
-- **M9** — Shadow mapping, and **v1.0**: directional cascade, depth-only passes
+  found while capturing frames to verify M7, and now both added and checked
+  against the surface's `supportedUsageFlags`. The tonemap curve is selectable
+  at runtime (none / Reinhard / ACES) so two can be compared on one frame, with
+  `none` kept as the pre-M8 control rather than as a placeholder. Captures are
+  the rendered image only: no panels, no gizmo, no outline. Done — see
+  [ADR 0028](docs/adr/0028-hdr-target-tonemap-and-capture.md).
+- **M9** — Shadow mapping, and **v1.0** ← current: directional cascade, depth-only passes
   into an array texture, PCF filtering. Unshadowed PBR reads as flat no matter
   how correct the BRDF is, so this is the last thing standing between the editor
   and a screenshot worth showing. Then polish, document, and call it done.

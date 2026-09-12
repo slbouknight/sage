@@ -86,6 +86,15 @@ void Swapchain::create(VkExtent2D extent) {
         image_count = caps.maxImageCount;
     }
 
+    // Only COLOR_ATTACHMENT is guaranteed; everything else is the surface's to
+    // grant. Checked rather than assumed because a swapchain created with an
+    // unsupported usage is invalid usage, not a graceful failure -- and because
+    // TRANSFER_SRC, which the screenshot copy needs, was missing here until M8.
+    SAGE_VERIFY((caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0U,
+                "Surface does not support TRANSFER_SRC on swapchain images");
+    SAGE_VERIFY((caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0U,
+                "Surface does not support TRANSFER_DST on swapchain images");
+
     VkSwapchainCreateInfoKHR create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     create_info.surface = surface_;
@@ -95,8 +104,11 @@ void Swapchain::create(VkExtent2D extent) {
     create_info.imageExtent = extent_;
     create_info.imageArrayLayers = 1;
     // TRANSFER_DST for M1's vkCmdClearColorImage; COLOR_ATTACHMENT for the
-    // dynamic-rendering path M2 introduces against the same swapchain.
-    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // dynamic-rendering path M2 introduces against the same swapchain;
+    // TRANSFER_SRC for M8's screenshot, which copies the tonemapped result back
+    // out of the image it was just presented from.
+    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     create_info.preTransform = caps.currentTransform;
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     create_info.presentMode = present_mode_;

@@ -24,6 +24,12 @@ public:
     // which is why this is SAMPLED_IMAGE and not COMBINED_IMAGE_SAMPLER --
     // integer formats support no filtering, so there is nothing for one to do.
     static constexpr std::uint32_t k_object_id_binding = 2;
+    // The HDR colour target, read by the tonemap pass. Its format is float, so
+    // unlike the id image above it *could* share the array at binding 1 -- but
+    // that array is TextureRegistry's to allocate out of, and a render target is
+    // not scene content the registry owns and destroys on reset(). Its own
+    // binding keeps the two lifetimes from touching.
+    static constexpr std::uint32_t k_hdr_color_binding = 3;
 
     // Array capacities. Far below what target hardware (RTX 5070) allows
     // (~1M update-after-bind descriptors); raise when something needs it
@@ -54,6 +60,10 @@ public:
     // recreated, which is every swapchain resize. Expects the image to be in
     // SHADER_READ_ONLY_OPTIMAL by the time a shader reads it.
     void write_object_id_image(VkImageView view) const;
+
+    // Registers the HDR colour target. Rewritten on every swapchain resize, for
+    // the same reason as the id attachment above.
+    void write_hdr_color_image(VkImageView view) const;
 
 private:
     const Device& device_;
