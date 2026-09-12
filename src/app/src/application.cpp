@@ -29,6 +29,7 @@
 #include <ctime>
 #include <filesystem>
 #include <memory>
+#include <numbers>
 #include <span>
 #include <string>
 #include <vector>
@@ -289,6 +290,50 @@ constexpr float k_plane_scene_fraction = 3.0F;
 // big again. A third keeps both orders sensible.
 constexpr float k_solid_scene_fraction = 0.3F;
 
+// A light icon marks a position; it is not an object in the scene, so it is a
+// good deal smaller than a primitive added deliberately. Small enough to read
+// as a marker rather than as geometry, but still a comfortable click target at
+// the distances the camera frames a scene from.
+constexpr float k_light_icon_fraction = 0.020F;
+// A point light's reach, as a fraction of the scene. Beyond this the windowed
+// falloff takes it to zero.
+constexpr float k_point_range_fraction = 2.0F;
+// A directional light's intensity is irradiance and does not fall off. A point
+// light's divides by distance squared, so it needs far more to read at all.
+constexpr float k_default_key_intensity = 8.0F;
+constexpr float k_default_point_intensity = 60.0F;
+
+// Mostly along -X, with far less -Z than the obvious diagonal.
+//
+// The obvious diagonal is what this was, and it is wrong for a default: the
+// camera starts at +X, +Y, +Z and framing puts it back there, so a light
+// shining along -X, -Y, -Z travels straight down the view axis. Its shadow
+// falls directly behind the object, where the object itself hides it -- which
+// looks exactly like shadows being broken. Casting across the view instead
+// puts the shadow beside the subject, where it can be seen.
+const glm::vec3 k_default_key_direction{-0.80F, -0.50F, -0.33F};
+
+constexpr float k_pi_f = std::numbers::pi_v<float>;
+
+// A rotation whose -Y axis lands on `direction`, built as a basis rather than
+// through glm's quaternion helpers: those live in GLM_GTX, which needs
+// GLM_ENABLE_EXPERIMENTAL defined across every translation unit that includes
+// glm. That is a project-wide decision to take for one rotation, and this is
+// four lines.
+glm::mat4 orientation_pointing_down_along(const glm::vec3& direction) {
+    const glm::vec3 down = glm::normalize(direction);
+    // The node's +Y is the opposite of where the light shines.
+    const glm::vec3 up = -down;
+    // Any hint not parallel to up; world X fails only when the light points
+    // along X, which world Z then covers.
+    const glm::vec3 hint =
+        std::abs(up.x) > 0.99F ? glm::vec3(0.0F, 0.0F, 1.0F) : glm::vec3(1.0F, 0.0F, 0.0F);
+    const glm::vec3 right = glm::normalize(glm::cross(hint, up));
+    const glm::vec3 forward = glm::cross(up, right);
+    return glm::mat4(glm::vec4(right, 0.0F), glm::vec4(up, 0.0F), glm::vec4(forward, 0.0F),
+                     glm::vec4(0.0F, 0.0F, 0.0F, 1.0F));
+}
+
 // Where a context-menu placement lands when the cursor ray never meets the
 // ground plane -- looking up, or along it. Far enough to be in front of the
 // camera rather than inside it, near enough to stay in frame.
@@ -443,13 +488,17 @@ Application::Application(const std::filesystem::path& model_path)
     bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
     gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
     tonemap_operator_ = static_cast<int>(TonemapOperator::aces);
-
     if (!gpu::is_capturable_format(swapchain_.format())) {
         SAGE_LOG_WARN("Swapchain format {} cannot be captured; screenshots are disabled",
                       static_cast<int>(swapchain_.format()));
     }
 
     if (model_path.empty()) {
+        // Nothing will call clear_scene, so the default light is this path's to
+        // create. With a model named, load_model clears first and clear_scene
+        // puts one back -- doing it here as well would build one and throw it
+        // away a line later.
+        add_default_light();
         SAGE_LOG_INFO("No model given; use the Load glTF panel to pick one");
         return;
     }
@@ -513,6 +562,10 @@ void Application::clear_scene() {
     // that were opened. Deferred because the storage belongs to the Hierarchy
     // window, which is only current inside its own Begin/End.
     hierarchy_state_stale_ = true;
+
+    // A light is a node, so clearing the graph removed it. Without putting one
+    // back, the next model would load into a scene with nothing lighting it.
+    add_default_light();
 }
 
 void Application::service_pending_load() {
@@ -551,6 +604,50 @@ Application::CameraMatrices Application::camera_matrices() const {
     return matrices;
 }
 
+std::uint32_t Application::collect_lights(std::array<gpu::Light, gpu::k_max_lights>& lights) const {
+    std::uint32_t count = 0;
+
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.has_light) {
+            continue;
+        }
+        if (count >= gpu::k_max_lights) {
+            // Dropped rather than grown: the frame buffer's light array is a
+            // fixed size the shader also declares, so the limit is a layout
+            // fact rather than a policy this function can bend.
+            break;
+        }
+
+        gpu::Light& light = lights[count];
+        light.type = node.light.type;
+        light.color = node.light.color;
+        light.intensity = node.light.intensity;
+        light.range = node.light.range;
+        // Both derived from the transform, which is what makes the gizmo work
+        // on a light at all.
+        light.position = glm::vec3(node.world_transform[3]);
+        // -Y is the canonical direction, so an unrotated light points down and
+        // the rotate gizmo tilts it from there. Normalised because a scaled
+        // node would otherwise hand the shader a non-unit direction, which the
+        // BRDF has no way to notice and every dot product would be wrong by.
+        const glm::vec3 down = glm::mat3(node.world_transform) * glm::vec3(0.0F, -1.0F, 0.0F);
+        const float length = glm::length(down);
+        light.direction = length > 1e-6F ? down / length : glm::vec3(0.0F, -1.0F, 0.0F);
+        ++count;
+    }
+    return count;
+}
+
+gpu::NodeHandle Application::first_directional_light() const {
+    for (std::size_t i = 0; i < scene_graph_.nodes().size(); ++i) {
+        const gpu::SceneNode& node = scene_graph_.nodes()[i];
+        if (node.has_light && node.light.type == gpu::LightType::directional) {
+            return scene_graph_.handle_at(i);
+        }
+    }
+    return gpu::NodeHandle{};
+}
+
 Application::Bounds Application::scene_bounds() const {
     Bounds bounds{glm::vec3(std::numeric_limits<float>::max()),
                   glm::vec3(std::numeric_limits<float>::lowest())};
@@ -577,7 +674,8 @@ Application::Bounds Application::scene_bounds() const {
     return bounds;
 }
 
-Application::LightFit Application::fit_light(const Bounds& bounds) const {
+Application::LightFit Application::fit_light(const Bounds& bounds,
+                                             const glm::vec3& light_direction) const {
     if (bounds.empty()) {
         return {};
     }
@@ -592,7 +690,7 @@ Application::LightFit Application::fit_light(const Bounds& bounds) const {
     // projection and divide by zero.
     const float extent = std::max(radius, 1e-3F);
 
-    const glm::vec3 direction = glm::normalize(key_light_.direction);
+    const glm::vec3 direction = glm::normalize(light_direction);
 
     // Any vector not parallel to the light will do as an up hint; world up
     // fails exactly when the light points straight down, which is a common
@@ -628,37 +726,32 @@ void Application::write_frame_data(std::uint32_t frame_slot) const {
     frame_data.view_projection = matrices.projection * matrices.view;
     frame_data.camera_position = camera_.position();
 
-    // The shader reads data rather than constants, so moving a light is a value
-    // change and not a recompile -- which is what makes a lighting panel
-    // possible at all.
-    frame_data.lights[0].type = gpu::LightType::directional;
-    frame_data.lights[0].direction = glm::normalize(key_light_.direction);
-    frame_data.lights[0].color = key_light_.color;
-    frame_data.lights[0].intensity = key_light_.intensity;
-    frame_data.light_count = 1;
-
-    if (fill_light_.enabled) {
-        frame_data.lights[1].type = gpu::LightType::point;
-        frame_data.lights[1].position = fill_light_.position;
-        frame_data.lights[1].color = fill_light_.color;
-        frame_data.lights[1].intensity = fill_light_.intensity;
-        frame_data.lights[1].range = fill_light_.range;
-        frame_data.light_count = 2;
-    }
-
+    // Gathered from the graph rather than from members. The shader has always
+    // read lights as data; what changed is that the data now comes from nodes,
+    // so a light can be placed, parented and dragged like anything else.
+    frame_data.light_count = collect_lights(frame_data.lights);
     frame_data.ambient_intensity = ambient_intensity_;
 
     // Refitted every frame from live world transforms. A gizmo drag moves
     // geometry, which moves the bounds, which moves the frustum -- so a shadow
     // keeps up with the thing casting it.
-    const LightFit fit = fit_light(scene_bounds());
+    // The shadow map is fitted to one directional light -- the first in the
+    // graph, matching the shader, which spends it on the first directional
+    // light it evaluates. With none in the scene there is nothing to fit and
+    // nothing to cast, so the pass still runs but the lookup is skipped.
+    const gpu::SceneNode* key = scene_graph_.find(first_directional_light());
+    const glm::vec3 key_direction =
+        key != nullptr ? glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F))
+                       : glm::vec3(0.0F, -1.0F, 0.0F);
+
+    const LightFit fit = fit_light(scene_bounds(), key_direction);
     frame_data.light_view_projection = fit.view_projection;
     // Texels converted to world units here, so the shader stays in world space
     // and the slider keeps meaning the same thing at any scene scale.
     frame_data.shadow_normal_bias = shadow_normal_bias_texels_ * fit.world_texel_size;
     frame_data.shadow_pcf_radius = shadow_pcf_radius_;
     frame_data.shadow_texel_size = 1.0F / static_cast<float>(shadow_map_.resolution());
-    frame_data.shadow_enabled = shadows_enabled_ ? 1U : 0U;
+    frame_data.shadow_enabled = (shadows_enabled_ && key != nullptr) ? 1U : 0U;
 
     frame_buffer_.write(&frame_data, sizeof(frame_data),
                         VkDeviceSize{frame_slot} * sizeof(FrameData));
@@ -737,7 +830,9 @@ void Application::record_shadow(VkCommandBuffer command_buffer, std::uint32_t fr
         frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
 
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.has_mesh) {
+        // editor_only skipped as well as mesh-less: a marker standing for a
+        // light must not cast a shadow of its own.
+        if (!node.has_mesh || node.editor_only) {
             continue;
         }
         // The same struct the main pass pushes. This pipeline's shader declares
@@ -903,10 +998,21 @@ void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t fra
     const VkDeviceAddress frame_address =
         frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
 
+    // Light icons are drawn with the scene so they pick and outline like any
+    // other mesh, but they are the tool rather than the render: hidden with the
+    // panels, and hidden for the frame a no-UI capture is taken on. That frame
+    // is also the one on screen, so pressing F2 without F11 blinks them for a
+    // single frame -- the alternative is rendering the scene twice.
+    const bool show_editor_meshes =
+        !ui_hidden_ && !(pending_screenshot_.has_value() && !screenshot_include_ui_);
+
     for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
         const gpu::SceneNode& node = scene_graph_.nodes()[index];
         if (!node.has_mesh) {
             // Pure transform nodes: glTF hierarchy nodes, and the per-load root.
+            continue;
+        }
+        if (node.editor_only && !show_editor_meshes) {
             continue;
         }
 
@@ -1725,6 +1831,112 @@ bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& positi
     return true;
 }
 
+bool Application::add_light(gpu::LightType type, const glm::vec3& position) {
+    const bool directional = type == gpu::LightType::directional;
+
+    gpu::SceneLight authored;
+    authored.type = type;
+    authored.color = glm::vec3(1.0F, 0.96F, 0.9F);
+    // A directional light's intensity is irradiance and does not fall off; a
+    // point light's is divided by distance squared, so the same number would
+    // be invisible a couple of units away.
+    authored.intensity = directional ? k_default_key_intensity : k_default_point_intensity;
+
+    const Bounds bounds = scene_bounds();
+    const float radius = bounds.empty() ? 1.0F : glm::length(bounds.max - bounds.min) * 0.5F;
+    const float reference = radius > 1e-4F ? radius : 1.0F;
+    authored.range = reference * k_point_range_fraction;
+
+    // Rotated so -Y, the canonical direction, points the way the default key
+    // light did. A directional light has no position, but the node still needs
+    // one to put its icon somewhere and to give the gizmo something to hold.
+    glm::mat4 transform = glm::translate(glm::mat4(1.0F), position);
+    if (directional) {
+        transform *= orientation_pointing_down_along(k_default_key_direction);
+    }
+
+    const gpu::NodeHandle node = scene_graph_.add_node(
+        gpu::NodeHandle{}, transform, directional ? "Directional Light" : "Point Light");
+    scene_graph_.set_light(node, authored);
+
+    // A light has no geometry, so without this it could not be picked in the
+    // viewport, could not be outlined, and would be reachable only from the
+    // hierarchy -- which is exactly when you least want to leave the 3D view.
+    const gpu::PrimitiveMesh icon =
+        gpu::make_primitive(directional ? gpu::PrimitiveKind::cone : gpu::PrimitiveKind::sphere);
+    glm::vec3 low{std::numeric_limits<float>::max()};
+    glm::vec3 high{std::numeric_limits<float>::lowest()};
+    for (const gpu::Vertex& vertex : icon.vertices) {
+        low = glm::min(low, vertex.position);
+        high = glm::max(high, vertex.position);
+    }
+
+    const gpu::GeometryRegistry::MeshView view = geometry_registry_.add_mesh(
+        icon.vertices.data(), sizeof(gpu::Vertex) * icon.vertices.size(), icon.indices.data(),
+        static_cast<std::uint32_t>(icon.indices.size()), low, high);
+    if (!view.valid()) {
+        return false;
+    }
+
+    // Emissive rather than lit: an icon standing for a light source should
+    // read as one, and a shaded grey blob sitting in mid-air reads as an
+    // object that someone forgot to delete.
+    gpu::Material material;
+    material.base_color_factor = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F);
+    material.emissive_factor = authored.color;
+    material.metallic = 0.0F;
+    material.roughness = 1.0F;
+    material.base_color_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.normal_texture = gpu::TextureRegistry::k_flat_normal_slot;
+    material.metallic_roughness_texture = gpu::TextureRegistry::k_fallback_slot;
+    material.emissive_texture = gpu::TextureRegistry::k_fallback_slot;
+    const std::uint32_t material_index = material_registry_.append({material});
+
+    // A child, so moving the light moves its icon and the icon never needs
+    // updating separately. Scaled small: it marks a position, it is not a
+    // thing in the scene.
+    const float icon_scale = reference * k_light_icon_fraction;
+    glm::mat4 icon_transform = glm::scale(glm::mat4(1.0F), glm::vec3(icon_scale));
+    if (directional) {
+        // Cone tip towards -Y, so it reads as an arrow pointing the way the
+        // light travels. The generated cone points +Y.
+        icon_transform =
+            glm::rotate(glm::mat4(1.0F), k_pi_f, glm::vec3(1.0F, 0.0F, 0.0F)) * icon_transform;
+    }
+
+    const gpu::NodeHandle icon_node = scene_graph_.add_node(node, icon_transform, "Icon");
+    scene_graph_.set_mesh(icon_node, view, material_index);
+    scene_graph_.set_editor_only(icon_node, true);
+    scene_graph_.update_transforms();
+    select(node);
+
+    SAGE_LOG_INFO("Added {} at ({:.3f}, {:.3f}, {:.3f})",
+                  directional ? "directional light" : "point light", position.x, position.y,
+                  position.z);
+    return true;
+}
+
+void Application::add_default_light() {
+    // Placed above whatever is in the scene rather than at the origin, so the
+    // icon does not sit inside the model it is lighting.
+    const Bounds bounds = scene_bounds();
+    const float height =
+        bounds.empty() ? 2.0F : bounds.max.y + glm::length(bounds.max - bounds.min);
+    static_cast<void>(add_light(gpu::LightType::directional, glm::vec3(0.0F, height, 0.0F)));
+}
+
+void Application::service_pending_light() {
+    if (!pending_light_.has_value()) {
+        return;
+    }
+    const PendingLight pending = *pending_light_;
+    pending_light_.reset();
+
+    if (!add_light(pending.type, pending.position)) {
+        SAGE_LOG_ERROR("Could not add light: out of geometry capacity for its icon");
+    }
+}
+
 void Application::service_pending_primitive() {
     if (!pending_primitive_.has_value()) {
         return;
@@ -1810,6 +2022,15 @@ void Application::draw_context_menu() {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Light")) {
+            if (ImGui::MenuItem("Directional")) {
+                pending_light_ = PendingLight{gpu::LightType::directional, context_menu_point_};
+            }
+            if (ImGui::MenuItem("Point")) {
+                pending_light_ = PendingLight{gpu::LightType::point, context_menu_point_};
+            }
+            ImGui::EndMenu();
+        }
         ImGui::EndPopup();
     }
 
@@ -1842,24 +2063,27 @@ void Application::draw_context_menu() {
 void Application::draw_lighting_panel() {
     ImGui::Begin("Lighting");
 
-    ImGui::SeparatorText("Key light (directional)");
-    // A direction rather than two angles: matching a reference image is easier
-    // by nudging a vector than by converting to azimuth and elevation first.
-    // Normalised at upload, so the magnitude here does not matter.
-    ImGui::DragFloat3("Direction", glm::value_ptr(key_light_.direction), 0.01F, -1.0F, 1.0F);
-    ImGui::ColorEdit3("Colour##key", glm::value_ptr(key_light_.color));
-    ImGui::DragFloat("Intensity##key", &key_light_.intensity, 0.05F, 0.0F, 50.0F);
-
-    ImGui::SeparatorText("Fill light (point)");
-    ImGui::Checkbox("Enabled", &fill_light_.enabled);
-    ImGui::BeginDisabled(!fill_light_.enabled);
-    ImGui::DragFloat3("Position", glm::value_ptr(fill_light_.position), 0.01F);
-    ImGui::ColorEdit3("Colour##fill", glm::value_ptr(fill_light_.color));
-    ImGui::DragFloat("Intensity##fill", &fill_light_.intensity, 0.05F, 0.0F, 200.0F);
-    // Beyond this distance the light contributes nothing. Also what stops the
-    // falloff from being a pure inverse square that never quite reaches zero.
-    ImGui::DragFloat("Range", &fill_light_.range, 0.05F, 0.01F, 200.0F);
-    ImGui::EndDisabled();
+    // Lights live in the scene graph now, so this panel holds only what is
+    // global. Editing one light happens in Properties, with that light
+    // selected -- the same place every other node is edited.
+    std::uint32_t directional = 0;
+    std::uint32_t point = 0;
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.has_light) {
+            continue;
+        }
+        (node.light.type == gpu::LightType::directional ? directional : point) += 1;
+    }
+    ImGui::SeparatorText("Scene lights");
+    ImGui::Text("%u directional, %u point", directional, point);
+    if (directional + point > gpu::k_max_lights) {
+        ImGui::TextDisabled("Over the %u the shader reads; the rest are ignored.",
+                            gpu::k_max_lights);
+    }
+    if (directional == 0) {
+        ImGui::TextDisabled("No directional light: nothing casts a shadow.");
+    }
+    ImGui::TextDisabled("Right-click the viewport to add one.");
 
     ImGui::SeparatorText("Ambient");
     ImGui::DragFloat("Intensity##ambient", &ambient_intensity_, 0.002F, 0.0F, 1.0F, "%.3f");
@@ -1928,6 +2152,29 @@ void Application::draw_properties_panel() {
     }
 
     ImGui::Separator();
+    if (node->has_light) {
+        ImGui::SeparatorText("Light");
+        gpu::SceneLight light = node->light;
+
+        int type = static_cast<int>(light.type);
+        bool light_edited = ImGui::Combo("Type", &type, "Directional\0Point\0");
+        light.type = static_cast<gpu::LightType>(type);
+
+        light_edited |= ImGui::ColorEdit3("Colour", glm::value_ptr(light.color));
+        light_edited |= ImGui::DragFloat("Intensity", &light.intensity, 0.1F, 0.0F, 500.0F);
+        if (light.type == gpu::LightType::point) {
+            light_edited |= ImGui::DragFloat("Range", &light.range, 0.05F, 0.01F, 500.0F);
+        } else {
+            // A directional light has no position, only a bearing, and the
+            // rotate gizmo is how that is set.
+            ImGui::TextDisabled("Rotate to aim; position is only the icon's.");
+        }
+        if (light_edited) {
+            scene_graph_.set_light(selected_, light);
+        }
+        ImGui::Separator();
+    }
+
     ImGui::Text("Mesh: %s", node->has_mesh ? "yes" : "no");
     if (node->has_mesh) {
         ImGui::Text("Indices: %u", node->mesh.index_count);
@@ -2162,6 +2409,7 @@ void Application::run() {
         // disturb nothing. Costs the picker one frame of latency.
         service_pending_load();
         service_pending_primitive();
+        service_pending_light();
         service_selection();
 
         const auto now = std::chrono::steady_clock::now();

@@ -91,6 +91,19 @@ void SceneGraph::set_mesh(NodeHandle node, const GeometryRegistry::MeshView& mes
     target->has_mesh = true;
 }
 
+void SceneGraph::set_light(NodeHandle node, const SceneLight& light) {
+    SceneNode* target = mutable_find(node);
+    SAGE_VERIFY(target != nullptr, "SceneGraph: set_light on a stale handle");
+    target->light = light;
+    target->has_light = true;
+}
+
+void SceneGraph::set_editor_only(NodeHandle node, bool editor_only) {
+    SceneNode* target = mutable_find(node);
+    SAGE_VERIFY(target != nullptr, "SceneGraph: set_editor_only on a stale handle");
+    target->editor_only = editor_only;
+}
+
 void SceneGraph::set_local_transform(NodeHandle node, const glm::mat4& local_transform) {
     SceneNode* target = mutable_find(node);
     SAGE_VERIFY(target != nullptr, "SceneGraph: set_local_transform on a stale handle");

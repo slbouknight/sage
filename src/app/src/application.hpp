@@ -177,6 +177,14 @@ private:
     // with a command buffer already recording.
     std::optional<PendingPrimitive> pending_primitive_;
     void service_pending_primitive();
+
+    struct PendingLight {
+        gpu::LightType type = gpu::LightType::directional;
+        glm::vec3 position{0.0F};
+    };
+    // Queued for the same reason: adding one uploads its icon mesh.
+    std::optional<PendingLight> pending_light_;
+    void service_pending_light();
     // Builds a primitive, sizes it against the scene, and drops it in. Returns
     // false when the geometry did not fit.
     bool add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position);
@@ -217,7 +225,23 @@ private:
     // light has no position, so the frustum is placed by the scene rather than
     // by the light: it is centred on the bounds and pulled back far enough
     // along the light direction to enclose them.
-    [[nodiscard]] LightFit fit_light(const Bounds& bounds) const;
+    [[nodiscard]] LightFit fit_light(const Bounds& bounds, const glm::vec3& light_direction) const;
+
+    // Fills the frame's light array from the graph, returning how many were
+    // written. Lights past the shader's fixed capacity are dropped.
+    [[nodiscard]] std::uint32_t collect_lights(
+        std::array<gpu::Light, gpu::k_max_lights>& lights) const;
+    // The light the shadow map is fitted to: the first directional one in the
+    // graph, which is also the one the shader shadows. Invalid when there is
+    // none, in which case nothing casts.
+    [[nodiscard]] gpu::NodeHandle first_directional_light() const;
+    // Creates the default key light. Called at startup and after a clear, since
+    // a light is a node and clearing the graph removes it -- without this, an
+    // empty scene would load the next model into the dark.
+    void add_default_light();
+    // Adds a light node, with the small mesh that makes it visible and
+    // clickable, at `position`.
+    bool add_light(gpu::LightType type, const glm::vec3& position);
 
     bool dock_layout_built_ = false;
     // Set when node indices are about to be reused, so the hierarchy panel
@@ -255,35 +279,6 @@ private:
     int gizmo_operation_ = 0;
     bool gizmo_local_space_ = false;
 
-    // Scene lighting, editable rather than hardcoded. Two lights: a key
-    // directional one, which is the only one that casts a shadow, and an
-    // optional point light for fill.
-    struct DirectionalLightState {
-        // Pointing direction, i.e. the way the light travels. Normalised before
-        // upload; the UI edits it as a raw vector because a pair of angles is
-        // harder to reason about when matching a reference image.
-        // Angled rather than near-vertical. The old default was mostly
-        // straight down, which puts every shadow directly underneath the thing
-        // casting it -- correct, and invisible from any normal camera.
-        glm::vec3 direction{-0.6F, -0.55F, -0.6F};
-        glm::vec3 color{1.0F, 0.96F, 0.9F};
-        // 2.0 was the M5 value and leaves a typical glTF sitting around a
-        // quarter of the display range, where a shadow has no room to be
-        // darker than its surroundings. Measured on the chess set: at 2 the
-        // subject averages 45/255, at 25 it averages 124 with shadows a clear
-        // 98 levels below. This is a middle that suits most files; the slider
-        // is there for the ones it does not.
-        float intensity = 8.0F;
-    };
-    struct PointLightState {
-        glm::vec3 position{0.0F, 1.0F, 0.0F};
-        glm::vec3 color{1.0F, 0.7F, 0.35F};
-        float intensity = 4.0F;
-        float range = 4.0F;
-        bool enabled = false;
-    };
-    DirectionalLightState key_light_;
-    PointLightState fill_light_;
     // Replaces the 0.03 that was compiled into the shader. Without ambient
     // occlusion or IBL this is the only thing keeping unlit faces off pure
     // black, so it is the difference between "dramatic" and "half the model is
