@@ -35,10 +35,9 @@ GeometryRegistry::GeometryRegistry(const Allocator& allocator, const Device& dev
     SAGE_LOG_INFO("Geometry registry: {} KiB device-local", capacity / 1024);
 }
 
-GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
-                                                      VkDeviceSize vertex_bytes,
-                                                      const std::uint32_t* indices,
-                                                      std::uint32_t index_count) {
+GeometryRegistry::MeshView GeometryRegistry::add_mesh(
+    const void* vertices, VkDeviceSize vertex_bytes, const std::uint32_t* indices,
+    std::uint32_t index_count, const glm::vec3& bounds_min, const glm::vec3& bounds_max) {
     SAGE_VERIFY(vertices != nullptr && indices != nullptr, "GeometryRegistry: null mesh data");
     SAGE_VERIFY(vertex_bytes > 0 && index_count > 0, "GeometryRegistry: empty mesh");
 
@@ -70,6 +69,8 @@ GeometryRegistry::MeshView GeometryRegistry::add_mesh(const void* vertices,
     view.vertex_address = base_address_ + vertex_offset;
     view.index_offset = index_offset;
     view.index_count = index_count;
+    view.bounds_min = bounds_min;
+    view.bounds_max = bounds_max;
     return view;
 }
 

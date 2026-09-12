@@ -30,6 +30,17 @@ public:
     // not scene content the registry owns and destroys on reset(). Its own
     // binding keeps the two lifetimes from touching.
     static constexpr std::uint32_t k_hdr_color_binding = 3;
+    // The directional light's shadow map. COMBINED_IMAGE_SAMPLER rather than
+    // SAMPLED_IMAGE like the two above, because its sampler is not
+    // interchangeable with theirs: it has compareEnable set, which turns a
+    // sample into a depth test whose result is then filtered. Pairing the view
+    // with that specific sampler is the point.
+    static constexpr std::uint32_t k_shadow_map_binding = 4;
+    // The tonemapped image, read by the anti-aliasing pass. Like the shadow
+    // map, COMBINED_IMAGE_SAMPLER rather than SAMPLED_IMAGE: FXAA samples
+    // between texel centres and depends on the bilinear blend, so the view has
+    // to travel with a LINEAR sampler rather than being read by integer texel.
+    static constexpr std::uint32_t k_ldr_color_binding = 5;
 
     // Array capacities. Far below what target hardware (RTX 5070) allows
     // (~1M update-after-bind descriptors); raise when something needs it
@@ -64,6 +75,15 @@ public:
     // Registers the HDR colour target. Rewritten on every swapchain resize, for
     // the same reason as the id attachment above.
     void write_hdr_color_image(VkImageView view) const;
+
+    // Registers the shadow map with its comparison sampler. Written once: the
+    // shadow map's size is a quality setting, not a function of the window, so
+    // a resize leaves it alone.
+    void write_shadow_map(VkImageView view, VkSampler sampler) const;
+
+    // Registers the tonemapped image. Rewritten on every swapchain resize --
+    // the view changes with the window, though the sampler beside it does not.
+    void write_ldr_color_image(VkImageView view, VkSampler sampler) const;
 
 private:
     const Device& device_;

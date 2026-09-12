@@ -96,16 +96,26 @@ documented reasoning matter as much as features. CUDA was cut after M5; see
   `none` kept as the pre-M8 control rather than as a placeholder. Captures are
   the rendered image only: no panels, no gizmo, no outline. Done — see
   [ADR 0028](docs/adr/0028-hdr-target-tonemap-and-capture.md).
-- **M9** — Shadow mapping, and **v1.0** ← current: directional cascade, depth-only passes
-  into an array texture, PCF filtering. Unshadowed PBR reads as flat no matter
-  how correct the BRDF is, so this is the last thing standing between the editor
-  and a screenshot worth showing. Then polish, document, and call it done.
+- **M9** — Shadow mapping, and **v1.0**. Unshadowed PBR reads as flat no matter
+  how correct the BRDF is, so this was the last thing standing between the editor
+  and a screenshot worth showing. **Scope cut from the cascade**: a single
+  directional `D32_SFLOAT` map with a comparison sampler and PCF, because the
+  hero scene is a chess set, where one frustum fitted to the scene is not an
+  approximation of cascades but identical to them. Cascades stay available for
+  a large scene later. FXAA came with it — a still with stepped edges reads as
+  amateur whatever is in it, and MSAA is ruled out by the `R32_UINT` object-id
+  attachment, which cannot be meaningfully resolved. Also gained: a lighting
+  panel (the lights had been constants tuned for the lantern), F11 to hide the
+  panels, and a capture mode that includes the editor. Done — see
+  [ADR 0029](docs/adr/0029-shadow-mapping-and-fxaa.md).
 
-Past v1.0, in no committed order — pick one and finish it rather than starting
-several:
+**v1.0 is done.** Past this point, pick one of the items below and finish it
+rather than starting several.
+
+In no committed order:
 
 - **v2 — Forward and deferred paths.** A G-buffer and full-screen lighting pass,
-  reusing M6's offscreen-target machinery. Needs material identity resolvable
+  reusing M8's offscreen-target machinery. Needs material identity resolvable
   without draw context, which is why `Material` and `Light` were made
   layout-portable between scalar and std430.
 - **v2 — IBL and global illumination.** HDR environment, equirectangular→cubemap,
@@ -121,7 +131,7 @@ several:
 - **v3 — Neural rendering.** Note this collides with the standing prohibition on
   OptiX, TensorRT and neural denoising; revisit that decision before starting.
 
-Work the current milestone only. Flag scope creep instead of accommodating it.
+Work one item at a time. Flag scope creep instead of accommodating it.
 
 ## Conventions
 

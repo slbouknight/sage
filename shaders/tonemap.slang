@@ -7,9 +7,15 @@
 // amount of correctness in the BRDF could show through that. This pass is where
 // the range collapses instead, deliberately and with the whole pixel in hand.
 //
-// The output is LINEAR. The swapchain is a _SRGB format, so the colour write
-// applies the linear -> sRGB transfer function in fixed function; encoding here
-// as well would apply it twice and wash the image out.
+// The output is sRGB-ENCODED, applied here in the shader.
+//
+// That is the opposite of what this pass did in M8, and the reason is the pass
+// that now follows it. The target is no longer the _SRGB swapchain, whose
+// colour write encodes in fixed function; it is a UNORM image that FXAA reads.
+// FXAA finds edges by comparing luma, and luma only matches what the eye calls
+// an edge when it is perceptual -- a linear midpoint is nowhere near the
+// visual one. So the encode happens here, the UNORM store keeps it verbatim,
+// and the FXAA pass undoes it once on the way out to the swapchain.
 
 // Binding 3 of set 0. Declared Texture2D rather than Sampler2D and read with
 // Load() because this pass is exactly one texel per pixel -- the target is
@@ -68,6 +74,16 @@ float3 tonemap_aces(float3 color)
     return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
 }
 
+// The sRGB transfer function proper, not the gamma-2.2 approximation. The
+// linear segment near zero is the part the approximation gets worst, and it is
+// exactly the range shadowed pixels live in.
+float3 linear_to_srgb(float3 c)
+{
+    const float3 low = c * 12.92;
+    const float3 high = 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055;
+    return lerp(low, high, step(0.0031308, c));
+}
+
 [shader("fragment")]
 float4 fragment_main(float4 position: SV_Position) : SV_Target
 {
@@ -93,7 +109,7 @@ float4 fragment_main(float4 position: SV_Position) : SV_Target
         break;
     }
 
-    // Alpha 1: the swapchain is composited opaque, and the HDR target's alpha
+    // Alpha 1: the image is composited opaque, and the HDR target's alpha
     // carries nothing meaningful -- the scene pass never writes it with intent.
-    return float4(color, 1.0);
+    return float4(linear_to_srgb(color), 1.0);
 }

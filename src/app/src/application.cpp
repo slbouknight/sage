@@ -68,8 +68,10 @@ core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
     return camera_input;
 }
 
-// Must match FrameData in shaders/mesh.slang. Written once per frame and read
-// by every draw which is exactly why it is a buffer and not a push constant.
+// Must match FrameData in shaders/mesh.slang *and* shaders/shadow.slang, which
+// declare it separately because slangc compiles each file alone. Written once
+// per frame and read by every draw, which is exactly why it is a buffer and not
+// a push constant.
 //
 // glm's mat4 has alignment 4, not 16, so the alignas is what puts camera_position
 // at 64 rather than wherever the compiler feels like. Note the SPIR-V ArrayStride for
@@ -81,12 +83,29 @@ struct FrameData {
     glm::vec3 camera_position{0.0F};
     std::uint32_t light_count = 0;
     std::array<gpu::Light, gpu::k_max_lights> lights{};
+    alignas(16) glm::mat4 light_view_projection{1.0F};
+    float shadow_normal_bias = 0.0F;
+    std::int32_t shadow_pcf_radius = 0;
+    float shadow_texel_size = 0.0F;
+    std::uint32_t shadow_enabled = 0;
+    float ambient_intensity = 0.0F;
 };
 static_assert(offsetof(FrameData, view_projection) == 0);
 static_assert(offsetof(FrameData, camera_position) == 64);
 static_assert(offsetof(FrameData, light_count) == 76);
 static_assert(offsetof(FrameData, lights) == 80);
-static_assert(sizeof(FrameData) == 464);
+// Verified against the compiled SPIR-V, which decorates these members at
+// exactly these offsets in both mesh.slang and shadow.slang.
+static_assert(offsetof(FrameData, light_view_projection) == 464);
+static_assert(offsetof(FrameData, shadow_normal_bias) == 528);
+static_assert(offsetof(FrameData, shadow_pcf_radius) == 532);
+static_assert(offsetof(FrameData, shadow_texel_size) == 536);
+static_assert(offsetof(FrameData, shadow_enabled) == 540);
+static_assert(offsetof(FrameData, ambient_intensity) == 544);
+// 560, not 548: the alignas(16) on the two matrices gives the whole struct
+// 16-byte alignment, so its size rounds up. The trailing 12 bytes are padding
+// no shader reads.
+static_assert(sizeof(FrameData) == 560);
 // 80 is a multiple of the 16-byte alignment a device address requires, so slot
 // N's address is simply base + N * sizeof(FrameData) with no padding.
 static_assert(sizeof(FrameData) % 16 == 0);
@@ -149,6 +168,23 @@ static_assert(offsetof(TonemapPushConstants, exposure) == 0);
 static_assert(offsetof(TonemapPushConstants, tonemap_operator) == 4);
 static_assert(sizeof(TonemapPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
+// Must match PushConstants in shaders/fxaa.slang. Verified against the compiled
+// SPIR-V, which decorates these members at 0, 8, 12, 16 and 20 -- the float2
+// aligns to 8, which is what puts the first scalar at 8 rather than 4.
+struct FxaaPushConstants {
+    glm::vec2 inverse_extent{0.0F};
+    float edge_threshold = 0.0F;
+    float edge_threshold_min = 0.0F;
+    float subpixel_quality = 0.0F;
+    std::int32_t enabled = 0;
+};
+static_assert(offsetof(FxaaPushConstants, inverse_extent) == 0);
+static_assert(offsetof(FxaaPushConstants, edge_threshold) == 8);
+static_assert(offsetof(FxaaPushConstants, edge_threshold_min) == 12);
+static_assert(offsetof(FxaaPushConstants, subpixel_quality) == 16);
+static_assert(offsetof(FxaaPushConstants, enabled) == 20);
+static_assert(sizeof(FxaaPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
+
 // Range of the exposure slider, in stops. Four either way covers "the scene is
 // lit for a sunny day" to "the scene is lit by one lantern" without the slider
 // becoming too coarse to make a small correction with.
@@ -164,8 +200,10 @@ constexpr const char* k_screenshot_directory = "screenshots";
 // Every format is_capturable_format accepts is 8-bit RGBA or BGRA.
 constexpr VkDeviceSize k_swapchain_bytes_per_pixel = 4;
 
-constexpr std::uint32_t k_initial_width = 1280;
-constexpr std::uint32_t k_initial_height = 720;
+// 720p left the 3D view around 716 px wide once the panels took their columns,
+// which is thin for an editor and thinner still for a capture of one.
+constexpr std::uint32_t k_initial_width = 1600;
+constexpr std::uint32_t k_initial_height = 900;
 
 constexpr VkClearColorValue k_clear_color{{0.0036F, 0.0036F, 0.0036F, 1.0F}};
 
@@ -308,7 +346,19 @@ Application::Application(const std::filesystem::path& model_path)
       depth_buffer_(allocator_, device_, swapchain_.extent()),
       id_buffer_(allocator_, device_, swapchain_.extent()),
       hdr_target_(allocator_, device_, swapchain_.extent()),
+      ldr_target_(allocator_, device_, swapchain_.extent()),
+      shadow_map_(allocator_, device_),
       pipeline_cache_(device_, pipeline_cache_path()),
+      shadow_pipeline_(device_,
+                       gpu::GraphicsPipelineDesc{
+                           .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "shadow.spv",
+                           // No colour at all; depth is the entire output.
+                           .depth_format = gpu::ShadowMap::format(),
+                           .depth_only = true,
+                           .depth_bias = true,
+                           .set_layout = bindless_set_.layout(),
+                           .cache = pipeline_cache_.handle(),
+                       }),
       pipeline_(device_,
                 gpu::GraphicsPipelineDesc{
                     .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
@@ -340,15 +390,29 @@ Application::Application(const std::filesystem::path& model_path)
       tonemap_pipeline_(device_,
                         gpu::GraphicsPipelineDesc{
                             .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "tonemap.spv",
-                            .color_format = swapchain_.format(),
+                            // The LDR target, not the swapchain: FXAA sits
+                            // between them now.
+                            .color_format = gpu::LdrTarget::format(),
                             .cull_backfaces = false,
                             .set_layout = bindless_set_.layout(),
                             .cache = pipeline_cache_.handle(),
                         }),
+      fxaa_pipeline_(device_,
+                     gpu::GraphicsPipelineDesc{
+                         .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "fxaa.spv",
+                         .color_format = swapchain_.format(),
+                         .cull_backfaces = false,
+                         .set_layout = bindless_set_.layout(),
+                         .cache = pipeline_cache_.handle(),
+                     }),
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
     bindless_set_.write_object_id_image(id_buffer_.view());
     bindless_set_.write_hdr_color_image(hdr_target_.view());
+    // Written once, unlike the two above: the shadow map does not follow the
+    // swapchain, so a resize never invalidates this view.
+    bindless_set_.write_shadow_map(shadow_map_.view(), shadow_map_.sampler());
+    bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
     gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
     tonemap_operator_ = static_cast<int>(TonemapOperator::aces);
 
@@ -441,6 +505,232 @@ Application::CameraMatrices Application::camera_matrices() const {
     matrices.projection = core::perspective_vk(fov, aspect, k_near_plane, k_far_plane);
     matrices.projection_gl = core::perspective_gl(fov, aspect, k_near_plane, k_far_plane);
     return matrices;
+}
+
+Application::Bounds Application::scene_bounds() const {
+    Bounds bounds{glm::vec3(std::numeric_limits<float>::max()),
+                  glm::vec3(std::numeric_limits<float>::lowest())};
+
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.has_mesh) {
+            continue;
+        }
+        const glm::vec3& local_min = node.mesh.bounds_min;
+        const glm::vec3& local_max = node.mesh.bounds_max;
+
+        // All eight corners, not just the two. Transforming min and max alone
+        // is only correct for an axis-aligned transform; under any rotation it
+        // yields a box that does not contain the mesh.
+        for (int corner = 0; corner < 8; ++corner) {
+            const glm::vec3 local{(corner & 1) != 0 ? local_max.x : local_min.x,
+                                  (corner & 2) != 0 ? local_max.y : local_min.y,
+                                  (corner & 4) != 0 ? local_max.z : local_min.z};
+            const glm::vec3 world = glm::vec3(node.world_transform * glm::vec4(local, 1.0F));
+            bounds.min = glm::min(bounds.min, world);
+            bounds.max = glm::max(bounds.max, world);
+        }
+    }
+    return bounds;
+}
+
+Application::LightFit Application::fit_light(const Bounds& bounds) const {
+    if (bounds.empty()) {
+        return {};
+    }
+
+    const glm::vec3 center = (bounds.min + bounds.max) * 0.5F;
+    // The bounding sphere, not the box. A box's extent depends on how it is
+    // turned; fitting the sphere means the frustum stays the same size as the
+    // light swings around, so the shadow's resolution does not change while
+    // the direction slider is dragged.
+    const float radius = glm::length(bounds.max - bounds.min) * 0.5F;
+    // A degenerate scene -- one point, or nothing -- would make a zero-extent
+    // projection and divide by zero.
+    const float extent = std::max(radius, 1e-3F);
+
+    const glm::vec3 direction = glm::normalize(key_light_.direction);
+
+    // Any vector not parallel to the light will do as an up hint; world up
+    // fails exactly when the light points straight down, which is a common
+    // enough setting to handle rather than hope about.
+    const glm::vec3 up =
+        std::abs(direction.y) > 0.99F ? glm::vec3(0.0F, 0.0F, 1.0F) : glm::vec3(0.0F, 1.0F, 0.0F);
+
+    // Pulled back a full diameter beyond the sphere so that geometry behind
+    // the centre still falls inside the near plane and casts.
+    const glm::vec3 eye = center - direction * (extent * 2.0F);
+    const glm::mat4 view = glm::lookAt(eye, center, up);
+
+    // Depth range covers the pull-back plus the far side of the sphere. Kept
+    // tight rather than generous: every unit of depth range spent on empty
+    // space is precision taken from the part that has geometry in it.
+    const glm::mat4 projection =
+        core::ortho_vk(-extent, extent, -extent, extent, 0.0F, extent * 4.0F);
+
+    LightFit fit;
+    fit.view_projection = projection * view;
+    // The frustum spans 2 * extent across `resolution` texels.
+    fit.world_texel_size = (extent * 2.0F) / static_cast<float>(shadow_map_.resolution());
+    return fit;
+}
+
+void Application::write_frame_data(std::uint32_t frame_slot) const {
+    const CameraMatrices matrices = camera_matrices();
+
+    // One write per frame, into this frame's own slot. Writing a single shared
+    // slot would race the GPU, which may still be reading the previous frame's
+    // copy. begin_frame() has already waited out the work that used this slot.
+    FrameData frame_data;
+    frame_data.view_projection = matrices.projection * matrices.view;
+    frame_data.camera_position = camera_.position();
+
+    // The shader reads data rather than constants, so moving a light is a value
+    // change and not a recompile -- which is what makes a lighting panel
+    // possible at all.
+    frame_data.lights[0].type = gpu::LightType::directional;
+    frame_data.lights[0].direction = glm::normalize(key_light_.direction);
+    frame_data.lights[0].color = key_light_.color;
+    frame_data.lights[0].intensity = key_light_.intensity;
+    frame_data.light_count = 1;
+
+    if (fill_light_.enabled) {
+        frame_data.lights[1].type = gpu::LightType::point;
+        frame_data.lights[1].position = fill_light_.position;
+        frame_data.lights[1].color = fill_light_.color;
+        frame_data.lights[1].intensity = fill_light_.intensity;
+        frame_data.lights[1].range = fill_light_.range;
+        frame_data.light_count = 2;
+    }
+
+    frame_data.ambient_intensity = ambient_intensity_;
+
+    // Refitted every frame from live world transforms. A gizmo drag moves
+    // geometry, which moves the bounds, which moves the frustum -- so a shadow
+    // keeps up with the thing casting it.
+    const LightFit fit = fit_light(scene_bounds());
+    frame_data.light_view_projection = fit.view_projection;
+    // Texels converted to world units here, so the shader stays in world space
+    // and the slider keeps meaning the same thing at any scene scale.
+    frame_data.shadow_normal_bias = shadow_normal_bias_texels_ * fit.world_texel_size;
+    frame_data.shadow_pcf_radius = shadow_pcf_radius_;
+    frame_data.shadow_texel_size = 1.0F / static_cast<float>(shadow_map_.resolution());
+    frame_data.shadow_enabled = shadows_enabled_ ? 1U : 0U;
+
+    frame_buffer_.write(&frame_data, sizeof(frame_data),
+                        VkDeviceSize{frame_slot} * sizeof(FrameData));
+}
+
+void Application::record_shadow(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
+    VkImageMemoryBarrier2 to_depth{};
+    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    // The previous frame's last use was the fragment shader sampling this map,
+    // so that read has to finish before the pass below overwrites it. A
+    // write-after-read, hence no source access mask.
+    to_depth.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    to_depth.srcAccessMask = VK_ACCESS_2_NONE;
+    to_depth.dstStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_depth.image = shadow_map_.image();
+    to_depth.subresourceRange = k_depth_range;
+
+    VkDependencyInfo begin_dependency{};
+    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    begin_dependency.imageMemoryBarrierCount = 1;
+    begin_dependency.pImageMemoryBarriers = &to_depth;
+    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
+
+    // STORE, unlike the main depth buffer's DONT_CARE: this attachment's whole
+    // purpose is to be read back afterwards.
+    VkRenderingAttachmentInfo depth_attachment{};
+    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth_attachment.imageView = shadow_map_.view();
+    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth_attachment.clearValue.depthStencil = {1.0F, 0};
+
+    const VkExtent2D extent = shadow_map_.extent();
+
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.offset = {0, 0};
+    rendering.renderArea.extent = extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 0;
+    rendering.pDepthAttachment = &depth_attachment;
+
+    vkCmdBeginRendering(command_buffer, &rendering);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_.handle());
+
+    const VkDescriptorSet descriptor_set = bindless_set_.handle();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            shadow_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
+
+    VkViewport viewport{};
+    viewport.x = 0.0F;
+    viewport.y = 0.0F;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{{0, 0}, extent};
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    // Dynamic, so the two ends of the bias trade-off stay draggable. The
+    // constant term is in units of the depth format's smallest representable
+    // difference; the slope term scales with how steeply the surface is turned
+    // away from the light, which is where acne appears first.
+    vkCmdSetDepthBias(command_buffer, shadow_depth_bias_, 0.0F, shadow_slope_bias_);
+
+    const VkDeviceAddress frame_address =
+        frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
+
+    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+        if (!node.has_mesh) {
+            continue;
+        }
+        // The same struct the main pass pushes. This pipeline's shader declares
+        // only the first three members and ignores the rest.
+        PushConstants push{};
+        push.vertex_address = node.mesh.vertex_address;
+        push.frame_address = frame_address;
+        push.model = node.world_transform;
+        vkCmdPushConstants(command_buffer, shadow_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
+                           sizeof(push), &push);
+        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
+                             VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
+    }
+
+    vkCmdEndRendering(command_buffer);
+
+    // Into the layout the descriptor written at startup names. DEPTH_READ_ONLY
+    // rather than SHADER_READ_ONLY because this is a depth image.
+    VkImageMemoryBarrier2 to_read{};
+    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_read.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    to_read.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.image = shadow_map_.image();
+    to_read.subresourceRange = k_depth_range;
+
+    VkDependencyInfo end_dependency{};
+    end_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    end_dependency.imageMemoryBarrierCount = 1;
+    end_dependency.pImageMemoryBarriers = &to_read;
+    vkCmdPipelineBarrier2(command_buffer, &end_dependency);
 }
 
 void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
@@ -563,35 +853,11 @@ void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t fra
 
     vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
 
-    const CameraMatrices matrices = camera_matrices();
-
-    // One write per frame, into this frame's own slot. Writing a single shared
-    // slot would race the GPU, which may still be reading the previous frame's
-    // copy. begin_frame() has already waited out the work that used this slot.
-    FrameData frame_data;
-    frame_data.view_projection = matrices.projection * matrices.view;
-    frame_data.camera_position = camera_.position();
-
-    // A scene owned light list arrives with the editor. What's important here
-    // is that the shader reads data rather than constants, so moving a light
-    // is a value change and not a recompile.
-    frame_data.light_count = 2;
-
-    frame_data.lights[0].type = gpu::LightType::directional;
-    frame_data.lights[0].direction = glm::normalize(glm::vec3(-0.5F, -1.0F, -0.8F));
-    frame_data.lights[0].color = glm::vec3(1.0F, 0.96F, 0.9F);
-    frame_data.lights[0].intensity = 2.0F;
-
-    // Parked near the lantern head so the falloff is visible against the post.
-    frame_data.lights[1].type = gpu::LightType::point;
-    frame_data.lights[1].position = glm::vec3(9.6F, 18.0F, 0.0F);
-    frame_data.lights[1].color = glm::vec3(1.0F, 0.7F, 0.35F);
-    frame_data.lights[1].intensity = 60.0F;
-    frame_data.lights[1].range = 12.0F;
-
-    const VkDeviceSize frame_offset = VkDeviceSize{frame_slot} * sizeof(FrameData);
-    frame_buffer_.write(&frame_data, sizeof(frame_data), frame_offset);
-    const VkDeviceAddress frame_address = frame_buffer_.device_address() + frame_offset;
+    // Already written by write_frame_data, before the shadow pass -- both
+    // passes read the same slot, and the shadow pass needs the light matrix
+    // that is in it.
+    const VkDeviceAddress frame_address =
+        frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
 
     for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
         const gpu::SceneNode& node = scene_graph_.nodes()[index];
@@ -618,11 +884,10 @@ void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t fra
     vkCmdEndRendering(command_buffer);
 }
 
-void Application::record_tonemap(VkCommandBuffer command_buffer, VkImage image,
-                                 VkImageView image_view) const {
+void Application::record_tonemap(VkCommandBuffer command_buffer) const {
     // Two transitions, one dependency. The HDR target stops being an attachment
-    // and becomes a texture; the swapchain image, untouched so far this frame,
-    // becomes an attachment for the first time.
+    // and becomes a texture; the LDR target, which the FXAA pass sampled last
+    // frame, goes the other way.
     VkImageMemoryBarrier2 hdr_to_read{};
     hdr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     hdr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -636,20 +901,22 @@ void Application::record_tonemap(VkCommandBuffer command_buffer, VkImage image,
     hdr_to_read.image = hdr_target_.image();
     hdr_to_read.subresourceRange = k_color_range;
 
-    VkImageMemoryBarrier2 swapchain_to_color{};
-    swapchain_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    swapchain_to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    swapchain_to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    swapchain_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    swapchain_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    swapchain_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    swapchain_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    swapchain_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapchain_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapchain_to_color.image = image;
-    swapchain_to_color.subresourceRange = k_color_range;
+    // Write-after-read: the previous frame's FXAA pass sampled this image, and
+    // that read has to finish before the tonemap overwrites it.
+    VkImageMemoryBarrier2 ldr_to_color{};
+    ldr_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    ldr_to_color.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    ldr_to_color.srcAccessMask = VK_ACCESS_2_NONE;
+    ldr_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    ldr_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    ldr_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ldr_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ldr_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ldr_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ldr_to_color.image = ldr_target_.image();
+    ldr_to_color.subresourceRange = k_color_range;
 
-    const std::array<VkImageMemoryBarrier2, 2> barriers{hdr_to_read, swapchain_to_color};
+    const std::array<VkImageMemoryBarrier2, 2> barriers{hdr_to_read, ldr_to_color};
 
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -658,15 +925,15 @@ void Application::record_tonemap(VkCommandBuffer command_buffer, VkImage image,
     vkCmdPipelineBarrier2(command_buffer, &dependency);
 
     // DONT_CARE, not CLEAR: the triangle below covers every pixel of the image,
-    // so clearing first would be writing the whole swapchain twice.
+    // so clearing first would be writing the whole target twice.
     VkRenderingAttachmentInfo color_attachment{};
     color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = image_view;
+    color_attachment.imageView = ldr_target_.view();
     color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
-    const VkExtent2D extent = swapchain_.extent();
+    const VkExtent2D extent = ldr_target_.extent();
 
     VkRenderingInfo rendering{};
     rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -704,6 +971,95 @@ void Application::record_tonemap(VkCommandBuffer command_buffer, VkImage image,
     push.exposure = std::exp2(exposure_stops_);
     push.tonemap_operator = tonemap_operator_;
     vkCmdPushConstants(command_buffer, tonemap_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
+                       sizeof(push), &push);
+
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    vkCmdEndRendering(command_buffer);
+}
+
+void Application::record_fxaa(VkCommandBuffer command_buffer, VkImage image,
+                              VkImageView image_view) const {
+    // The LDR target stops being an attachment and becomes a texture; the
+    // swapchain image, untouched so far this frame, becomes an attachment for
+    // the first time.
+    VkImageMemoryBarrier2 ldr_to_read{};
+    ldr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    ldr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    ldr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    ldr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    ldr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    ldr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ldr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ldr_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ldr_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ldr_to_read.image = ldr_target_.image();
+    ldr_to_read.subresourceRange = k_color_range;
+
+    VkImageMemoryBarrier2 swapchain_to_color{};
+    swapchain_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    swapchain_to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    swapchain_to_color.srcAccessMask = VK_ACCESS_2_NONE;
+    swapchain_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    swapchain_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    swapchain_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    swapchain_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    swapchain_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchain_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapchain_to_color.image = image;
+    swapchain_to_color.subresourceRange = k_color_range;
+
+    const std::array<VkImageMemoryBarrier2, 2> barriers{ldr_to_read, swapchain_to_color};
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size());
+    dependency.pImageMemoryBarriers = barriers.data();
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+
+    VkRenderingAttachmentInfo color_attachment{};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    const VkExtent2D extent = swapchain_.extent();
+
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.offset = {0, 0};
+    rendering.renderArea.extent = extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color_attachment;
+
+    vkCmdBeginRendering(command_buffer, &rendering);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaa_pipeline_.handle());
+
+    const VkDescriptorSet descriptor_set = bindless_set_.handle();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            fxaa_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
+
+    VkViewport viewport{};
+    viewport.x = 0.0F;
+    viewport.y = 0.0F;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{{0, 0}, extent};
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    FxaaPushConstants push{};
+    push.inverse_extent = glm::vec2(1.0F / static_cast<float>(extent.width),
+                                    1.0F / static_cast<float>(extent.height));
+    push.edge_threshold = fxaa_edge_threshold_;
+    push.edge_threshold_min = fxaa_edge_threshold_min_;
+    push.subpixel_quality = fxaa_subpixel_quality_;
+    push.enabled = fxaa_enabled_ ? 1 : 0;
+    vkCmdPushConstants(command_buffer, fxaa_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
                        sizeof(push), &push);
 
     vkCmdDraw(command_buffer, 3, 1, 0, 0);
@@ -977,10 +1333,11 @@ void Application::record_screenshot_copy(VkCommandBuffer command_buffer, VkImage
         return;
     }
 
-    // The 3D view alone. Everything outside it is either the background the
-    // scene pass cleared or, once ImGui has drawn, editor chrome -- and this
-    // runs before ImGui anyway, so the panels would be blank rectangles.
-    const VkRect2D region_rect = viewport_rect_;
+    // Either the 3D view alone -- recorded before any overlay reaches the image
+    // -- or the whole window after ImGui, which is a picture of the editor
+    // rather than of the render.
+    const VkRect2D region_rect =
+        screenshot_include_ui_ ? VkRect2D{{0, 0}, swapchain_.extent()} : viewport_rect_;
     screenshot_extent_ = region_rect.extent;
 
     const VkDeviceSize size = VkDeviceSize{screenshot_extent_.width} * screenshot_extent_.height *
@@ -1114,6 +1471,15 @@ void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage 
 }
 
 void Application::draw_dockspace() {
+    // With the UI hidden there is no dockspace at all, and the 3D view takes
+    // the whole image. Set explicitly rather than by letting the central node
+    // grow: a node whose windows were simply not submitted keeps whatever size
+    // the layout gave it, so the rect would be a frame behind at best.
+    if (ui_hidden_) {
+        viewport_rect_ = VkRect2D{{0, 0}, swapchain_.extent()};
+        return;
+    }
+
     // PassthruCentralNode leaves the middle node transparent and, while it is
     // empty, lets mouse input through it -- so the scene shows and the camera
     // still responds. NoDockingOverCentralNode keeps it empty permanently, so a
@@ -1157,6 +1523,11 @@ void Application::draw_dockspace() {
                                 &right_bottom);
 
     ImGui::DockBuilderDockWindow("Hierarchy", right_top);
+    // Lighting shares a node with Properties rather than taking a third row.
+    // The two are rarely wanted at once -- Properties describes a selection,
+    // Lighting describes the scene -- and tabs beat three panels each too short
+    // to show their contents. Either can be dragged out at runtime.
+    ImGui::DockBuilderDockWindow("Lighting", right_bottom);
     ImGui::DockBuilderDockWindow("Properties", right_bottom);
     ImGui::DockBuilderFinish(dockspace);
 
@@ -1215,7 +1586,19 @@ void Application::draw_presentation_controls() {
     ImGui::SliderFloat("Exposure", &exposure_stops_, k_min_exposure_stops, k_max_exposure_stops,
                        "%+.2f stops");
 
+    ImGui::SeparatorText("Anti-aliasing");
+    ImGui::Checkbox("FXAA", &fxaa_enabled_);
+    ImGui::BeginDisabled(!fxaa_enabled_);
+    // Lower catches more edges and softens more of the image with them; higher
+    // leaves faint edges alone. The floor matters most in dark regions, where a
+    // tiny absolute difference is a large relative one.
+    ImGui::SliderFloat("Edge threshold", &fxaa_edge_threshold_, 0.03F, 0.33F, "%.3f");
+    ImGui::SliderFloat("Dark floor", &fxaa_edge_threshold_min_, 0.005F, 0.1F, "%.4f");
+    ImGui::SliderFloat("Subpixel", &fxaa_subpixel_quality_, 0.0F, 1.0F, "%.2f");
+    ImGui::EndDisabled();
+
     ImGui::SeparatorText("Capture");
+    ImGui::Checkbox("Include UI", &screenshot_include_ui_);
     // Disabled rather than hidden while one is in flight: the button vanishing
     // for a frame reads as a misclick.
     ImGui::BeginDisabled(pending_screenshot_.has_value());
@@ -1223,7 +1606,61 @@ void Application::draw_presentation_controls() {
         request_screenshot();
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width, viewport_rect_.extent.height);
+    if (screenshot_include_ui_) {
+        ImGui::TextDisabled("%ux%u, whole window", swapchain_.extent().width,
+                            swapchain_.extent().height);
+    } else {
+        ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
+                            viewport_rect_.extent.height);
+    }
+    ImGui::TextDisabled("F11 hides the panels");
+}
+
+void Application::draw_lighting_panel() {
+    ImGui::Begin("Lighting");
+
+    ImGui::SeparatorText("Key light (directional)");
+    // A direction rather than two angles: matching a reference image is easier
+    // by nudging a vector than by converting to azimuth and elevation first.
+    // Normalised at upload, so the magnitude here does not matter.
+    ImGui::DragFloat3("Direction", glm::value_ptr(key_light_.direction), 0.01F, -1.0F, 1.0F);
+    ImGui::ColorEdit3("Colour##key", glm::value_ptr(key_light_.color));
+    ImGui::DragFloat("Intensity##key", &key_light_.intensity, 0.05F, 0.0F, 50.0F);
+
+    ImGui::SeparatorText("Fill light (point)");
+    ImGui::Checkbox("Enabled", &fill_light_.enabled);
+    ImGui::BeginDisabled(!fill_light_.enabled);
+    ImGui::DragFloat3("Position", glm::value_ptr(fill_light_.position), 0.01F);
+    ImGui::ColorEdit3("Colour##fill", glm::value_ptr(fill_light_.color));
+    ImGui::DragFloat("Intensity##fill", &fill_light_.intensity, 0.05F, 0.0F, 200.0F);
+    // Beyond this distance the light contributes nothing. Also what stops the
+    // falloff from being a pure inverse square that never quite reaches zero.
+    ImGui::DragFloat("Range", &fill_light_.range, 0.05F, 0.01F, 200.0F);
+    ImGui::EndDisabled();
+
+    ImGui::SeparatorText("Ambient");
+    ImGui::DragFloat("Intensity##ambient", &ambient_intensity_, 0.002F, 0.0F, 1.0F, "%.3f");
+    ImGui::TextDisabled("Flat term; no IBL yet");
+
+    ImGui::SeparatorText("Shadow");
+    ImGui::Checkbox("Enabled##shadow", &shadows_enabled_);
+    ImGui::BeginDisabled(!shadows_enabled_);
+    // Acne and peter-panning are the two ends of one trade-off: too little bias
+    // and the surface shadows itself in stripes, too much and the contact
+    // shadow detaches from the object. The middle is found by dragging.
+    // The constant term's range dwarfs the slope term's because the spec scales
+    // it by the depth format's smallest resolvable difference -- about 2^-23
+    // here. Hundreds is the working range, not single digits.
+    ImGui::DragFloat("Depth bias", &shadow_depth_bias_, 10.0F, 0.0F, 10000.0F, "%.0f");
+    ImGui::DragFloat("Slope bias", &shadow_slope_bias_, 0.05F, 0.0F, 8.0F, "%.2f");
+    ImGui::DragFloat("Normal bias", &shadow_normal_bias_texels_, 0.05F, 0.0F, 8.0F, "%.2f texels");
+    ImGui::SliderInt("PCF radius", &shadow_pcf_radius_, 0, 4);
+    ImGui::EndDisabled();
+    const int taps = ((2 * shadow_pcf_radius_) + 1) * ((2 * shadow_pcf_radius_) + 1);
+    ImGui::TextDisabled("%ux%u map, %d taps", shadow_map_.resolution(), shadow_map_.resolution(),
+                        taps);
+
+    ImGui::End();
 }
 
 void Application::draw_properties_panel() {
@@ -1427,10 +1864,13 @@ bool Application::recreate_swapchain() {
     depth_buffer_.recreate(swapchain_.extent());
     id_buffer_.recreate(swapchain_.extent());
     hdr_target_.recreate(swapchain_.extent());
+    ldr_target_.recreate(swapchain_.extent());
     // The old views are gone, so the descriptors naming them have to be
-    // rewritten.
+    // rewritten. The shadow map is absent here on purpose: it does not follow
+    // the swapchain, so its view is still valid.
     bindless_set_.write_object_id_image(id_buffer_.view());
     bindless_set_.write_hdr_color_image(hdr_target_.view());
+    bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
     // A pick names a texel in an image that no longer exists.
     pending_pick_.reset();
     // Same for a capture: the region it named was measured against the old
@@ -1538,6 +1978,18 @@ void Application::run() {
         // After ImGui::NewFrame and before anything queries the gizmo: it
         // caches per-frame state of its own.
         ImGuizmo::BeginFrame();
+
+        // Before draw_dockspace, which reads it. Toggling after would submit a
+        // dockspace this frame and hide the panels that belong in it, leaving
+        // the 3D view sized for a layout that is no longer on screen.
+        //
+        // Not gated on wants_keyboard, unlike the gizmo keys: with the panels
+        // hidden there is nothing left to take keyboard focus, so gating it
+        // would make the toggle one-way in exactly the state it matters.
+        if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
+            ui_hidden_ = !ui_hidden_;
+        }
+
         // First, so the panels below have a dockspace to place themselves in.
         draw_dockspace();
 
@@ -1549,13 +2001,11 @@ void Application::run() {
         }
 
         handle_gizmo_keys();
-
         // Not in handle_gizmo_keys: that is gated on the camera not being flown,
         // and there is no reason a capture should be.
         if (!gpu::ImGuiLayer::wants_keyboard() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
             request_screenshot();
         }
-
         // Before picking: a drag that ends over a different object must not
         // also reselect it, and ImGuizmo only reports IsUsing() once drawn.
         const bool gizmo_active = draw_gizmo();
@@ -1566,21 +2016,36 @@ void Application::run() {
             handle_picking_input();
         }
 
-        draw_ui();
-        draw_hierarchy_panel();
-        draw_properties_panel();
+        if (!ui_hidden_) {
+            draw_ui();
+            draw_hierarchy_panel();
+            draw_properties_panel();
+            draw_lighting_panel();
+        }
 
-        // Pass order is load-bearing. The scene shades into the HDR target; the
-        // tonemap resolves it to the swapchain and is the first thing to touch
-        // that image; the capture takes the resolved scene before any editor
-        // overlay reaches it; the outline and then ImGui draw on top.
+        // Pass order is load-bearing. The shadow map is filled first, since the
+        // scene samples it; the scene shades into the HDR target; the tonemap
+        // resolves that to the LDR target; FXAA resolves *that* to the
+        // swapchain and is the first thing to touch it; the capture takes the
+        // finished image before any editor overlay reaches it; the outline and
+        // then ImGui draw on top.
+        write_frame_data(frame.slot);
+        record_shadow(frame.command_buffer, frame.slot);
         record_scene(frame.command_buffer, frame.slot);
-        record_tonemap(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index));
-        record_screenshot_copy(frame.command_buffer, acquired.image);
+        record_tonemap(frame.command_buffer);
+        record_fxaa(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index));
+        if (!screenshot_include_ui_) {
+            record_screenshot_copy(frame.command_buffer, acquired.image);
+        }
         record_outline(frame.command_buffer, swapchain_.image_view(acquired.index));
         record_pick_copy(frame.command_buffer);
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
                       swapchain_.extent());
+        // The other capture point: after everything, so the file shows the
+        // editor rather than only what it is looking at.
+        if (screenshot_include_ui_) {
+            record_screenshot_copy(frame.command_buffer, acquired.image);
+        }
         transition_to_present(frame.command_buffer, acquired.image);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,

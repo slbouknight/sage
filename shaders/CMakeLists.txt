@@ -10,7 +10,7 @@ endif()
 file(MAKE_DIRECTORY "${SAGE_SHADER_BINARY_DIR}")
 
 # Listed explicitly, never globbed (see CLAUDE.md).
-set(shaders mesh outline tonemap)
+set(shaders fxaa mesh outline shadow tonemap)
 
 set(spv_outputs)
 foreach(shader IN LISTS shaders)
@@ -19,7 +19,14 @@ foreach(shader IN LISTS shaders)
 
     add_custom_command(
         OUTPUT "${spv}"
-        COMMAND "${SLANGC_EXECUTABLE}" "${src}" -target spirv -o "${spv}" -depfile "${spv}.d"
+        # -fvk-use-entrypoint-name: without it slangc emits a lone entry point
+        # as "main" and only preserves source names when a file has more than
+        # one. shadow.slang has just a vertex stage, so GraphicsPipeline would
+        # look up "vertex_main" and find nothing. Setting it for every shader
+        # keeps one rule rather than a per-file exception; the shaders that
+        # already have two entry points are unaffected.
+        COMMAND "${SLANGC_EXECUTABLE}" "${src}" -target spirv -fvk-use-entrypoint-name
+                -o "${spv}" -depfile "${spv}.d"
         DEPENDS "${src}"
         DEPFILE "${spv}.d"
         COMMENT "slangc ${shader}.slang -> ${shader}.spv"

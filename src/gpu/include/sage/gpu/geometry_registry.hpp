@@ -2,6 +2,7 @@
 
 #include <sage/gpu/allocator.hpp>
 
+#include <glm/glm.hpp>
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
@@ -26,6 +27,13 @@ public:
         VkDeviceSize index_offset = 0;
         std::uint32_t index_count = 0;
 
+        // The mesh's own AABB, in the space its vertices were authored in. Kept
+        // per mesh rather than only per load because M9 fits a shadow frustum
+        // to the scene every frame: a load-time world AABB goes stale the
+        // moment the gizmo moves anything, and the shadow would stop following.
+        glm::vec3 bounds_min{0.0F};
+        glm::vec3 bounds_max{0.0F};
+
         // A mesh with no indices cannot be drawn, so a zeroed view doubles as
         // the failure result of add_mesh without a separate sentinel.
         [[nodiscard]] bool valid() const { return index_count > 0; }
@@ -46,8 +54,13 @@ public:
     // Returns an invalid view when the mesh does not fit. Capacity is a real
     // limit a user can hit by picking a large file, so it is reported rather
     // than asserted -- a viewer that aborts over a file choice is a bug.
+    //
+    // The AABB is passed in rather than derived: this takes opaque bytes and
+    // has no idea where a position sits inside a vertex. The caller is walking
+    // the positions anyway, so computing it there costs nothing extra.
     MeshView add_mesh(const void* vertices, VkDeviceSize vertex_bytes, const std::uint32_t* indices,
-                      std::uint32_t index_count);
+                      std::uint32_t index_count, const glm::vec3& bounds_min,
+                      const glm::vec3& bounds_max);
 
     // Rewinds to empty. Every MeshView handed out before this dangles, so the
     // caller must have dropped them and waited for the device to be idle.

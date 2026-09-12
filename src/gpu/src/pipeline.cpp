@@ -59,7 +59,9 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     raster.polygonMode = VK_POLYGON_MODE_FILL;
     raster.cullMode = desc.cull_backfaces ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.depthBiasEnable = VK_FALSE;
+    // The values come from vkCmdSetDepthBias; this only decides whether the
+    // stage is on at all.
+    raster.depthBiasEnable = desc.depth_bias ? VK_TRUE : VK_FALSE;
     raster.lineWidth = 1.0F;
 
     VkPipelineMultisampleStateCreateInfo multisample{};
@@ -80,6 +82,7 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     depth_stencil.maxDepthBounds = 1.0F;
 
     const bool writes_ids = desc.id_format != VK_FORMAT_UNDEFINED;
+    const std::uint32_t color_attachment_count = desc.depth_only ? 0U : (writes_ids ? 2U : 1U);
 
     // One entry per colour attachment -- the count must match
     // colorAttachmentCount exactly, independently of whether blending is on.
@@ -107,29 +110,35 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     VkPipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     color_blend.logicOpEnable = VK_FALSE;
-    color_blend.attachmentCount = writes_ids ? 2U : 1U;
+    color_blend.attachmentCount = color_attachment_count;
     color_blend.pAttachments = blend_attachments.data();
 
-    constexpr std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
-                                                           VK_DYNAMIC_STATE_SCISSOR};
+    constexpr std::array<VkDynamicState, 3> k_all_dynamic_states{
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS};
     VkPipelineDynamicStateCreateInfo dynamic_state{};
     dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic_state.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
-    dynamic_state.pDynamicStates = dynamic_states.data();
+    // The depth-bias entry is only listed when the pipeline enables bias.
+    // Declaring a dynamic state the pipeline never uses is legal but means
+    // vkCmdSetDepthBias must still be called before every draw, which would
+    // put that requirement on passes that have nothing to do with shadows.
+    dynamic_state.dynamicStateCount = desc.depth_bias ? 3U : 2U;
+    dynamic_state.pDynamicStates = k_all_dynamic_states.data();
 
     // This is what stands in for a VkRenderPass.
     const std::array<VkFormat, 2> color_formats{desc.color_format, desc.id_format};
 
     VkPipelineRenderingCreateInfo rendering_info{};
     rendering_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    rendering_info.colorAttachmentCount = writes_ids ? 2U : 1U;
+    rendering_info.colorAttachmentCount = color_attachment_count;
     rendering_info.pColorAttachmentFormats = color_formats.data();
     rendering_info.depthAttachmentFormat = desc.depth_format;
 
     VkGraphicsPipelineCreateInfo pipeline_info{};
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipeline_info.pNext = &rendering_info;
-    pipeline_info.stageCount = static_cast<std::uint32_t>(stages.size());
+    // One stage for a depth-only pass: stages[1] names a fragment entry point
+    // that a shadow shader deliberately does not have.
+    pipeline_info.stageCount = desc.depth_only ? 1U : static_cast<std::uint32_t>(stages.size());
     pipeline_info.pStages = stages.data();
     pipeline_info.pVertexInputState = &vertex_input;
     pipeline_info.pInputAssemblyState = &input_assembly;

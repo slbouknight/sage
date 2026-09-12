@@ -194,12 +194,22 @@ std::optional<GeometryRegistry::MeshView> upload_primitive(
         SAGE_LOG_WARN("Primitive has no TEXCOORD_0; textures will not map");
     }
 
+    // The mesh's own AABB, in the space its vertices are authored in -- as
+    // distinct from the world-space bounds accumulated alongside it. This one
+    // travels with the MeshView so a shadow frustum can be refitted from live
+    // world transforms rather than from wherever the model sat at load time.
+    glm::vec3 mesh_min{std::numeric_limits<float>::max()};
+    glm::vec3 mesh_max{std::numeric_limits<float>::lowest()};
+
     scratch.vertices.resize(vertex_count);
     for (std::size_t i = 0; i < vertex_count; ++i) {
         scratch.vertices[i].position = scratch.positions[i];
         scratch.vertices[i].normal = scratch.normals[i];
         scratch.vertices[i].tangent = scratch.tangents[i];
         scratch.vertices[i].uv = scratch.uvs[i];
+
+        mesh_min = glm::min(mesh_min, scratch.positions[i]);
+        mesh_max = glm::max(mesh_max, scratch.positions[i]);
 
         // Bounds are world-space so a camera can frame the load; the graph has
         // not composed its transforms yet, so the walk carries the matrix down.
@@ -214,7 +224,7 @@ std::optional<GeometryRegistry::MeshView> upload_primitive(
 
     const GeometryRegistry::MeshView view = registry.add_mesh(
         scratch.vertices.data(), sizeof(Vertex) * scratch.vertices.size(), scratch.indices.data(),
-        static_cast<std::uint32_t>(scratch.indices.size()));
+        static_cast<std::uint32_t>(scratch.indices.size()), mesh_min, mesh_max);
     if (!view.valid()) {
         // Out of geometry capacity. add_mesh has already said so; carrying on
         // yields a partial model, which beats losing the whole file.
