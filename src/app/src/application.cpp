@@ -313,6 +313,15 @@ constexpr float k_default_point_intensity = 60.0F;
 // puts the shadow beside the subject, where it can be seen.
 const glm::vec3 k_default_key_direction{-0.80F, -0.50F, -0.33F};
 
+// Where the default light starts, before anything is loaded to measure. Only
+// its icon's position; a directional light shades by rotation alone.
+constexpr float k_default_light_height = 2.0F;
+// Once there is a scene: how far back along the beam the marker sits, and the
+// clearance above the scene's top it is never allowed below, both as fractions
+// of the scene radius.
+constexpr float k_default_light_distance = 2.0F;
+constexpr float k_default_light_clearance = 0.3F;
+
 constexpr float k_pi_f = std::numbers::pi_v<float>;
 
 // A rotation whose -Y axis lands on `direction`, built as a basis rather than
@@ -540,6 +549,11 @@ bool Application::load_model(const PendingLoad& load) {
     if (load.replace && loaded->mesh_count > 0) {
         pending_frame_ = SceneBounds{loaded->bounds_min, loaded->bounds_max};
     }
+
+    // Now that there is something to measure. Also runs for an additive load,
+    // where the scene has grown and a marker sized for the old one is in the
+    // wrong place -- but only while the light is still untouched.
+    reposition_default_light();
     return true;
 }
 
@@ -653,7 +667,14 @@ Application::Bounds Application::scene_bounds() const {
                   glm::vec3(std::numeric_limits<float>::lowest())};
 
     for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.has_mesh) {
+        // editor_only excluded as well as mesh-less. A light icon is not scene
+        // content, and counting it here would cost three separate things: the
+        // shadow frustum would stretch to cover a marker floating above the
+        // subject and spend its resolution on empty air, a new primitive would
+        // be sized against a scene the markers made bigger, and repositioning
+        // the default light would move the very icon that set the bounds it
+        // was positioned from.
+        if (!node.has_mesh || node.editor_only) {
             continue;
         }
         const glm::vec3& local_min = node.mesh.bounds_min;
@@ -1917,12 +1938,58 @@ bool Application::add_light(gpu::LightType type, const glm::vec3& position) {
 }
 
 void Application::add_default_light() {
-    // Placed above whatever is in the scene rather than at the origin, so the
-    // icon does not sit inside the model it is lighting.
+    // The scene is almost always empty here -- clear_scene calls this before
+    // anything is loaded -- so this position is a placeholder that
+    // reposition_default_light replaces once there is something to measure.
+    static_cast<void>(
+        add_light(gpu::LightType::directional, glm::vec3(0.0F, k_default_light_height, 0.0F)));
+    // add_light selects what it adds, which is how its handle is recovered
+    // without threading a return value through it.
+    default_light_ = selected_;
+    if (const gpu::SceneNode* node = scene_graph_.find(default_light_); node != nullptr) {
+        default_light_transform_ = node->local_transform;
+    }
+}
+
+void Application::reposition_default_light() {
+    const gpu::SceneNode* node = scene_graph_.find(default_light_);
+    if (node == nullptr) {
+        return;
+    }
+    // Only while it is still the light this put there. Once it has been moved
+    // or aimed, it is the user's, and relocating it under them on the next
+    // load would undo that.
+    if (node->local_transform != default_light_transform_) {
+        return;
+    }
+
     const Bounds bounds = scene_bounds();
-    const float height =
-        bounds.empty() ? 2.0F : bounds.max.y + glm::length(bounds.max - bounds.min);
-    static_cast<void>(add_light(gpu::LightType::directional, glm::vec3(0.0F, height, 0.0F)));
+    if (bounds.empty()) {
+        return;
+    }
+
+    const glm::vec3 centre = (bounds.min + bounds.max) * 0.5F;
+    const float radius = std::max(glm::length(bounds.max - bounds.min) * 0.5F, 1e-3F);
+
+    // Back along its own beam, which is where the light would be if it were a
+    // sun -- so the cone icon points at the scene rather than away from it.
+    const glm::vec3 direction =
+        glm::normalize(glm::mat3(node->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F));
+    glm::vec3 position = centre - (direction * (radius * k_default_light_distance));
+
+    // A nearly horizontal beam would leave the marker at the scene's own height
+    // and back inside it, which is the thing this exists to avoid. The default
+    // beam is not horizontal, but it is not the only one that reaches here.
+    position.y = std::max(position.y, bounds.max.y + (radius * k_default_light_clearance));
+
+    glm::mat4 transform = node->local_transform;
+    // Only the translation column: the rotation is the aim, and rebuilding it
+    // from the direction would round-trip through a basis for nothing.
+    transform[3] = glm::vec4(position, 1.0F);
+
+    scene_graph_.set_local_transform(default_light_, transform);
+    scene_graph_.update_transforms();
+    default_light_transform_ = transform;
 }
 
 void Application::service_pending_light() {

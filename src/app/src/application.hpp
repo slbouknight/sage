@@ -239,9 +239,20 @@ private:
     // a light is a node and clearing the graph removes it -- without this, an
     // empty scene would load the next model into the dark.
     void add_default_light();
+    // Moves the default light to suit the scene, once there is one to measure.
+    // Does nothing once the light has been touched: from that point it is the
+    // user's, not a default.
+    void reposition_default_light();
     // Adds a light node, with the small mesh that makes it visible and
     // clickable, at `position`.
     bool add_light(gpu::LightType type, const glm::vec3& position);
+
+    // The light add_default_light created, and the transform it was left with.
+    // Comparing against that transform is how "still a default" is decided --
+    // cheaper and more honest than a dirty flag, which every edit path would
+    // have to remember to set.
+    gpu::NodeHandle default_light_;
+    glm::mat4 default_light_transform_{1.0F};
 
     bool dock_layout_built_ = false;
     // Set when node indices are about to be reused, so the hierarchy panel
