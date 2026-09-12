@@ -83,11 +83,14 @@ documented reasoning matter as much as features. CUDA was cut after M5; see
   highlighting from ID discontinuity in a post pass — one buffer, both features,
   and no stencil, which matters because the depth format is `D32_SFLOAT`. Then a
   properties panel over the selection and ImGuizmo writing transforms back into
-  the scene graph. New dependency: `imguizmo`. ← current
+  the scene graph. New dependency: `imguizmo`. Done — see
+  [ADR 0027](docs/adr/0027-object-id-selection-and-gizmos.md).
 - **M8** — Presentation and capture: HDR offscreen target
   (`R16G16B16A16_SFLOAT`), a full-screen tonemap resolve, and screenshot-to-PNG
   reusing `stb_image_write` from the stb port. Speculars have clamped against the
-  sRGB swapchain since M5; this is where that stops.
+  sRGB swapchain since M5; this is where that stops. Note the swapchain is not
+  created with `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`, which a screenshot copy needs —
+  found while capturing frames to verify M7. ← current
 - **M9** — Shadow mapping, and **v1.0**: directional cascade, depth-only passes
   into an array texture, PCF filtering. Unshadowed PBR reads as flat no matter
   how correct the BRDF is, so this is the last thing standing between the editor

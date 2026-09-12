@@ -22,7 +22,7 @@ BindlessSet::BindlessSet(const Device& device) : device_(device) {
     SAGE_VERIFY(props12.maxDescriptorSetUpdateAfterBindSampledImages >= k_max_sampled_images,
                 "GPU cannot back the requested bindless sampled-image array");
 
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
     bindings[0].binding = k_storage_buffer_binding;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = k_max_storage_buffers;
@@ -33,10 +33,17 @@ BindlessSet::BindlessSet(const Device& device) : device_(device) {
     bindings[1].descriptorCount = k_max_sampled_images;
     bindings[1].stageFlags = VK_SHADER_STAGE_ALL;
 
+    bindings[2].binding = k_object_id_binding;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    // One: there is a single id attachment, not an array of them.
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_ALL;
+
     constexpr VkDescriptorBindingFlags k_binding_flags =
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
         VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
-    constexpr std::array<VkDescriptorBindingFlags, 2> k_flags{k_binding_flags, k_binding_flags};
+    constexpr std::array<VkDescriptorBindingFlags, 3> k_flags{k_binding_flags, k_binding_flags,
+                                                              k_binding_flags};
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{};
     flags_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -51,9 +58,10 @@ BindlessSet::BindlessSet(const Device& device) : device_(device) {
     layout_info.pBindings = bindings.data();
     VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &layout_info, nullptr, &layout_));
 
-    const std::array<VkDescriptorPoolSize, 2> pool_sizes{
+    const std::array<VkDescriptorPoolSize, 3> pool_sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, k_max_storage_buffers},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, k_max_sampled_images}};
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, k_max_sampled_images},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1}};
 
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -91,6 +99,25 @@ void BindlessSet::write_storage_buffer(std::uint32_t index, VkBuffer buffer,
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     write.pBufferInfo = &buffer_info;
+
+    vkUpdateDescriptorSets(device_.handle(), 1, &write, 0, nullptr);
+}
+
+void BindlessSet::write_object_id_image(VkImageView view) const {
+    VkDescriptorImageInfo image_info{};
+    // No sampler: SAMPLED_IMAGE descriptors carry only the view, and the
+    // outline pass reads texels by integer coordinate rather than sampling.
+    image_info.imageView = view;
+    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_;
+    write.dstBinding = k_object_id_binding;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image_info;
 
     vkUpdateDescriptorSets(device_.handle(), 1, &write, 0, nullptr);
 }

@@ -9,6 +9,7 @@
 #include <sage/gpu/frame_pacer.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/gltf_loader.hpp>
+#include <sage/gpu/id_buffer.hpp>
 #include <sage/gpu/imgui_layer.hpp>
 #include <sage/gpu/instance.hpp>
 #include <sage/gpu/material_registry.hpp>
@@ -16,6 +17,7 @@
 #include <sage/gpu/pipeline_cache.hpp>
 #include <sage/gpu/sampler.hpp>
 #include <sage/gpu/scene.hpp>
+#include <sage/gpu/selection_buffer.hpp>
 #include <sage/gpu/surface.hpp>
 #include <sage/gpu/swapchain.hpp>
 #include <sage/gpu/texture_registry.hpp>
@@ -58,6 +60,45 @@ private:
     void draw_dockspace();
     void draw_ui();
     void draw_hierarchy_panel();
+    void draw_properties_panel();
+    // Draws the manipulator and writes any drag back into the scene graph.
+    // Returns true while the gizmo is being dragged, which suppresses picking
+    // so that releasing over another object does not reselect.
+    bool draw_gizmo();
+
+    struct CameraMatrices {
+        glm::mat4 view{1.0F};
+        // Vulkan convention, with Y flipped for NDC. What the scene renders with.
+        glm::mat4 projection{1.0F};
+        // The same projection without the flip, for ImGuizmo.
+        glm::mat4 projection_gl{1.0F};
+    };
+    // Derived from the camera and the current viewport rect, so the gizmo and
+    // the scene pass cannot disagree about where a point lands on screen.
+    [[nodiscard]] CameraMatrices camera_matrices() const;
+
+    // Turns a click in the 3D view into a pending object-id readback. No-op
+    // when a panel has the pointer or the cursor is outside the viewport.
+    void handle_picking_input();
+    // W/E/R switch the manipulator, as in Unreal and Blender.
+    void handle_gizmo_keys();
+    // Copies the picked texel out of the id attachment. Recorded after the
+    // scene, so the value read is the one this frame just drew.
+    void record_pick_copy(VkCommandBuffer command_buffer) const;
+    // Draws the selection outline over the scene, reading the id attachment
+    // this frame just wrote. Runs before record_pick_copy, which is what fixes
+    // each pass's expected source layout to a single value.
+    void record_outline(VkCommandBuffer command_buffer, VkImageView image_view) const;
+    // Reads the copied texel back and resolves it to a node. Must run only
+    // after the submission carrying record_pick_copy has completed.
+    void resolve_pick();
+    // Records a new selection. The flag upload it implies is deferred rather
+    // than done here, because this is reachable from inside a panel's draw.
+    void select(gpu::NodeHandle node);
+    // Uploads the selection flags when they have changed. Runs at the top of a
+    // frame, before anything is recorded, for the same reason a queued load
+    // does: the upload blocks and submits work of its own.
+    void service_selection();
 
     // Loads a file into the registries and the graph. Returns false when the
     // file could not be read; the scene is left as it was in that case, unless
@@ -94,6 +135,22 @@ private:
     // when the constructor loads a model named on the command line.
     std::optional<SceneBounds> pending_frame_;
 
+    // Texel in the id attachment to read back, in framebuffer pixels. Set on
+    // click and cleared once resolved.
+    std::optional<VkOffset2D> pending_pick_;
+    gpu::NodeHandle selected_;
+    // One flag per node: 1 for the selection and everything beneath it. Kept
+    // here rather than rebuilt per frame so the upload can be skipped when
+    // nothing changed.
+    std::vector<std::uint32_t> selection_flags_;
+    bool selection_dirty_ = false;
+    // Which manipulator is active. Stored as int to keep ImGuizmo's enum out
+    // of this header; application.cpp casts it back.
+    // ImGuizmo::TRANSLATE, assigned in the constructor body so the enum stays
+    // out of this header.
+    int gizmo_operation_ = 0;
+    bool gizmo_local_space_ = false;
+
     FilePicker file_picker_;
     std::optional<FilePicker::Request> pending_load_;
     bool pending_clear_ = false;
@@ -111,12 +168,18 @@ private:
     gpu::Sampler sampler_;
     gpu::TextureRegistry texture_registry_;
     gpu::MaterialRegistry material_registry_;
+    gpu::SelectionBuffer selection_buffer_;
     gpu::Buffer frame_buffer_;
+    // One texel of object id, copied out of id_buffer_ on a pick. Host-cached
+    // rather than write-combined: this one is read, not written.
+    gpu::Buffer pick_buffer_;
     gpu::SceneGraph scene_graph_;
     gpu::Swapchain swapchain_;
     gpu::DepthBuffer depth_buffer_;
+    gpu::IdBuffer id_buffer_;
     gpu::PipelineCache pipeline_cache_;
     gpu::GraphicsPipeline pipeline_;
+    gpu::GraphicsPipeline outline_pipeline_;
     gpu::FramePacer frame_pacer_;
     // Last, so it is destroyed first: its teardown frees Vulkan objects and
     // touches the device, both of which must still be alive.

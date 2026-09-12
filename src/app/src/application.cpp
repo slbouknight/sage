@@ -4,14 +4,17 @@
 #include <sage/core/math.hpp>
 #include <sage/gpu/geometry_registry.hpp>
 #include <sage/gpu/light.hpp>
+#include <sage/gpu/selection_buffer.hpp>
 #include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
 
+#include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
 // The DockBuilder API is internal and has no public equivalent. Confined to
 // this file, and only for the one-time default layout; everything else uses
 // the public header.
+#include <ImGuizmo.h>
 #include <imgui_internal.h>
 
 #include <algorithm>
@@ -19,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <span>
@@ -33,6 +37,8 @@ const glm::vec3 k_initial_camera_position{2.0F, 1.5F, 3.0F};
 constexpr float k_initial_camera_yaw = -2.16F;    // radians
 constexpr float k_initial_camera_pitch = -0.39F;  // radians
 constexpr float k_field_of_view_degrees = 60.0F;
+constexpr float k_near_plane = 0.1F;
+constexpr float k_far_plane = 1000.0F;
 
 // Radians per pixel of the mouse movement.
 constexpr float k_mouse_sensitivity = 0.003F;
@@ -92,12 +98,30 @@ struct PushConstants {
     VkDeviceAddress frame_address = 0;
     alignas(16) glm::mat4 model{1.0F};
     std::uint32_t material_index = 0;
+    std::uint32_t object_id = 0;
 };
 static_assert(offsetof(PushConstants, vertex_address) == 0);
 static_assert(offsetof(PushConstants, frame_address) == 8);
 static_assert(offsetof(PushConstants, model) == 16);
 static_assert(offsetof(PushConstants, material_index) == 80);
+// Verified against the compiled SPIR-V, which decorates this member Offset 84.
+static_assert(offsetof(PushConstants, object_id) == 84);
 static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
+
+// Must match PushConstants in shaders/outline.slang. The padding is not
+// cosmetic: Slang aligns an int2 to 8 and a float3 to 16, which is what puts
+// these members where the static_asserts say they are.
+struct OutlinePushConstants {
+    glm::ivec2 viewport_origin{0, 0};
+    glm::ivec2 viewport_size{0, 0};
+    alignas(16) glm::vec3 color{1.0F, 0.55F, 0.12F};
+    std::int32_t thickness = 2;
+};
+static_assert(offsetof(OutlinePushConstants, viewport_origin) == 0);
+static_assert(offsetof(OutlinePushConstants, viewport_size) == 8);
+static_assert(offsetof(OutlinePushConstants, color) == 16);
+static_assert(offsetof(OutlinePushConstants, thickness) == 28);
+static_assert(sizeof(OutlinePushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 constexpr std::uint32_t k_initial_width = 1280;
 constexpr std::uint32_t k_initial_height = 720;
@@ -137,6 +161,9 @@ constexpr float k_left_column_fraction = 0.22F;
 constexpr float k_right_column_fraction = 0.28F;
 // The stats read-out is a handful of lines; the picker below it wants the rest.
 constexpr float k_stats_fraction = 0.35F;
+// The right column is split between the scene tree and the properties of
+// whatever is selected in it.
+constexpr float k_hierarchy_fraction = 0.5F;
 
 // Fraction of the bounding sphere's fitted distance to back off by, so the
 // model does not touch the edges of the view.
@@ -210,21 +237,41 @@ Application::Application(const std::filesystem::path& model_path)
       sampler_(device_),
       texture_registry_(allocator_, device_, uploader_, bindless_set_, sampler_),
       material_registry_(allocator_, uploader_, bindless_set_, k_max_materials),
+      selection_buffer_(allocator_, uploader_, bindless_set_),
       frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
+      pick_buffer_(allocator_, device_, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   gpu::BufferAccess::host_read),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
       depth_buffer_(allocator_, device_, swapchain_.extent()),
+      id_buffer_(allocator_, device_, swapchain_.extent()),
       pipeline_cache_(device_, pipeline_cache_path()),
       pipeline_(device_,
                 gpu::GraphicsPipelineDesc{
                     .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
                     .color_format = swapchain_.format(),
+                    .id_format = gpu::IdBuffer::format(),
                     .depth_format = depth_buffer_.format(),
                     .set_layout = bindless_set_.layout(),
                     .cache = pipeline_cache_.handle(),
                 }),
+      outline_pipeline_(device_,
+                        gpu::GraphicsPipelineDesc{
+                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "outline.spv",
+                            .color_format = swapchain_.format(),
+                            // No id attachment and no depth: this pass reads
+                            // ids, it does not write them, and a full-screen
+                            // triangle has nothing to be occluded by.
+                            .alpha_blend = true,
+                            .cull_backfaces = false,
+                            .set_layout = bindless_set_.layout(),
+                            .cache = pipeline_cache_.handle(),
+                        }),
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
+    bindless_set_.write_object_id_image(id_buffer_.view());
+    gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
+
     if (model_path.empty()) {
         SAGE_LOG_INFO("No model given; use the Load glTF panel to pick one");
         return;
@@ -268,6 +315,7 @@ void Application::clear_scene() {
     // a submitted draw may still sample.
     device_.wait_idle();
 
+    select(gpu::NodeHandle{});
     scene_graph_.clear();
     geometry_registry_.reset();
     material_registry_.reset();
@@ -296,6 +344,18 @@ void Application::service_pending_load() {
 Application::~Application() {
     // Everything below must outlive in-flight GPU work.
     device_.wait_idle();
+}
+
+Application::CameraMatrices Application::camera_matrices() const {
+    const float aspect = static_cast<float>(viewport_rect_.extent.width) /
+                         static_cast<float>(viewport_rect_.extent.height);
+    const float fov = glm::radians(k_field_of_view_degrees);
+
+    CameraMatrices matrices;
+    matrices.view = camera_.view_matrix();
+    matrices.projection = core::perspective_vk(fov, aspect, k_near_plane, k_far_plane);
+    matrices.projection_gl = core::perspective_gl(fov, aspect, k_near_plane, k_far_plane);
+    return matrices;
 }
 
 void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
@@ -329,7 +389,22 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     to_depth.image = depth_buffer_.image();
     to_depth.subresourceRange = k_depth_range;
 
-    const std::array<VkImageMemoryBarrier2, 2> begin_barriers{to_color, to_depth};
+    // Same shape as the colour barrier: the previous contents are never read,
+    // so UNDEFINED discards them and the clear below writes every texel.
+    VkImageMemoryBarrier2 to_id{};
+    to_id.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_id.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_id.srcAccessMask = VK_ACCESS_2_NONE;
+    to_id.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_id.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_id.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_id.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_id.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_id.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_id.image = id_buffer_.image();
+    to_id.subresourceRange = k_color_range;
+
+    const std::array<VkImageMemoryBarrier2, 3> begin_barriers{to_color, to_depth, to_id};
 
     VkDependencyInfo begin_dependency{};
     begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -354,13 +429,26 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth_attachment.clearValue.depthStencil = {1.0F, 0};
 
+    // Cleared to k_null_id, so every pixel no draw covers reads back as
+    // "nothing here" rather than as whatever the last frame left behind.
+    VkRenderingAttachmentInfo id_attachment{};
+    id_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    id_attachment.imageView = id_buffer_.view();
+    id_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    id_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    id_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    id_attachment.clearValue.color.uint32[0] = gpu::IdBuffer::k_null_id;
+
+    const std::array<VkRenderingAttachmentInfo, 2> color_attachments{color_attachment,
+                                                                     id_attachment};
+
     VkRenderingInfo rendering{};
     rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering.renderArea.offset = {0, 0};
     rendering.renderArea.extent = extent;
     rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(color_attachments.size());
+    rendering.pColorAttachments = color_attachments.data();
     rendering.pDepthAttachment = &depth_attachment;
 
     vkCmdBeginRendering(command_buffer, &rendering);
@@ -385,15 +473,13 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
 
     vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
 
-    const float aspect = viewport.width / viewport.height;
-    const glm::mat4 projection =
-        core::perspective_vk(glm::radians(k_field_of_view_degrees), aspect, 0.1F, 1000.0F);
+    const CameraMatrices matrices = camera_matrices();
 
     // One write per frame, into this frame's own slot. Writing a single shared
     // slot would race the GPU, which may still be reading the previous frame's
     // copy. begin_frame() has already waited out the work that used this slot.
     FrameData frame_data;
-    frame_data.view_projection = projection * camera_.view_matrix();
+    frame_data.view_projection = matrices.projection * matrices.view;
     frame_data.camera_position = camera_.position();
 
     // A scene owned light list arrives with the editor. What's important here
@@ -417,7 +503,8 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     frame_buffer_.write(&frame_data, sizeof(frame_data), frame_offset);
     const VkDeviceAddress frame_address = frame_buffer_.device_address() + frame_offset;
 
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
+    for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
+        const gpu::SceneNode& node = scene_graph_.nodes()[index];
         if (!node.has_mesh) {
             // Pure transform nodes: glTF hierarchy nodes, and the per-load root.
             continue;
@@ -428,6 +515,9 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
         push.frame_address = frame_address;
         push.model = node.world_transform;
         push.material_index = node.material_index;
+        // Offset by one so that k_null_id (0) stays reserved for empty space;
+        // resolve_pick subtracts it back off.
+        push.object_id = index + 1;
         vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
                            &push);
         vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
@@ -436,6 +526,255 @@ void Application::record_scene(VkCommandBuffer command_buffer, VkImage image,
     }
 
     vkCmdEndRendering(command_buffer);
+}
+
+void Application::handle_picking_input() {
+    // A panel under the pointer wins, matching the camera's rule -- otherwise
+    // clicking a tree row would also pick whatever is behind the panel.
+    if (gpu::ImGuiLayer::wants_mouse() || !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        return;
+    }
+    // Right button held means the camera is being flown, and a left click then
+    // is part of that gesture rather than a selection.
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+        return;
+    }
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
+        return;
+    }
+
+    // ImGui reports logical coordinates; the id attachment is framebuffer
+    // pixels. Same conversion as central_node_rect, for the same reason.
+    const VkExtent2D extent = id_buffer_.extent();
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const float x =
+        (mouse.x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
+    const float y =
+        (mouse.y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
+
+    const auto texel_x = static_cast<std::int32_t>(x);
+    const auto texel_y = static_cast<std::int32_t>(y);
+
+    // Outside the 3D view is not a miss, it is not a pick at all -- clicking
+    // the dockspace border should leave the selection alone.
+    const VkRect2D& rect = viewport_rect_;
+    if (texel_x < rect.offset.x || texel_y < rect.offset.y ||
+        texel_x >= rect.offset.x + static_cast<std::int32_t>(rect.extent.width) ||
+        texel_y >= rect.offset.y + static_cast<std::int32_t>(rect.extent.height)) {
+        return;
+    }
+
+    pending_pick_ = VkOffset2D{texel_x, texel_y};
+}
+
+void Application::handle_gizmo_keys() {
+    // Gated on the camera not being flown: W/E/R are also part of WASD, and
+    // holding the right button means the keys belong to the camera.
+    if (gpu::ImGuiLayer::wants_keyboard() || ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_W)) {
+        gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_E)) {
+        gizmo_operation_ = static_cast<int>(ImGuizmo::ROTATE);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+        gizmo_operation_ = static_cast<int>(ImGuizmo::SCALE);
+    }
+}
+
+void Application::select(gpu::NodeHandle node) {
+    if (node == selected_) {
+        return;
+    }
+    selected_ = node;
+    selection_dirty_ = true;
+}
+
+void Application::service_selection() {
+    if (!selection_dirty_) {
+        return;
+    }
+    selection_dirty_ = false;
+
+    scene_graph_.mark_subtree(selected_, selection_flags_);
+    selection_buffer_.update(selection_flags_);
+}
+
+void Application::record_outline(VkCommandBuffer command_buffer, VkImageView image_view) const {
+    // Unconditional, even with nothing selected: the barrier below is what
+    // leaves the id image in the layout record_pick_copy expects, so skipping
+    // the pass would make that layout depend on the selection.
+    VkImageMemoryBarrier2 to_read{};
+    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_read.image = id_buffer_.image();
+    to_read.subresourceRange = k_color_range;
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &to_read;
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+
+    if (!selected_.valid()) {
+        return;
+    }
+
+    // LOAD, not CLEAR: the shaded scene is already here and the outline is
+    // drawn over it.
+    VkRenderingAttachmentInfo color_attachment{};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = image_view;
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.offset = viewport_rect_.offset;
+    rendering.renderArea.extent = viewport_rect_.extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color_attachment;
+
+    vkCmdBeginRendering(command_buffer, &rendering);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_pipeline_.handle());
+
+    const VkDescriptorSet descriptor_set = bindless_set_.handle();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            outline_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
+
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(viewport_rect_.offset.x);
+    viewport.y = static_cast<float>(viewport_rect_.offset.y);
+    viewport.width = static_cast<float>(viewport_rect_.extent.width);
+    viewport.height = static_cast<float>(viewport_rect_.extent.height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
+
+    OutlinePushConstants push{};
+    push.viewport_origin = {viewport_rect_.offset.x, viewport_rect_.offset.y};
+    push.viewport_size = {static_cast<std::int32_t>(viewport_rect_.extent.width),
+                          static_cast<std::int32_t>(viewport_rect_.extent.height)};
+    vkCmdPushConstants(command_buffer, outline_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
+                       sizeof(push), &push);
+
+    // Three vertices, no buffers: the vertex shader builds a full-screen
+    // triangle from SV_VertexID.
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    vkCmdEndRendering(command_buffer);
+}
+
+void Application::record_pick_copy(VkCommandBuffer command_buffer) const {
+    if (!pending_pick_.has_value()) {
+        return;
+    }
+
+    VkImageMemoryBarrier2 to_transfer_src{};
+    to_transfer_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    // SHADER_READ_ONLY, not COLOR_ATTACHMENT: record_outline has already moved
+    // the image there. Ordering the two passes rather than making each one
+    // handle both cases keeps a single source layout per barrier.
+    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    to_transfer_src.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    to_transfer_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_transfer_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_transfer_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_src.image = id_buffer_.image();
+    to_transfer_src.subresourceRange = k_color_range;
+
+    VkDependencyInfo to_transfer_dependency{};
+    to_transfer_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    to_transfer_dependency.imageMemoryBarrierCount = 1;
+    to_transfer_dependency.pImageMemoryBarriers = &to_transfer_src;
+    vkCmdPipelineBarrier2(command_buffer, &to_transfer_dependency);
+
+    // One texel. The whole point of an id attachment over a CPU-side raycast is
+    // that the answer is already rendered; reading more of it would be waste.
+    VkBufferImageCopy2 region{};
+    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {pending_pick_->x, pending_pick_->y, 0};
+    region.imageExtent = {1, 1, 1};
+
+    VkCopyImageToBufferInfo2 copy{};
+    copy.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+    copy.srcImage = id_buffer_.image();
+    copy.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    copy.dstBuffer = pick_buffer_.handle();
+    copy.regionCount = 1;
+    copy.pRegions = &region;
+    vkCmdCopyImageToBuffer2(command_buffer, &copy);
+
+    // Waiting on the submission alone does not make the copy visible to the
+    // host; the HOST stage has to be named as a destination for that.
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = pick_buffer_.handle();
+    to_host.offset = 0;
+    to_host.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo to_host_dependency{};
+    to_host_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    to_host_dependency.bufferMemoryBarrierCount = 1;
+    to_host_dependency.pBufferMemoryBarriers = &to_host;
+    vkCmdPipelineBarrier2(command_buffer, &to_host_dependency);
+}
+
+void Application::resolve_pick() {
+    if (!pending_pick_.has_value()) {
+        return;
+    }
+    pending_pick_.reset();
+
+    // The copy is in a submission that has to have completed before the mapping
+    // holds this frame's value. Blocking is deliberate: it costs a stall on the
+    // frame a click happens, where the alternative -- reading a slot two frames
+    // old -- would hand back whatever was under the cursor before the click.
+    frame_pacer_.wait_all();
+
+    std::uint32_t id = gpu::IdBuffer::k_null_id;
+    pick_buffer_.read(&id, sizeof(id));
+
+    // Promoted to the root of whatever was hit. Clicking a mesh selects the
+    // object it belongs to, not the individual submesh -- which is what makes
+    // a loaded file behave as one thing to move, and what the properties panel
+    // will want to describe.
+    const gpu::NodeHandle hit =
+        id == gpu::IdBuffer::k_null_id ? gpu::NodeHandle{} : scene_graph_.handle_at(id - 1);
+    select(scene_graph_.root_of(hit));
+
+    if (const gpu::SceneNode* node = scene_graph_.find(selected_); node != nullptr) {
+        SAGE_LOG_INFO("Selected '{}'", node->name);
+    } else {
+        SAGE_LOG_INFO("Selection cleared");
+    }
 }
 
 void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage image) {
@@ -497,7 +836,13 @@ void Application::draw_dockspace() {
 
     ImGui::DockBuilderDockWindow("sage", left_top);
     ImGui::DockBuilderDockWindow("Load glTF", left_bottom);
-    ImGui::DockBuilderDockWindow("Hierarchy", right);
+    ImGuiID right_top = 0;
+    ImGuiID right_bottom = 0;
+    ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, k_hierarchy_fraction, &right_top,
+                                &right_bottom);
+
+    ImGui::DockBuilderDockWindow("Hierarchy", right_top);
+    ImGui::DockBuilderDockWindow("Properties", right_bottom);
     ImGui::DockBuilderFinish(dockspace);
 
     // The split above changed the central node, so the rect taken before it is
@@ -518,6 +863,8 @@ void Application::draw_ui() {
                 static_cast<unsigned long long>(geometry_registry_.capacity() / 1024));
     ImGui::Text("Materials: %u / %u", material_registry_.count(), material_registry_.capacity());
     ImGui::Text("Textures: %u", texture_registry_.count());
+    const gpu::SceneNode* selected = scene_graph_.find(selected_);
+    ImGui::Text("Selected: %s", selected != nullptr ? selected->name.c_str() : "(none)");
     const glm::vec3 position = camera_.position();
     ImGui::Text("Camera: %.1f, %.1f, %.1f", static_cast<double>(position.x),
                 static_cast<double>(position.y), static_cast<double>(position.z));
@@ -534,6 +881,122 @@ void Application::draw_ui() {
         // not something to do with a frame half-recorded.
         pending_clear_ = true;
     }
+}
+
+void Application::draw_properties_panel() {
+    ImGui::Begin("Properties");
+
+    const gpu::SceneNode* node = scene_graph_.find(selected_);
+    if (node == nullptr) {
+        ImGui::TextDisabled("Nothing selected.");
+        ImGui::TextDisabled("Click an object, or a row in the Hierarchy.");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("%s", node->name.c_str());
+    ImGui::Separator();
+
+    // Decomposed with ImGuizmo's own helper rather than glm's, so the numbers
+    // shown here and the numbers a drag produces come from the same code. Two
+    // decompositions that disagree on, say, euler order would make the panel
+    // jitter while dragging.
+    glm::mat4 local = node->local_transform;
+    glm::vec3 translation{0.0F};
+    glm::vec3 rotation{0.0F};
+    glm::vec3 scale{1.0F};
+    ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(local), glm::value_ptr(translation),
+                                          glm::value_ptr(rotation), glm::value_ptr(scale));
+
+    bool edited = false;
+    edited |= ImGui::DragFloat3("Position", glm::value_ptr(translation), 0.01F);
+    edited |= ImGui::DragFloat3("Rotation", glm::value_ptr(rotation), 0.5F);
+    edited |= ImGui::DragFloat3("Scale", glm::value_ptr(scale), 0.01F);
+
+    if (edited) {
+        // A zero on any axis makes the matrix singular, which the next
+        // decomposition cannot undo -- the node would be stuck flat.
+        scale = glm::max(scale, glm::vec3(1e-4F));
+        ImGuizmo::RecomposeMatrixFromComponents(glm::value_ptr(translation),
+                                                glm::value_ptr(rotation), glm::value_ptr(scale),
+                                                glm::value_ptr(local));
+        scene_graph_.set_local_transform(selected_, local);
+        scene_graph_.update_transforms();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Mesh: %s", node->has_mesh ? "yes" : "no");
+    if (node->has_mesh) {
+        ImGui::Text("Indices: %u", node->mesh.index_count);
+        ImGui::Text("Material: %u", node->material_index);
+    }
+
+    ImGui::Separator();
+    // Radio buttons rather than a combo: three options that change with one
+    // click, and the keyboard shortcuts below mirror them.
+    int operation = gizmo_operation_;
+    ImGui::TextUnformatted("Gizmo");
+    ImGui::RadioButton("Move (W)", &operation, static_cast<int>(ImGuizmo::TRANSLATE));
+    ImGui::SameLine();
+    ImGui::RadioButton("Rotate (E)", &operation, static_cast<int>(ImGuizmo::ROTATE));
+    ImGui::SameLine();
+    ImGui::RadioButton("Scale (R)", &operation, static_cast<int>(ImGuizmo::SCALE));
+    gizmo_operation_ = operation;
+
+    // Scale is always along the object's own axes; offering a world-space
+    // scale would just be a lie about what the gizmo does.
+    if (gizmo_operation_ != static_cast<int>(ImGuizmo::SCALE)) {
+        ImGui::Checkbox("Local space", &gizmo_local_space_);
+    }
+
+    ImGui::End();
+}
+
+bool Application::draw_gizmo() {
+    const gpu::SceneNode* node = scene_graph_.find(selected_);
+    if (node == nullptr) {
+        return false;
+    }
+
+    ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
+    ImGuizmo::SetOrthographic(false);
+
+    // ImGui's logical coordinates, not framebuffer pixels: the gizmo is drawn
+    // through ImGui's draw list, which works in the same space the mouse does.
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const VkExtent2D extent = swapchain_.extent();
+    const float to_logical_x = viewport->Size.x / static_cast<float>(extent.width);
+    const float to_logical_y = viewport->Size.y / static_cast<float>(extent.height);
+    ImGuizmo::SetRect(viewport->Pos.x + static_cast<float>(viewport_rect_.offset.x) * to_logical_x,
+                      viewport->Pos.y + static_cast<float>(viewport_rect_.offset.y) * to_logical_y,
+                      static_cast<float>(viewport_rect_.extent.width) * to_logical_x,
+                      static_cast<float>(viewport_rect_.extent.height) * to_logical_y);
+
+    const CameraMatrices matrices = camera_matrices();
+
+    // The gizmo manipulates a world transform, which is what makes dragging a
+    // child behave the way the screen suggests rather than in its parent's
+    // rotated frame.
+    glm::mat4 world = node->world_transform;
+
+    const bool changed = ImGuizmo::Manipulate(
+        glm::value_ptr(matrices.view), glm::value_ptr(matrices.projection_gl),
+        static_cast<ImGuizmo::OPERATION>(gizmo_operation_),
+        gizmo_local_space_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD, glm::value_ptr(world));
+
+    if (changed) {
+        // Back out of world space into the parent's. The parent's world
+        // transform is already final this frame -- parents precede children --
+        // so no re-composition is needed before inverting it.
+        glm::mat4 parent_world{1.0F};
+        if (const gpu::SceneNode* parent = scene_graph_.find(node->parent); parent != nullptr) {
+            parent_world = parent->world_transform;
+        }
+        scene_graph_.set_local_transform(selected_, glm::inverse(parent_world) * world);
+        scene_graph_.update_transforms();
+    }
+
+    return ImGuizmo::IsUsing();
 }
 
 void Application::draw_hierarchy_panel() {
@@ -573,6 +1036,11 @@ void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& chi
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
                                ImGuiTreeNodeFlags_DefaultOpen;
+    // Compared by handle rather than index: a stale handle from before a scene
+    // reload must not light up whatever now occupies that slot.
+    if (selected_.valid() && scene_graph_.handle_at(index) == selected_) {
+        flags |= ImGuiTreeNodeFlags_Selected;
+    }
     if (children[index].empty()) {
         // A leaf gets no arrow, and NoTreePushOnOpen means it must not be
         // popped -- which is why the TreePop below is guarded on having
@@ -585,6 +1053,13 @@ void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& chi
     // distinct without having to build unique label strings.
     ImGui::PushID(static_cast<int>(index));
     const bool open = ImGui::TreeNodeEx(node.name.c_str(), flags);
+
+    // Not promoted to the root, unlike a viewport click: the panel exists to
+    // reach a specific node, so clicking a child selects that child and
+    // outlines its own subtree.
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+        select(scene_graph_.handle_at(index));
+    }
 
     if (node.has_mesh) {
         ImGui::SameLine();
@@ -607,6 +1082,11 @@ bool Application::recreate_swapchain() {
     }
     swapchain_.recreate(extent);
     depth_buffer_.recreate(swapchain_.extent());
+    id_buffer_.recreate(swapchain_.extent());
+    // The old view is gone, so the descriptor naming it has to be rewritten.
+    bindless_set_.write_object_id_image(id_buffer_.view());
+    // A pick names a texel in an image that no longer exists.
+    pending_pick_.reset();
     return true;
 }
 
@@ -659,6 +1139,7 @@ void Application::run() {
         // and no ImGui frame is open, so a wait_idle and a blocking upload here
         // disturb nothing. Costs the picker one frame of latency.
         service_pending_load();
+        service_selection();
 
         const auto now = std::chrono::steady_clock::now();
         const float delta_seconds = std::chrono::duration<float>(now - last_frame_time).count();
@@ -704,6 +1185,9 @@ void Application::run() {
         // out-of-date path above bails without rendering, and an unterminated
         // ImGui frame would trip the next NewFrame().
         gpu::ImGuiLayer::begin_frame();
+        // After ImGui::NewFrame and before anything queries the gizmo: it
+        // caches per-frame state of its own.
+        ImGuizmo::BeginFrame();
         // First, so the panels below have a dockspace to place themselves in.
         draw_dockspace();
 
@@ -714,17 +1198,36 @@ void Application::run() {
             pending_frame_.reset();
         }
 
+        handle_gizmo_keys();
+
+        // Before picking: a drag that ends over a different object must not
+        // also reselect it, and ImGuizmo only reports IsUsing() once drawn.
+        const bool gizmo_active = draw_gizmo();
+
+        // After draw_dockspace, which refreshes viewport_rect_, and before the
+        // panels, so a click is tested against this frame's layout.
+        if (!gizmo_active) {
+            handle_picking_input();
+        }
+
         draw_ui();
         draw_hierarchy_panel();
+        draw_properties_panel();
 
         record_scene(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index),
                      swapchain_.extent(), frame.slot);
+        record_outline(frame.command_buffer, swapchain_.image_view(acquired.index));
+        record_pick_copy(frame.command_buffer);
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
                       swapchain_.extent());
         transition_to_present(frame.command_buffer, acquired.image);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
+
+        // After submit, so the copy has been handed to the GPU; resolve_pick
+        // waits for it before touching the mapping.
+        resolve_pick();
 
         const VkResult present_result = swapchain_.present(device_.present_queue(), acquired.index);
         if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR ||

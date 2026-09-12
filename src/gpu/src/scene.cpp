@@ -41,6 +41,43 @@ const SceneNode* SceneGraph::find(NodeHandle node) const {
     return is_live(node) ? &nodes_[node.index()] : nullptr;
 }
 
+NodeHandle SceneGraph::handle_at(std::size_t index) const {
+    if (index >= nodes_.size()) {
+        return {};
+    }
+    return NodeHandle{static_cast<NodeHandle::Index>(index), generations_[index]};
+}
+
+NodeHandle SceneGraph::root_of(NodeHandle node) const {
+    if (!is_live(node)) {
+        return {};
+    }
+
+    NodeHandle current = node;
+    // Terminates because a parent always sits at a lower index, so the walk
+    // strictly decreases and cannot cycle.
+    while (nodes_[current.index()].parent.valid()) {
+        current = nodes_[current.index()].parent;
+    }
+    return current;
+}
+
+void SceneGraph::mark_subtree(NodeHandle node, std::vector<std::uint32_t>& flags) const {
+    flags.assign(nodes_.size(), 0U);
+    if (!is_live(node)) {
+        return;
+    }
+
+    flags[node.index()] = 1U;
+    // Starting past the selected node: nothing before it can be beneath it.
+    for (std::size_t i = node.index() + 1; i < nodes_.size(); ++i) {
+        const NodeHandle parent = nodes_[i].parent;
+        if (parent.valid() && flags[parent.index()] != 0U) {
+            flags[i] = 1U;
+        }
+    }
+}
+
 SceneNode* SceneGraph::mutable_find(NodeHandle node) {
     return is_live(node) ? &nodes_[node.index()] : nullptr;
 }

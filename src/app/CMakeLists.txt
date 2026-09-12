@@ -1,4 +1,5 @@
 find_package(imgui CONFIG REQUIRED)
+find_package(imguizmo CONFIG REQUIRED)
 
 add_executable(sage_app
     src/application.cpp
@@ -17,6 +18,7 @@ target_link_libraries(sage_app PRIVATE
     sage::core
     sage::gpu
     imgui::imgui
+    imguizmo::imguizmo
 )
 
 add_dependencies(sage_app sage_shaders)

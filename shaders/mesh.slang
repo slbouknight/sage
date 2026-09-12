@@ -56,6 +56,9 @@ struct PushConstants
     FrameData* frame;
     float4x4 model;
     uint material_index;
+    // Node index + 1, written to the object-id attachment. Zero is reserved
+    // for "nothing here", which is what the attachment clears to.
+    uint object_id;
 };
 
 [vk::push_constant]
@@ -191,8 +194,16 @@ float3 apply_normal_map(float3 world_normal, float4 world_tangent, uint normal_t
     return normalize(sampled.x * t + sampled.y * b + sampled.z * n);
 }
 
+// Two render targets: shaded colour, and the object id that lets the cursor
+// and the outline pass work out what a pixel belongs to.
+struct FragmentOutput
+{
+    float4 color : SV_Target0;
+    uint object_id : SV_Target1;
+};
+
 [shader("fragment")]
-float4 fragment_main(VertexOutput input) : SV_Target
+FragmentOutput fragment_main(VertexOutput input)
 {
     const Material material = materials[k_material_buffer_slot][pc.material_index];
     const float4 base_color = textures[material.base_color_texture].Sample(input.uv) * material.base_color_factor;
@@ -252,5 +263,8 @@ float4 fragment_main(VertexOutput input) : SV_Target
         textures[material.emissive_texture].Sample(input.uv).rgb * material.emissive_factor;
     lit += emissive;
 
-    return float4(lit, base_color.a);
+    FragmentOutput output;
+    output.color = float4(lit, base_color.a);
+    output.object_id = pc.object_id;
+    return output;
 }

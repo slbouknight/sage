@@ -72,9 +72,38 @@ BufferAllocation Allocator::create_device_local_buffer(VkDeviceSize size,
     return result;
 }
 
+BufferAllocation Allocator::create_readback_buffer(VkDeviceSize size,
+                                                   VkBufferUsageFlags usage) const {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    // HOST_ACCESS_RANDOM rather than SEQUENTIAL_WRITE: the difference is which
+    // memory type VMA picks. Sequential-write permits uncached write-combined
+    // memory, where host reads go uncached over the bus one access at a time.
+    alloc_info.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    BufferAllocation result;
+    VmaAllocationInfo info{};
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &result.buffer,
+                             &result.allocation, &info));
+    result.mapped = info.pMappedData;
+    return result;
+}
+
 void Allocator::flush(const BufferAllocation& allocation, VkDeviceSize size,
                       VkDeviceSize offset) const {
     VK_CHECK(vmaFlushAllocation(allocator_, allocation.allocation, offset, size));
+}
+
+void Allocator::invalidate(const BufferAllocation& allocation, VkDeviceSize size,
+                           VkDeviceSize offset) const {
+    VK_CHECK(vmaInvalidateAllocation(allocator_, allocation.allocation, offset, size));
 }
 
 void Allocator::destroy_buffer(const BufferAllocation& allocation) const {

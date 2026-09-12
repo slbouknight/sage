@@ -17,6 +17,13 @@ public:
     // Binding numbers, as seen by shader source.
     static constexpr std::uint32_t k_storage_buffer_binding = 0;
     static constexpr std::uint32_t k_sampled_image_binding = 1;
+    // The object-id attachment, read by the outline pass. Separate from the
+    // array above because its sampled type is uint, not float: a shader's
+    // declared type must match the format's numeric type, so it cannot share a
+    // binding with the colour textures. Read with Load() rather than a sampler,
+    // which is why this is SAMPLED_IMAGE and not COMBINED_IMAGE_SAMPLER --
+    // integer formats support no filtering, so there is nothing for one to do.
+    static constexpr std::uint32_t k_object_id_binding = 2;
 
     // Array capacities. Far below what target hardware (RTX 5070) allows
     // (~1M update-after-bind descriptors); raise when something needs it
@@ -42,6 +49,11 @@ public:
     // SHADER_READ_ONLY_OPTIMAL by the time a shader samples it. The descriptor records
     // that layout but nothing verifies it.
     void write_sampled_image(std::uint32_t index, VkImageView view, VkSampler sampler) const;
+
+    // Registers the object-id attachment. Rewritten whenever the image is
+    // recreated, which is every swapchain resize. Expects the image to be in
+    // SHADER_READ_ONLY_OPTIMAL by the time a shader reads it.
+    void write_object_id_image(VkImageView view) const;
 
 private:
     const Device& device_;

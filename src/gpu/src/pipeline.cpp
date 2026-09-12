@@ -57,7 +57,7 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     raster.depthClampEnable = VK_FALSE;
     raster.rasterizerDiscardEnable = VK_FALSE;
     raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_BACK_BIT;
+    raster.cullMode = desc.cull_backfaces ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.depthBiasEnable = VK_FALSE;
     raster.lineWidth = 1.0F;
@@ -67,26 +67,48 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     multisample.sampleShadingEnable = VK_FALSE;
 
+    const bool has_depth = desc.depth_format != VK_FORMAT_UNDEFINED;
+
     VkPipelineDepthStencilStateCreateInfo depth_stencil{};
     depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth_stencil.depthTestEnable = VK_TRUE;
-    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthTestEnable = has_depth ? VK_TRUE : VK_FALSE;
+    depth_stencil.depthWriteEnable = has_depth ? VK_TRUE : VK_FALSE;
     depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
     depth_stencil.depthBoundsTestEnable = VK_FALSE;
     depth_stencil.stencilTestEnable = VK_FALSE;
     depth_stencil.minDepthBounds = 0.0F;
     depth_stencil.maxDepthBounds = 1.0F;
 
+    const bool writes_ids = desc.id_format != VK_FORMAT_UNDEFINED;
+
+    // One entry per colour attachment -- the count must match
+    // colorAttachmentCount exactly, independently of whether blending is on.
+    //
+    // Both entries are identical on purpose. Without the independentBlend
+    // device feature, every attachment's blend state must match element for
+    // element, and validation rejects the pipeline if they differ. Writing
+    // RGBA at a single-component R32_UINT target is harmless -- mask bits for
+    // components the format does not have are ignored -- so matching costs
+    // nothing, where narrowing the id's mask to R would have cost a device
+    // feature request for no benefit.
     VkPipelineColorBlendAttachmentState blend_attachment{};
-    blend_attachment.blendEnable = VK_FALSE;
+    blend_attachment.blendEnable = desc.alpha_blend ? VK_TRUE : VK_FALSE;
+    blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
     blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    const std::array<VkPipelineColorBlendAttachmentState, 2> blend_attachments{blend_attachment,
+                                                                               blend_attachment};
 
     VkPipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     color_blend.logicOpEnable = VK_FALSE;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &blend_attachment;
+    color_blend.attachmentCount = writes_ids ? 2U : 1U;
+    color_blend.pAttachments = blend_attachments.data();
 
     constexpr std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
                                                            VK_DYNAMIC_STATE_SCISSOR};
@@ -96,10 +118,12 @@ GraphicsPipeline::GraphicsPipeline(const Device& device, const GraphicsPipelineD
     dynamic_state.pDynamicStates = dynamic_states.data();
 
     // This is what stands in for a VkRenderPass.
+    const std::array<VkFormat, 2> color_formats{desc.color_format, desc.id_format};
+
     VkPipelineRenderingCreateInfo rendering_info{};
     rendering_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    rendering_info.colorAttachmentCount = 1;
-    rendering_info.pColorAttachmentFormats = &desc.color_format;
+    rendering_info.colorAttachmentCount = writes_ids ? 2U : 1U;
+    rendering_info.pColorAttachmentFormats = color_formats.data();
     rendering_info.depthAttachmentFormat = desc.depth_format;
 
     VkGraphicsPipelineCreateInfo pipeline_info{};

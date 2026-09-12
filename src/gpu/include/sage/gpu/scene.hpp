@@ -57,6 +57,25 @@ public:
     // Null when the handle is stale or was never valid.
     [[nodiscard]] const SceneNode* find(NodeHandle node) const;
 
+    // The handle naming the node at `index`, or a default handle when the
+    // index is out of range. This is the inverse of nodes()[i] and exists for
+    // object-ID picking: the GPU can only hand back an index, and a raw index
+    // is worthless a scene-clear later. Converting it here, while the index is
+    // still fresh, gives a handle whose generation catches exactly that.
+    [[nodiscard]] NodeHandle handle_at(std::size_t index) const;
+
+    // The topmost ancestor of `node`, or `node` itself when it is already a
+    // root. Clicking a mesh in the viewport selects this rather than the mesh,
+    // which is what makes a loaded file behave as one object to drag around.
+    // A stale or invalid handle returns a default handle.
+    [[nodiscard]] NodeHandle root_of(NodeHandle node) const;
+
+    // Writes 1 for `node` and every node beneath it, 0 elsewhere. One forward
+    // pass, for the same reason update_transforms() is one: a parent's answer
+    // is always settled before its children are reached. `flags` is resized to
+    // size(). An invalid handle clears every flag.
+    void mark_subtree(NodeHandle node, std::vector<std::uint32_t>& flags) const;
+
     // Recomposes every world transform. Call after changing any local transform.
     void update_transforms();
 
