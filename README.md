@@ -65,7 +65,7 @@ delete it, and undo any of that.
 
 Selecting, moving and deleting objects with the gizmo:
 
-<video src="https://github.com/slbouknight/sage/raw/main/docs/videos/sageDemo.mp4" controls muted width="900"></video>
+https://github.com/user-attachments/assets/ff39acc8-c1d0-4e3a-afad-71a0138b8834
 
 ### Anti-aliasing
 
