@@ -1,5 +1,8 @@
 #pragma once
 
+#include <sage/app/edit_history.hpp>
+#include <sage/app/scene_query.hpp>
+#include <sage/app/viewport_mapping.hpp>
 #include <sage/core/camera.hpp>
 #include <sage/gpu/allocator.hpp>
 #include <sage/gpu/bindless_set.hpp>
@@ -133,6 +136,10 @@ private:
     // or nothing when it falls outside the 3D view. Shared by picking and by
     // the context menu, which need the identical test.
     [[nodiscard]] std::optional<VkOffset2D> viewport_texel(float window_x, float window_y) const;
+    // The 3D view's placement, read from ImGui and the swapchain. The one
+    // place that reaches for ImGui's viewport; everything downstream works on
+    // the plain values.
+    [[nodiscard]] ViewportMapping view_mapping() const;
     // W/E/R switch the manipulator, as in Unreal and Blender.
     void handle_gizmo_keys();
     // Copies the picked texel out of the id attachment. Recorded after the
@@ -206,21 +213,8 @@ private:
     // queued: nothing is freed, so no in-flight command buffer is invalidated.
     void delete_selected();
 
-    // One reversible edit.
-    //
-    // Closures rather than a variant of command types: every operation here is
-    // a handful of captured values and two calls into the scene graph, and a
-    // class hierarchy for that would be more machinery than the thing it
-    // describes. They capture by value and `this`, which outlives the stack.
-    struct Command {
-        std::string name;
-        std::function<void()> undo;
-        std::function<void()> redo;
-    };
-    // Pushes a command, discarding anything that had been undone past the
-    // cursor -- the usual rule: a new edit after an undo forks the history and
-    // the abandoned branch goes.
-    // Records an addition, which undo tombstones and redo restores.
+    // Records an addition, which undo tombstones and redo restores. The
+    // closures capture by value and `this`, which outlives them.
     void push_add_command(std::string name, gpu::NodeHandle added,
                           gpu::NodeHandle previous_selection);
     // Closes a transform drag, pushing one command for the whole gesture.
@@ -229,19 +223,11 @@ private:
     void commit_light_edit();
     void push_light_command(std::string name, gpu::NodeHandle node, const gpu::SceneLight& before,
                             const gpu::SceneLight& after);
-    void push_command(std::string name, std::function<void()> undo, std::function<void()> redo);
-    void undo();
-    void redo();
-    [[nodiscard]] bool can_undo() const { return undo_cursor_ > 0; }
-    [[nodiscard]] bool can_redo() const { return undo_cursor_ < undo_stack_.size(); }
-    // Drops the history. Called when the registries rewind, which is the one
-    // thing here that genuinely cannot be reversed.
+    // Drops the history and any edit mid-gesture. Called when the registries
+    // rewind, which is the one thing here that genuinely cannot be reversed.
     void clear_history();
 
-    std::vector<Command> undo_stack_;
-    // How many commands are currently applied. Undo steps it back, redo
-    // forward; everything at or past it has been undone.
-    std::size_t undo_cursor_ = 0;
+    EditHistory history_;
 
     // A transform edit in progress, and the value it started from. Both the
     // gizmo and the Properties drags run across many frames, so the command is
@@ -269,33 +255,10 @@ private:
     void draw_hierarchy_node(std::uint32_t index, const ChildTable& children);
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
-    struct Bounds {
-        glm::vec3 min{0.0F};
-        glm::vec3 max{0.0F};
-        [[nodiscard]] bool empty() const { return min.x > max.x; }
-    };
-    // World-space AABB over every mesh currently in the graph, recomputed from
-    // live world transforms rather than remembered from load time -- otherwise
-    // moving a node with the gizmo would leave the shadow frustum behind.
-    [[nodiscard]] Bounds scene_bounds() const;
+    // Bounds, LightFit and the functions over them live in scene_query.hpp:
+    // they are arithmetic over the graph, and were only members because
+    // everything here was.
 
-    struct LightFit {
-        glm::mat4 view_projection{1.0F};
-        // How much world space one shadow-map texel covers. The unit the
-        // normal-offset bias is expressed in, so that it means the same thing
-        // whatever the scene's scale.
-        float world_texel_size = 0.0F;
-    };
-    // An orthographic light-space matrix fitted to `bounds`. A directional
-    // light has no position, so the frustum is placed by the scene rather than
-    // by the light: it is centred on the bounds and pulled back far enough
-    // along the light direction to enclose them.
-    [[nodiscard]] LightFit fit_light(const Bounds& bounds, const glm::vec3& light_direction) const;
-
-    // Fills the frame's light array from the graph, returning how many were
-    // written. Lights past the shader's fixed capacity are dropped.
-    [[nodiscard]] std::uint32_t collect_lights(
-        std::array<gpu::Light, gpu::k_max_lights>& lights) const;
     // The light the shadow map is fitted to: the first directional one in the
     // graph, which is also the one the shader shadows. Invalid when there is
     // none, in which case nothing casts.

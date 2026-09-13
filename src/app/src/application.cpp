@@ -263,10 +263,6 @@ constexpr float k_right_column_fraction = 0.22F;
 constexpr float k_overlay_margin = 12.0F;
 constexpr float k_overlay_alpha = 0.55F;
 
-// Edits kept on the undo stack. Deep enough that no realistic session runs
-// off the end, shallow enough that the closures cannot accumulate unboundedly.
-constexpr std::size_t k_max_undo_depth = 128;
-
 // Menu content has no panel to stretch into, so widgets that would otherwise
 // fill the available width need one given to them.
 constexpr float k_menu_item_width = 220.0F;
@@ -639,40 +635,6 @@ Application::CameraMatrices Application::camera_matrices() const {
     return matrices;
 }
 
-std::uint32_t Application::collect_lights(std::array<gpu::Light, gpu::k_max_lights>& lights) const {
-    std::uint32_t count = 0;
-
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.alive || !node.has_light) {
-            continue;
-        }
-        if (count >= gpu::k_max_lights) {
-            // Dropped rather than grown: the frame buffer's light array is a
-            // fixed size the shader also declares, so the limit is a layout
-            // fact rather than a policy this function can bend.
-            break;
-        }
-
-        gpu::Light& light = lights[count];
-        light.type = node.light.type;
-        light.color = node.light.color;
-        light.intensity = node.light.intensity;
-        light.range = node.light.range;
-        // Both derived from the transform, which is what makes the gizmo work
-        // on a light at all.
-        light.position = glm::vec3(node.world_transform[3]);
-        // -Y is the canonical direction, so an unrotated light points down and
-        // the rotate gizmo tilts it from there. Normalised because a scaled
-        // node would otherwise hand the shader a non-unit direction, which the
-        // BRDF has no way to notice and every dot product would be wrong by.
-        const glm::vec3 down = glm::mat3(node.world_transform) * glm::vec3(0.0F, -1.0F, 0.0F);
-        const float length = glm::length(down);
-        light.direction = length > 1e-6F ? down / length : glm::vec3(0.0F, -1.0F, 0.0F);
-        ++count;
-    }
-    return count;
-}
-
 gpu::NodeHandle Application::first_directional_light() const {
     for (std::size_t i = 0; i < scene_graph_.nodes().size(); ++i) {
         const gpu::SceneNode& node = scene_graph_.nodes()[i];
@@ -681,81 +643,6 @@ gpu::NodeHandle Application::first_directional_light() const {
         }
     }
     return gpu::NodeHandle{};
-}
-
-Application::Bounds Application::scene_bounds() const {
-    Bounds bounds{glm::vec3(std::numeric_limits<float>::max()),
-                  glm::vec3(std::numeric_limits<float>::lowest())};
-
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        // editor_only excluded as well as mesh-less. A light icon is not scene
-        // content, and counting it here would cost three separate things: the
-        // shadow frustum would stretch to cover a marker floating above the
-        // subject and spend its resolution on empty air, a new primitive would
-        // be sized against a scene the markers made bigger, and repositioning
-        // the default light would move the very icon that set the bounds it
-        // was positioned from.
-        if (!node.alive || !node.has_mesh || node.editor_only) {
-            continue;
-        }
-        const glm::vec3& local_min = node.mesh.bounds_min;
-        const glm::vec3& local_max = node.mesh.bounds_max;
-
-        // All eight corners, not just the two. Transforming min and max alone
-        // is only correct for an axis-aligned transform; under any rotation it
-        // yields a box that does not contain the mesh.
-        for (int corner = 0; corner < 8; ++corner) {
-            const glm::vec3 local{(corner & 1) != 0 ? local_max.x : local_min.x,
-                                  (corner & 2) != 0 ? local_max.y : local_min.y,
-                                  (corner & 4) != 0 ? local_max.z : local_min.z};
-            const glm::vec3 world = glm::vec3(node.world_transform * glm::vec4(local, 1.0F));
-            bounds.min = glm::min(bounds.min, world);
-            bounds.max = glm::max(bounds.max, world);
-        }
-    }
-    return bounds;
-}
-
-Application::LightFit Application::fit_light(const Bounds& bounds,
-                                             const glm::vec3& light_direction) const {
-    if (bounds.empty()) {
-        return {};
-    }
-
-    const glm::vec3 center = (bounds.min + bounds.max) * 0.5F;
-    // The bounding sphere, not the box. A box's extent depends on how it is
-    // turned; fitting the sphere means the frustum stays the same size as the
-    // light swings around, so the shadow's resolution does not change while
-    // the direction slider is dragged.
-    const float radius = glm::length(bounds.max - bounds.min) * 0.5F;
-    // A degenerate scene -- one point, or nothing -- would make a zero-extent
-    // projection and divide by zero.
-    const float extent = std::max(radius, 1e-3F);
-
-    const glm::vec3 direction = glm::normalize(light_direction);
-
-    // Any vector not parallel to the light will do as an up hint; world up
-    // fails exactly when the light points straight down, which is a common
-    // enough setting to handle rather than hope about.
-    const glm::vec3 up =
-        std::abs(direction.y) > 0.99F ? glm::vec3(0.0F, 0.0F, 1.0F) : glm::vec3(0.0F, 1.0F, 0.0F);
-
-    // Pulled back a full diameter beyond the sphere so that geometry behind
-    // the centre still falls inside the near plane and casts.
-    const glm::vec3 eye = center - direction * (extent * 2.0F);
-    const glm::mat4 view = glm::lookAt(eye, center, up);
-
-    // Depth range covers the pull-back plus the far side of the sphere. Kept
-    // tight rather than generous: every unit of depth range spent on empty
-    // space is precision taken from the part that has geometry in it.
-    const glm::mat4 projection =
-        core::ortho_vk(-extent, extent, -extent, extent, 0.0F, extent * 4.0F);
-
-    LightFit fit;
-    fit.view_projection = projection * view;
-    // The frustum spans 2 * extent across `resolution` texels.
-    fit.world_texel_size = (extent * 2.0F) / static_cast<float>(shadow_map_.resolution());
-    return fit;
 }
 
 void Application::write_frame_data(std::uint32_t frame_slot) const {
@@ -771,7 +658,7 @@ void Application::write_frame_data(std::uint32_t frame_slot) const {
     // Gathered from the graph rather than from members. The shader has always
     // read lights as data; what changed is that the data now comes from nodes,
     // so a light can be placed, parented and dragged like anything else.
-    frame_data.light_count = collect_lights(frame_data.lights);
+    frame_data.light_count = collect_lights(scene_graph_, frame_data.lights);
     frame_data.ambient_intensity = ambient_intensity_;
 
     // Refitted every frame from live world transforms. A gizmo drag moves
@@ -786,7 +673,8 @@ void Application::write_frame_data(std::uint32_t frame_slot) const {
         key != nullptr ? glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F))
                        : glm::vec3(0.0F, -1.0F, 0.0F);
 
-    const LightFit fit = fit_light(scene_bounds(), key_direction);
+    const LightFit fit = fit_directional_light(compute_scene_bounds(scene_graph_), key_direction,
+                                               shadow_map_.resolution());
     frame_data.light_view_projection = fit.view_projection;
     // Texels converted to world units here, so the shader stays in world space
     // and the slider keeps meaning the same thing at any scene scale.
@@ -1276,32 +1164,7 @@ void Application::handle_picking_input() {
 }
 
 std::optional<VkOffset2D> Application::viewport_texel(float window_x, float window_y) const {
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
-        return std::nullopt;
-    }
-
-    // ImGui reports logical coordinates; the attachments are framebuffer
-    // pixels. Same conversion as central_node_rect, for the same reason.
-    const VkExtent2D extent = swapchain_.extent();
-    const float x =
-        (window_x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
-    const float y =
-        (window_y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
-
-    const auto texel_x = static_cast<std::int32_t>(x);
-    const auto texel_y = static_cast<std::int32_t>(y);
-
-    // Outside the 3D view is not a miss, it is not a click in it at all --
-    // clicking the dockspace border should leave the selection alone, and
-    // should not offer to add anything either.
-    const VkRect2D& rect = viewport_rect_;
-    if (texel_x < rect.offset.x || texel_y < rect.offset.y ||
-        texel_x >= rect.offset.x + static_cast<std::int32_t>(rect.extent.width) ||
-        texel_y >= rect.offset.y + static_cast<std::int32_t>(rect.extent.height)) {
-        return std::nullopt;
-    }
-    return VkOffset2D{texel_x, texel_y};
+    return view_mapping().texel_at(glm::vec2{window_x, window_y});
 }
 
 void Application::handle_gizmo_keys() {
@@ -1818,14 +1681,14 @@ void Application::draw_menu_bar() {
         // Labelled with what they would actually reverse, so the menu says
         // "Undo Transform" rather than leaving you to remember what you did.
         const std::string undo_label =
-            can_undo() ? "Undo " + undo_stack_[undo_cursor_ - 1].name : std::string("Undo");
+            history_.can_undo() ? "Undo " + std::string(history_.undo_name()) : std::string("Undo");
         const std::string redo_label =
-            can_redo() ? "Redo " + undo_stack_[undo_cursor_].name : std::string("Redo");
-        if (ImGui::MenuItem(undo_label.c_str(), "Ctrl+Z", false, can_undo())) {
-            undo();
+            history_.can_redo() ? "Redo " + std::string(history_.redo_name()) : std::string("Redo");
+        if (ImGui::MenuItem(undo_label.c_str(), "Ctrl+Z", false, history_.can_undo())) {
+            history_.undo();
         }
-        if (ImGui::MenuItem(redo_label.c_str(), "Ctrl+Y", false, can_redo())) {
-            redo();
+        if (ImGui::MenuItem(redo_label.c_str(), "Ctrl+Y", false, history_.can_redo())) {
+            history_.redo();
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Delete", "Del", false, scene_graph_.find(selected_) != nullptr)) {
@@ -1952,7 +1815,7 @@ bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& positi
     // Sized against what is already here. A fixed size cannot suit both a
     // chess piece and a street lamp -- the sample models alone span a factor
     // of 36 -- so an absolute default would be wrong for nearly every scene.
-    const Bounds bounds = scene_bounds();
+    const Bounds bounds = compute_scene_bounds(scene_graph_);
     const float radius = bounds.empty() ? 0.0F : glm::length(bounds.max - bounds.min) * 0.5F;
     const float reference = radius > 1e-4F ? radius : 1.0F;
     const float scale =
@@ -1990,7 +1853,7 @@ bool Application::add_light(gpu::LightType type, const glm::vec3& position, bool
     // be invisible a couple of units away.
     authored.intensity = directional ? k_default_key_intensity : k_default_point_intensity;
 
-    const Bounds bounds = scene_bounds();
+    const Bounds bounds = compute_scene_bounds(scene_graph_);
     const float radius = bounds.empty() ? 1.0F : glm::length(bounds.max - bounds.min) * 0.5F;
     const float reference = radius > 1e-4F ? radius : 1.0F;
     authored.range = reference * k_point_range_fraction;
@@ -2099,7 +1962,7 @@ void Application::reposition_default_light() {
         return;
     }
 
-    const Bounds bounds = scene_bounds();
+    const Bounds bounds = compute_scene_bounds(scene_graph_);
     if (bounds.empty()) {
         return;
     }
@@ -2133,7 +1996,7 @@ void Application::reposition_default_light() {
 // the whole reason undo here is cheap.
 void Application::push_add_command(std::string name, gpu::NodeHandle added,
                                    gpu::NodeHandle previous_selection) {
-    push_command(
+    history_.push(
         std::move(name),
         [this, added, previous_selection]() {
             scene_graph_.remove_subtree(added);
@@ -2164,7 +2027,7 @@ void Application::commit_transform_edit() {
     }
     const glm::mat4 after = current->local_transform;
 
-    push_command(
+    history_.push(
         "Transform",
         [this, node, before]() {
             scene_graph_.set_local_transform(node, before);
@@ -2180,7 +2043,7 @@ void Application::commit_transform_edit() {
 
 void Application::push_light_command(std::string name, gpu::NodeHandle node,
                                      const gpu::SceneLight& before, const gpu::SceneLight& after) {
-    push_command(
+    history_.push(
         std::move(name),
         [this, node, before]() {
             scene_graph_.set_light(node, before);
@@ -2207,43 +2070,8 @@ void Application::commit_light_edit() {
     push_light_command("Light", node, before, current->light);
 }
 
-void Application::push_command(std::string name, std::function<void()> undo_action,
-                               std::function<void()> redo_action) {
-    // Anything already undone is dropped: the history is a line, not a tree,
-    // and a new edit made after stepping back replaces what was ahead.
-    undo_stack_.resize(undo_cursor_);
-    undo_stack_.push_back(Command{std::move(name), std::move(undo_action), std::move(redo_action)});
-
-    // Bounded so a long session cannot grow it without limit. Dropping from the
-    // front costs an O(n) shift on a vector, which happens once per edit past
-    // the cap and is nothing next to the edit itself.
-    if (undo_stack_.size() > k_max_undo_depth) {
-        undo_stack_.erase(undo_stack_.begin());
-    }
-    undo_cursor_ = undo_stack_.size();
-}
-
-void Application::undo() {
-    if (!can_undo()) {
-        return;
-    }
-    --undo_cursor_;
-    undo_stack_[undo_cursor_].undo();
-    SAGE_LOG_INFO("Undo: {}", undo_stack_[undo_cursor_].name);
-}
-
-void Application::redo() {
-    if (!can_redo()) {
-        return;
-    }
-    undo_stack_[undo_cursor_].redo();
-    SAGE_LOG_INFO("Redo: {}", undo_stack_[undo_cursor_].name);
-    ++undo_cursor_;
-}
-
 void Application::clear_history() {
-    undo_stack_.clear();
-    undo_cursor_ = 0;
+    history_.clear();
     transform_edit_.reset();
     light_edit_.reset();
 }
@@ -2266,7 +2094,7 @@ void Application::delete_selected() {
     //
     // That is also why undoing this is just un-tombstoning: the mesh never
     // left, so there is nothing to upload again.
-    push_command(
+    history_.push(
         "Delete",
         [this, target]() {
             scene_graph_.restore_subtree(target);
@@ -2308,50 +2136,39 @@ void Application::service_pending_primitive() {
 }
 
 glm::vec3 Application::placement_point(float window_x, float window_y) const {
-    const CameraMatrices matrices = camera_matrices();
     const glm::vec3 origin = camera_.position();
+    // Where the ray misses, or the view is not yet laid out: a fixed distance
+    // straight ahead, which is at least visible and in front of the camera.
+    const glm::vec3 fallback = origin + (camera_.forward() * k_fallback_placement_distance);
 
+    const std::optional<glm::vec2> ndc = view_mapping().ndc_at(glm::vec2{window_x, window_y});
+    if (!ndc.has_value()) {
+        return fallback;
+    }
+
+    const CameraMatrices matrices = camera_matrices();
+    const std::optional<glm::vec3> direction =
+        ray_direction(glm::inverse(matrices.projection * matrices.view), origin, *ndc);
+    if (!direction.has_value()) {
+        return fallback;
+    }
+
+    const std::optional<glm::vec3> hit =
+        ground_plane_hit(origin, *direction, k_max_placement_distance);
+    return hit.value_or(origin + (*direction * k_fallback_placement_distance));
+}
+
+// The 3D view's placement, gathered from ImGui and the swapchain. Built per
+// call rather than cached: the ImGui read is trivial, and a cached copy would
+// be one more thing to invalidate on resize.
+ViewportMapping Application::view_mapping() const {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const VkExtent2D extent = swapchain_.extent();
-    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F || viewport_rect_.extent.width == 0 ||
-        viewport_rect_.extent.height == 0) {
-        return origin + (camera_.forward() * k_fallback_placement_distance);
-    }
-
-    // ImGui reports logical coordinates; viewport_rect_ is framebuffer pixels.
-    // Same conversion as central_node_rect, for the same reason.
-    const float pixel_x = window_x * (static_cast<float>(extent.width) / viewport->Size.x);
-    const float pixel_y = window_y * (static_cast<float>(extent.height) / viewport->Size.y);
-
-    // Normalised within the 3D view, then to NDC. No Y negation: the
-    // projection is already Vulkan's, whose NDC Y runs down the screen exactly
-    // as framebuffer rows do.
-    const float ndc_x = (2.0F * (pixel_x - static_cast<float>(viewport_rect_.offset.x)) /
-                         static_cast<float>(viewport_rect_.extent.width)) -
-                        1.0F;
-    const float ndc_y = (2.0F * (pixel_y - static_cast<float>(viewport_rect_.offset.y)) /
-                         static_cast<float>(viewport_rect_.extent.height)) -
-                        1.0F;
-
-    // Unprojecting the far plane alone is enough for a direction: the near
-    // point is the camera position, which is already known exactly.
-    const glm::mat4 inverse_view_projection = glm::inverse(matrices.projection * matrices.view);
-    const glm::vec4 far_point = inverse_view_projection * glm::vec4(ndc_x, ndc_y, 1.0F, 1.0F);
-    if (std::abs(far_point.w) < 1e-6F) {
-        return origin + (camera_.forward() * k_fallback_placement_distance);
-    }
-    const glm::vec3 direction = glm::normalize(glm::vec3(far_point) / far_point.w - origin);
-
-    // Intersect the ground plane. A ray running along it, or pointing away
-    // from it, has no useful answer -- which is most of the time when the
-    // camera is below the horizon -- so fall back to a fixed distance ahead.
-    if (std::abs(direction.y) > 1e-4F) {
-        const float distance = -origin.y / direction.y;
-        if (distance > 0.0F && distance < k_max_placement_distance) {
-            return origin + (direction * distance);
-        }
-    }
-    return origin + (direction * k_fallback_placement_distance);
+    ViewportMapping mapping;
+    mapping.logical_pos = glm::vec2{viewport->Pos.x, viewport->Pos.y};
+    mapping.logical_size = glm::vec2{viewport->Size.x, viewport->Size.y};
+    mapping.framebuffer = swapchain_.extent();
+    mapping.rect = viewport_rect_;
+    return mapping;
 }
 
 void Application::draw_context_menu() {
@@ -2880,9 +2697,9 @@ void Application::run() {
             // for, and supporting one does not cost the other.
             if (ImGui::IsKeyPressed(ImGuiKey_Y) ||
                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))) {
-                redo();
+                history_.redo();
             } else if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
-                undo();
+                history_.undo();
             }
         }
         // Before picking: a drag that ends over a different object must not
