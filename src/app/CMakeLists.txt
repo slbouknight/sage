@@ -7,6 +7,7 @@ find_package(imguizmo CONFIG REQUIRED)
 # the undo stack shipped untested.
 add_library(sage_app STATIC
     src/application.cpp
+    src/renderer.cpp
     src/edit_history.cpp
     src/scene_query.cpp
     src/viewport_mapping.cpp

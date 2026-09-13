@@ -69,122 +69,10 @@ core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
     return camera_input;
 }
 
-// Must match FrameData in shaders/mesh.slang *and* shaders/shadow.slang, which
-// declare it separately because slangc compiles each file alone. Written once
-// per frame and read by every draw, which is exactly why it is a buffer and not
-// a push constant.
-//
-// glm's mat4 has alignment 4, not 16, so the alignas is what puts camera_position
-// at 64 rather than wherever the compiler feels like. Note the SPIR-V ArrayStride for
-// the struct is 76 under scalar layout while sizeof here is 80: the two disagree, which is
-// harmless only because a single element is ever dereferenced. Never index a FrameData* as an
-// array.
-struct FrameData {
-    alignas(16) glm::mat4 view_projection{1.0F};
-    glm::vec3 camera_position{0.0F};
-    std::uint32_t light_count = 0;
-    std::array<gpu::Light, gpu::k_max_lights> lights{};
-    alignas(16) glm::mat4 light_view_projection{1.0F};
-    float shadow_normal_bias = 0.0F;
-    std::int32_t shadow_pcf_radius = 0;
-    float shadow_texel_size = 0.0F;
-    std::uint32_t shadow_enabled = 0;
-    float ambient_intensity = 0.0F;
-};
-static_assert(offsetof(FrameData, view_projection) == 0);
-static_assert(offsetof(FrameData, camera_position) == 64);
-static_assert(offsetof(FrameData, light_count) == 76);
-static_assert(offsetof(FrameData, lights) == 80);
-// Verified against the compiled SPIR-V, which decorates these members at
-// exactly these offsets in both mesh.slang and shadow.slang.
-static_assert(offsetof(FrameData, light_view_projection) == 464);
-static_assert(offsetof(FrameData, shadow_normal_bias) == 528);
-static_assert(offsetof(FrameData, shadow_pcf_radius) == 532);
-static_assert(offsetof(FrameData, shadow_texel_size) == 536);
-static_assert(offsetof(FrameData, shadow_enabled) == 540);
-static_assert(offsetof(FrameData, ambient_intensity) == 544);
-// 560, not 548: the alignas(16) on the two matrices gives the whole struct
-// 16-byte alignment, so its size rounds up. The trailing 12 bytes are padding
-// no shader reads.
-static_assert(sizeof(FrameData) == 560);
-// 80 is a multiple of the 16-byte alignment a device address requires, so slot
-// N's address is simply base + N * sizeof(FrameData) with no padding.
-static_assert(sizeof(FrameData) % 16 == 0);
-
 // Materials are 64 bytes, so this is 64 KiB of device memory for the whole
 // table. Cheap enough that overrunning it is a reason to raise the number
 // rather than a case MaterialRegistry has to degrade around.
 constexpr std::uint32_t k_max_materials = 1024;
-
-// Must match shaders/mesh.slang's PushConstants exactly. The static_asserts
-// below turn a layout mismatch into a build failure instead of a GPU fault.
-struct PushConstants {
-    VkDeviceAddress vertex_address = 0;
-    VkDeviceAddress frame_address = 0;
-    alignas(16) glm::mat4 model{1.0F};
-    std::uint32_t material_index = 0;
-    std::uint32_t object_id = 0;
-};
-static_assert(offsetof(PushConstants, vertex_address) == 0);
-static_assert(offsetof(PushConstants, frame_address) == 8);
-static_assert(offsetof(PushConstants, model) == 16);
-static_assert(offsetof(PushConstants, material_index) == 80);
-// Verified against the compiled SPIR-V, which decorates this member Offset 84.
-static_assert(offsetof(PushConstants, object_id) == 84);
-static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match PushConstants in shaders/outline.slang. The padding is not
-// cosmetic: Slang aligns an int2 to 8 and a float3 to 16, which is what puts
-// these members where the static_asserts say they are.
-struct OutlinePushConstants {
-    glm::ivec2 viewport_origin{0, 0};
-    glm::ivec2 viewport_size{0, 0};
-    alignas(16) glm::vec3 color{1.0F, 0.55F, 0.12F};
-    std::int32_t thickness = 2;
-};
-static_assert(offsetof(OutlinePushConstants, viewport_origin) == 0);
-static_assert(offsetof(OutlinePushConstants, viewport_size) == 8);
-static_assert(offsetof(OutlinePushConstants, color) == 16);
-static_assert(offsetof(OutlinePushConstants, thickness) == 28);
-static_assert(sizeof(OutlinePushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match the k_operator_* constants in shaders/tonemap.slang.
-enum class TonemapOperator : std::int32_t {
-    none = 0,
-    reinhard = 1,
-    aces = 2,
-};
-
-// Parallel to the enum above, for the combo box. An array rather than a
-// function of the enum so the two orders cannot drift apart unnoticed.
-constexpr std::array<const char*, 3> k_tonemap_names{"None (clamp)", "Reinhard", "ACES (fitted)"};
-
-// Must match PushConstants in shaders/tonemap.slang. Verified against the
-// compiled SPIR-V, which decorates these members Offset 0 and Offset 4.
-struct TonemapPushConstants {
-    float exposure = 1.0F;
-    std::int32_t tonemap_operator = 0;
-};
-static_assert(offsetof(TonemapPushConstants, exposure) == 0);
-static_assert(offsetof(TonemapPushConstants, tonemap_operator) == 4);
-static_assert(sizeof(TonemapPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match PushConstants in shaders/fxaa.slang. Verified against the compiled
-// SPIR-V, which decorates these members at 0, 8, 12, 16 and 20 -- the float2
-// aligns to 8, which is what puts the first scalar at 8 rather than 4.
-struct FxaaPushConstants {
-    glm::vec2 inverse_extent{0.0F};
-    float edge_threshold = 0.0F;
-    float edge_threshold_min = 0.0F;
-    float subpixel_quality = 0.0F;
-    std::int32_t enabled = 0;
-};
-static_assert(offsetof(FxaaPushConstants, inverse_extent) == 0);
-static_assert(offsetof(FxaaPushConstants, edge_threshold) == 8);
-static_assert(offsetof(FxaaPushConstants, edge_threshold_min) == 12);
-static_assert(offsetof(FxaaPushConstants, subpixel_quality) == 16);
-static_assert(offsetof(FxaaPushConstants, enabled) == 20);
-static_assert(sizeof(FxaaPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
 
 // Range of the exposure slider, in stops. Four either way covers "the scene is
 // lit for a sunny day" to "the scene is lit by one lantern" without the slider
@@ -201,32 +89,20 @@ constexpr const char* k_screenshot_directory = "screenshots";
 // Every format is_capturable_format accepts is 8-bit RGBA or BGRA.
 constexpr VkDeviceSize k_swapchain_bytes_per_pixel = 4;
 
+// Used by the capture copy below. The render passes have their own copy in
+// renderer.cpp; a shared header for two lines of constexpr would cost more
+// than it saved.
+constexpr VkImageSubresourceRange k_color_range{
+    VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+
 // 720p left the 3D view around 716 px wide once the panels took their columns,
 // which is thin for an editor and thinner still for a capture of one.
 constexpr std::uint32_t k_initial_width = 1600;
 constexpr std::uint32_t k_initial_height = 900;
 
-constexpr VkClearColorValue k_clear_color{{0.0036F, 0.0036F, 0.0036F, 1.0F}};
-
-constexpr VkImageSubresourceRange k_color_range{
-    VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-
-constexpr VkImageSubresourceRange k_depth_range{
-    VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-
 // The cache belongs in the user's cache dir, not the build tree: it must
 // survive `--clean`, and it is machine-specific so it should never be
 // committed or copied between machines.
-std::filesystem::path pipeline_cache_path() {
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && *xdg != '\0') {
-        return std::filesystem::path(xdg) / "sage" / "pipeline_cache.bin";
-    }
-    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-        return std::filesystem::path(home) / ".cache" / "sage" / "pipeline_cache.bin";
-    }
-    return std::filesystem::path(".sage-pipeline-cache.bin");
-}
-
 // A timestamped path under k_screenshot_directory, disambiguated if one already
 // exists. The timestamp resolves to the second, so two captures in the same
 // second would otherwise silently overwrite each other.
@@ -424,83 +300,11 @@ Application::Application(const std::filesystem::path& model_path)
       texture_registry_(allocator_, device_, uploader_, bindless_set_, sampler_),
       material_registry_(allocator_, uploader_, bindless_set_, k_max_materials),
       selection_buffer_(allocator_, uploader_, bindless_set_),
-      frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
-      pick_buffer_(allocator_, device_, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                   gpu::BufferAccess::host_read),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
-      depth_buffer_(allocator_, device_, swapchain_.extent()),
-      id_buffer_(allocator_, device_, swapchain_.extent()),
-      hdr_target_(allocator_, device_, swapchain_.extent()),
-      ldr_target_(allocator_, device_, swapchain_.extent()),
-      shadow_map_(allocator_, device_),
-      pipeline_cache_(device_, pipeline_cache_path()),
-      shadow_pipeline_(device_,
-                       gpu::GraphicsPipelineDesc{
-                           .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "shadow.spv",
-                           // No colour at all; depth is the entire output.
-                           .depth_format = gpu::ShadowMap::format(),
-                           .depth_only = true,
-                           .depth_bias = true,
-                           .set_layout = bindless_set_.layout(),
-                           .cache = pipeline_cache_.handle(),
-                       }),
-      pipeline_(device_,
-                gpu::GraphicsPipelineDesc{
-                    .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
-                    // The HDR target, not the swapchain: this pass no longer
-                    // writes anything a display sees directly.
-                    .color_format = gpu::HdrTarget::format(),
-                    .id_format = gpu::IdBuffer::format(),
-                    .depth_format = depth_buffer_.format(),
-                    .set_layout = bindless_set_.layout(),
-                    .cache = pipeline_cache_.handle(),
-                }),
-      outline_pipeline_(device_,
-                        gpu::GraphicsPipelineDesc{
-                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "outline.spv",
-                            // Still the swapchain. The outline is an editor
-                            // affordance, not a lit surface: drawing it into
-                            // the HDR target would put it through the tonemap,
-                            // which would quietly change the colour asked for
-                            // into a darker, less saturated one.
-                            .color_format = swapchain_.format(),
-                            // No id attachment and no depth: this pass reads
-                            // ids, it does not write them, and a full-screen
-                            // triangle has nothing to be occluded by.
-                            .alpha_blend = true,
-                            .cull_backfaces = false,
-                            .set_layout = bindless_set_.layout(),
-                            .cache = pipeline_cache_.handle(),
-                        }),
-      tonemap_pipeline_(device_,
-                        gpu::GraphicsPipelineDesc{
-                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "tonemap.spv",
-                            // The LDR target, not the swapchain: FXAA sits
-                            // between them now.
-                            .color_format = gpu::LdrTarget::format(),
-                            .cull_backfaces = false,
-                            .set_layout = bindless_set_.layout(),
-                            .cache = pipeline_cache_.handle(),
-                        }),
-      fxaa_pipeline_(device_,
-                     gpu::GraphicsPipelineDesc{
-                         .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "fxaa.spv",
-                         .color_format = swapchain_.format(),
-                         .cull_backfaces = false,
-                         .set_layout = bindless_set_.layout(),
-                         .cache = pipeline_cache_.handle(),
-                     }),
+      renderer_(device_, allocator_, bindless_set_, swapchain_),
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
-    bindless_set_.write_object_id_image(id_buffer_.view());
-    bindless_set_.write_hdr_color_image(hdr_target_.view());
-    // Written once, unlike the two above: the shadow map does not follow the
-    // swapchain, so a resize never invalidates this view.
-    bindless_set_.write_shadow_map(shadow_map_.view(), shadow_map_.sampler());
-    bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
     gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
-    tonemap_operator_ = static_cast<int>(TonemapOperator::aces);
     if (!gpu::is_capturable_format(swapchain_.format())) {
         SAGE_LOG_WARN("Swapchain format {} cannot be captured; screenshots are disabled",
                       static_cast<int>(swapchain_.format()));
@@ -623,6 +427,40 @@ Application::~Application() {
     device_.wait_idle();
 }
 
+// Gathers everything the render passes read from outside themselves, once per
+// frame. The single place the editor's state is handed to the renderer -- which
+// is what keeps the passes from reaching back into Application for it.
+Renderer::FrameView Application::frame_view(std::uint32_t frame_slot) const {
+    const CameraMatrices matrices = camera_matrices();
+
+    // The shadow map is fitted to one directional light -- the first in the
+    // graph, matching the shader, which spends its one lookup on the first
+    // directional light it evaluates. With none in the scene there is nothing
+    // to fit and nothing to cast.
+    const gpu::SceneNode* key = scene_graph_.find(first_directional_light());
+
+    Renderer::FrameView view;
+    view.scene = &scene_graph_;
+    view.geometry = &geometry_registry_;
+    view.settings = &render_settings_;
+    view.view_projection = matrices.projection * matrices.view;
+    view.camera_position = camera_.position();
+    view.has_key_light = key != nullptr;
+    if (key != nullptr) {
+        view.key_light_direction =
+            glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F));
+    }
+    view.viewport = viewport_rect_;
+    // Hidden with the panels, and hidden for the frame a no-UI capture is
+    // taken on. That frame is also the one on screen, so pressing F2 without
+    // F11 blinks the icons for a single frame -- the alternative is rendering
+    // the scene twice.
+    view.show_editor_meshes =
+        !ui_hidden_ && !(pending_screenshot_.has_value() && !screenshot_include_ui_);
+    view.frame_slot = frame_slot;
+    return view;
+}
+
 Application::CameraMatrices Application::camera_matrices() const {
     const float aspect = static_cast<float>(viewport_rect_.extent.width) /
                          static_cast<float>(viewport_rect_.extent.height);
@@ -643,508 +481,6 @@ gpu::NodeHandle Application::first_directional_light() const {
         }
     }
     return gpu::NodeHandle{};
-}
-
-void Application::write_frame_data(std::uint32_t frame_slot) const {
-    const CameraMatrices matrices = camera_matrices();
-
-    // One write per frame, into this frame's own slot. Writing a single shared
-    // slot would race the GPU, which may still be reading the previous frame's
-    // copy. begin_frame() has already waited out the work that used this slot.
-    FrameData frame_data;
-    frame_data.view_projection = matrices.projection * matrices.view;
-    frame_data.camera_position = camera_.position();
-
-    // Gathered from the graph rather than from members. The shader has always
-    // read lights as data; what changed is that the data now comes from nodes,
-    // so a light can be placed, parented and dragged like anything else.
-    frame_data.light_count = collect_lights(scene_graph_, frame_data.lights);
-    frame_data.ambient_intensity = ambient_intensity_;
-
-    // Refitted every frame from live world transforms. A gizmo drag moves
-    // geometry, which moves the bounds, which moves the frustum -- so a shadow
-    // keeps up with the thing casting it.
-    // The shadow map is fitted to one directional light -- the first in the
-    // graph, matching the shader, which spends it on the first directional
-    // light it evaluates. With none in the scene there is nothing to fit and
-    // nothing to cast, so the pass still runs but the lookup is skipped.
-    const gpu::SceneNode* key = scene_graph_.find(first_directional_light());
-    const glm::vec3 key_direction =
-        key != nullptr ? glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F))
-                       : glm::vec3(0.0F, -1.0F, 0.0F);
-
-    const LightFit fit = fit_directional_light(compute_scene_bounds(scene_graph_), key_direction,
-                                               shadow_map_.resolution());
-    frame_data.light_view_projection = fit.view_projection;
-    // Texels converted to world units here, so the shader stays in world space
-    // and the slider keeps meaning the same thing at any scene scale.
-    frame_data.shadow_normal_bias = shadow_normal_bias_texels_ * fit.world_texel_size;
-    frame_data.shadow_pcf_radius = shadow_pcf_radius_;
-    frame_data.shadow_texel_size = 1.0F / static_cast<float>(shadow_map_.resolution());
-    frame_data.shadow_enabled = (shadows_enabled_ && key != nullptr) ? 1U : 0U;
-
-    frame_buffer_.write(&frame_data, sizeof(frame_data),
-                        VkDeviceSize{frame_slot} * sizeof(FrameData));
-}
-
-void Application::record_shadow(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
-    VkImageMemoryBarrier2 to_depth{};
-    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // The previous frame's last use was the fragment shader sampling this map,
-    // so that read has to finish before the pass below overwrites it. A
-    // write-after-read, hence no source access mask.
-    to_depth.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_depth.srcAccessMask = VK_ACCESS_2_NONE;
-    to_depth.dstStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.image = shadow_map_.image();
-    to_depth.subresourceRange = k_depth_range;
-
-    VkDependencyInfo begin_dependency{};
-    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    begin_dependency.imageMemoryBarrierCount = 1;
-    begin_dependency.pImageMemoryBarriers = &to_depth;
-    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
-
-    // STORE, unlike the main depth buffer's DONT_CARE: this attachment's whole
-    // purpose is to be read back afterwards.
-    VkRenderingAttachmentInfo depth_attachment{};
-    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_attachment.imageView = shadow_map_.view();
-    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depth_attachment.clearValue.depthStencil = {1.0F, 0};
-
-    const VkExtent2D extent = shadow_map_.extent();
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 0;
-    rendering.pDepthAttachment = &depth_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            shadow_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    VkViewport viewport{};
-    viewport.x = 0.0F;
-    viewport.y = 0.0F;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-    // Dynamic, so the two ends of the bias trade-off stay draggable. The
-    // constant term is in units of the depth format's smallest representable
-    // difference; the slope term scales with how steeply the surface is turned
-    // away from the light, which is where acne appears first.
-    vkCmdSetDepthBias(command_buffer, shadow_depth_bias_, 0.0F, shadow_slope_bias_);
-
-    const VkDeviceAddress frame_address =
-        frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
-
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        // editor_only skipped as well as mesh-less: a marker standing for a
-        // light must not cast a shadow of its own.
-        if (!node.alive || !node.has_mesh || node.editor_only) {
-            continue;
-        }
-        // The same struct the main pass pushes. This pipeline's shader declares
-        // only the first three members and ignores the rest.
-        PushConstants push{};
-        push.vertex_address = node.mesh.vertex_address;
-        push.frame_address = frame_address;
-        push.model = node.world_transform;
-        vkCmdPushConstants(command_buffer, shadow_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                           sizeof(push), &push);
-        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
-                             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
-    }
-
-    vkCmdEndRendering(command_buffer);
-
-    // Into the layout the descriptor written at startup names. DEPTH_READ_ONLY
-    // rather than SHADER_READ_ONLY because this is a depth image.
-    VkImageMemoryBarrier2 to_read{};
-    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_read.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_read.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
-    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.image = shadow_map_.image();
-    to_read.subresourceRange = k_depth_range;
-
-    VkDependencyInfo end_dependency{};
-    end_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    end_dependency.imageMemoryBarrierCount = 1;
-    end_dependency.pImageMemoryBarriers = &to_read;
-    vkCmdPipelineBarrier2(command_buffer, &end_dependency);
-}
-
-void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
-    VkImageMemoryBarrier2 to_color{};
-    to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // FRAGMENT_SHADER as the source stage, not COLOR_ATTACHMENT_OUTPUT: the
-    // previous frame's last use of this image was the tonemap sampling it, and
-    // that read has to finish before this frame overwrites it.
-    to_color.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.image = hdr_target_.image();
-    to_color.subresourceRange = k_color_range;
-
-    VkImageMemoryBarrier2 to_depth{};
-    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_depth.srcStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_depth.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_depth.dstStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.image = depth_buffer_.image();
-    to_depth.subresourceRange = k_depth_range;
-
-    // Same shape as the colour barrier: the previous contents are never read,
-    // so UNDEFINED discards them and the clear below writes every texel.
-    VkImageMemoryBarrier2 to_id{};
-    to_id.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_id.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_id.srcAccessMask = VK_ACCESS_2_NONE;
-    to_id.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_id.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_id.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_id.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_id.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_id.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_id.image = id_buffer_.image();
-    to_id.subresourceRange = k_color_range;
-
-    const std::array<VkImageMemoryBarrier2, 3> begin_barriers{to_color, to_depth, to_id};
-
-    VkDependencyInfo begin_dependency{};
-    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    begin_dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(begin_barriers.size());
-    begin_dependency.pImageMemoryBarriers = begin_barriers.data();
-    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
-
-    // loadOp CLEAR is what replaces M1's vkCmdClearColorImage.
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = hdr_target_.view();
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // The clear covers the whole image while the draws below are scissored to
-    // the viewport. That is deliberate: it leaves every texel the tonemap will
-    // read defined, so the resolve can be one full-screen triangle with no
-    // special case for the region behind the panels.
-    color_attachment.clearValue.color = k_clear_color;
-
-    VkRenderingAttachmentInfo depth_attachment{};
-    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_attachment.imageView = depth_buffer_.view();
-    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth_attachment.clearValue.depthStencil = {1.0F, 0};
-
-    // Cleared to k_null_id, so every pixel no draw covers reads back as
-    // "nothing here" rather than as whatever the last frame left behind.
-    VkRenderingAttachmentInfo id_attachment{};
-    id_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    id_attachment.imageView = id_buffer_.view();
-    id_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    id_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    id_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    id_attachment.clearValue.color.uint32[0] = gpu::IdBuffer::k_null_id;
-
-    const std::array<VkRenderingAttachmentInfo, 2> color_attachments{color_attachment,
-                                                                     id_attachment};
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = hdr_target_.extent();
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = static_cast<std::uint32_t>(color_attachments.size());
-    rendering.pColorAttachments = color_attachments.data();
-    rendering.pDepthAttachment = &depth_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.layout(), 0,
-                            1, &descriptor_set, 0, nullptr);
-
-    // The dockspace's central node, not the whole image: the panels are opaque,
-    // so drawing behind them costs fill rate and, worse, makes the projection
-    // describe a view wider than the one actually on screen.
-    VkViewport viewport{};
-    viewport.x = static_cast<float>(viewport_rect_.offset.x);
-    viewport.y = static_cast<float>(viewport_rect_.offset.y);
-    viewport.width = static_cast<float>(viewport_rect_.extent.width);
-    viewport.height = static_cast<float>(viewport_rect_.extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
-
-    // Already written by write_frame_data, before the shadow pass -- both
-    // passes read the same slot, and the shadow pass needs the light matrix
-    // that is in it.
-    const VkDeviceAddress frame_address =
-        frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
-
-    // Light icons are drawn with the scene so they pick and outline like any
-    // other mesh, but they are the tool rather than the render: hidden with the
-    // panels, and hidden for the frame a no-UI capture is taken on. That frame
-    // is also the one on screen, so pressing F2 without F11 blinks them for a
-    // single frame -- the alternative is rendering the scene twice.
-    const bool show_editor_meshes =
-        !ui_hidden_ && !(pending_screenshot_.has_value() && !screenshot_include_ui_);
-
-    for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
-        const gpu::SceneNode& node = scene_graph_.nodes()[index];
-        if (!node.alive || !node.has_mesh) {
-            // Deleted, or a pure transform node: glTF hierarchy nodes, and the
-            // per-load root.
-            continue;
-        }
-        if (node.editor_only && !show_editor_meshes) {
-            continue;
-        }
-
-        PushConstants push{};
-        push.vertex_address = node.mesh.vertex_address;
-        push.frame_address = frame_address;
-        push.model = node.world_transform;
-        push.material_index = node.material_index;
-        // Offset by one so that k_null_id (0) stays reserved for empty space;
-        // resolve_pick subtracts it back off.
-        push.object_id = index + 1;
-        vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
-                           &push);
-        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
-                             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
-    }
-
-    vkCmdEndRendering(command_buffer);
-}
-
-void Application::record_tonemap(VkCommandBuffer command_buffer) const {
-    // Two transitions, one dependency. The HDR target stops being an attachment
-    // and becomes a texture; the LDR target, which the FXAA pass sampled last
-    // frame, goes the other way.
-    VkImageMemoryBarrier2 hdr_to_read{};
-    hdr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    hdr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    hdr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    hdr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    hdr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    hdr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    hdr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    hdr_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hdr_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hdr_to_read.image = hdr_target_.image();
-    hdr_to_read.subresourceRange = k_color_range;
-
-    // Write-after-read: the previous frame's FXAA pass sampled this image, and
-    // that read has to finish before the tonemap overwrites it.
-    VkImageMemoryBarrier2 ldr_to_color{};
-    ldr_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    ldr_to_color.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    ldr_to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    ldr_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    ldr_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    ldr_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ldr_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ldr_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_color.image = ldr_target_.image();
-    ldr_to_color.subresourceRange = k_color_range;
-
-    const std::array<VkImageMemoryBarrier2, 2> barriers{hdr_to_read, ldr_to_color};
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size());
-    dependency.pImageMemoryBarriers = barriers.data();
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-
-    // DONT_CARE, not CLEAR: the triangle below covers every pixel of the image,
-    // so clearing first would be writing the whole target twice.
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = ldr_target_.view();
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    const VkExtent2D extent = ldr_target_.extent();
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, tonemap_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            tonemap_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    // The whole image, not viewport_rect_: the region behind the panels was
-    // cleared by the scene pass and still has to be resolved, or it would show
-    // whatever the presentation engine last left in this swapchain image.
-    VkViewport viewport{};
-    viewport.x = 0.0F;
-    viewport.y = 0.0F;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-    TonemapPushConstants push{};
-    // Stops are a doubling each, which is what the exp2 is: +1 stop is twice
-    // the light reaching the sensor.
-    push.exposure = std::exp2(exposure_stops_);
-    push.tonemap_operator = tonemap_operator_;
-    vkCmdPushConstants(command_buffer, tonemap_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                       sizeof(push), &push);
-
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    vkCmdEndRendering(command_buffer);
-}
-
-void Application::record_fxaa(VkCommandBuffer command_buffer, VkImage image,
-                              VkImageView image_view) const {
-    // The LDR target stops being an attachment and becomes a texture; the
-    // swapchain image, untouched so far this frame, becomes an attachment for
-    // the first time.
-    VkImageMemoryBarrier2 ldr_to_read{};
-    ldr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    ldr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    ldr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    ldr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    ldr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    ldr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ldr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ldr_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_read.image = ldr_target_.image();
-    ldr_to_read.subresourceRange = k_color_range;
-
-    VkImageMemoryBarrier2 swapchain_to_color{};
-    swapchain_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    swapchain_to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    swapchain_to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    swapchain_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    swapchain_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    swapchain_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    swapchain_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    swapchain_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapchain_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapchain_to_color.image = image;
-    swapchain_to_color.subresourceRange = k_color_range;
-
-    const std::array<VkImageMemoryBarrier2, 2> barriers{ldr_to_read, swapchain_to_color};
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size());
-    dependency.pImageMemoryBarriers = barriers.data();
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = image_view;
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    const VkExtent2D extent = swapchain_.extent();
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaa_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            fxaa_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    VkViewport viewport{};
-    viewport.x = 0.0F;
-    viewport.y = 0.0F;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-    FxaaPushConstants push{};
-    push.inverse_extent = glm::vec2(1.0F / static_cast<float>(extent.width),
-                                    1.0F / static_cast<float>(extent.height));
-    push.edge_threshold = fxaa_edge_threshold_;
-    push.edge_threshold_min = fxaa_edge_threshold_min_;
-    push.subpixel_quality = fxaa_subpixel_quality_;
-    push.enabled = fxaa_enabled_ ? 1 : 0;
-    vkCmdPushConstants(command_buffer, fxaa_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                       sizeof(push), &push);
-
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    vkCmdEndRendering(command_buffer);
 }
 
 void Application::handle_picking_input() {
@@ -1200,151 +536,6 @@ void Application::service_selection() {
     selection_buffer_.update(selection_flags_);
 }
 
-void Application::record_outline(VkCommandBuffer command_buffer, VkImageView image_view) const {
-    // Unconditional, even with nothing selected: the barrier below is what
-    // leaves the id image in the layout record_pick_copy expects, so skipping
-    // the pass would make that layout depend on the selection.
-    VkImageMemoryBarrier2 to_read{};
-    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.image = id_buffer_.image();
-    to_read.subresourceRange = k_color_range;
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = 1;
-    dependency.pImageMemoryBarriers = &to_read;
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-
-    if (!selected_.valid()) {
-        return;
-    }
-
-    // LOAD, not CLEAR: the shaded scene is already here and the outline is
-    // drawn over it.
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = image_view;
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = viewport_rect_.offset;
-    rendering.renderArea.extent = viewport_rect_.extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            outline_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    VkViewport viewport{};
-    viewport.x = static_cast<float>(viewport_rect_.offset.x);
-    viewport.y = static_cast<float>(viewport_rect_.offset.y);
-    viewport.width = static_cast<float>(viewport_rect_.extent.width);
-    viewport.height = static_cast<float>(viewport_rect_.extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
-
-    OutlinePushConstants push{};
-    push.viewport_origin = {viewport_rect_.offset.x, viewport_rect_.offset.y};
-    push.viewport_size = {static_cast<std::int32_t>(viewport_rect_.extent.width),
-                          static_cast<std::int32_t>(viewport_rect_.extent.height)};
-    vkCmdPushConstants(command_buffer, outline_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                       sizeof(push), &push);
-
-    // Three vertices, no buffers: the vertex shader builds a full-screen
-    // triangle from SV_VertexID.
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    vkCmdEndRendering(command_buffer);
-}
-
-void Application::record_pick_copy(VkCommandBuffer command_buffer) const {
-    if (!pending_pick_.has_value()) {
-        return;
-    }
-
-    VkImageMemoryBarrier2 to_transfer_src{};
-    to_transfer_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // SHADER_READ_ONLY, not COLOR_ATTACHMENT: record_outline has already moved
-    // the image there. Ordering the two passes rather than making each one
-    // handle both cases keeps a single source layout per barrier.
-    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_transfer_src.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_transfer_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    to_transfer_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    to_transfer_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer_src.image = id_buffer_.image();
-    to_transfer_src.subresourceRange = k_color_range;
-
-    VkDependencyInfo to_transfer_dependency{};
-    to_transfer_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_transfer_dependency.imageMemoryBarrierCount = 1;
-    to_transfer_dependency.pImageMemoryBarriers = &to_transfer_src;
-    vkCmdPipelineBarrier2(command_buffer, &to_transfer_dependency);
-
-    // One texel. The whole point of an id attachment over a CPU-side raycast is
-    // that the answer is already rendered; reading more of it would be waste.
-    VkBufferImageCopy2 region{};
-    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
-    region.bufferOffset = 0;
-    region.bufferRowLength = 0;
-    region.bufferImageHeight = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageOffset = {pending_pick_->x, pending_pick_->y, 0};
-    region.imageExtent = {1, 1, 1};
-
-    VkCopyImageToBufferInfo2 copy{};
-    copy.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
-    copy.srcImage = id_buffer_.image();
-    copy.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    copy.dstBuffer = pick_buffer_.handle();
-    copy.regionCount = 1;
-    copy.pRegions = &region;
-    vkCmdCopyImageToBuffer2(command_buffer, &copy);
-
-    // Waiting on the submission alone does not make the copy visible to the
-    // host; the HOST stage has to be named as a destination for that.
-    VkBufferMemoryBarrier2 to_host{};
-    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
-    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_host.buffer = pick_buffer_.handle();
-    to_host.offset = 0;
-    to_host.size = VK_WHOLE_SIZE;
-
-    VkDependencyInfo to_host_dependency{};
-    to_host_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_host_dependency.bufferMemoryBarrierCount = 1;
-    to_host_dependency.pBufferMemoryBarriers = &to_host;
-    vkCmdPipelineBarrier2(command_buffer, &to_host_dependency);
-}
-
 void Application::resolve_pick() {
     if (!pending_pick_.has_value()) {
         return;
@@ -1357,8 +548,7 @@ void Application::resolve_pick() {
     // old -- would hand back whatever was under the cursor before the click.
     frame_pacer_.wait_all();
 
-    std::uint32_t id = gpu::IdBuffer::k_null_id;
-    pick_buffer_.read(&id, sizeof(id));
+    const std::uint32_t id = renderer_.read_picked_id();
 
     // Promoted to the root of whatever was hit. Clicking a mesh selects the
     // object it belongs to, not the individual submesh -- which is what makes
@@ -1507,27 +697,6 @@ void Application::resolve_screenshot() {
 
     pending_screenshot_.reset();
     screenshot_buffer_.reset();
-}
-
-void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage image) {
-    VkImageMemoryBarrier2 to_present{};
-    to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_present.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_present.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_present.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-    to_present.dstAccessMask = VK_ACCESS_2_NONE;
-    to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_present.image = image;
-    to_present.subresourceRange = k_color_range;
-
-    VkDependencyInfo to_present_dependency{};
-    to_present_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_present_dependency.imageMemoryBarrierCount = 1;
-    to_present_dependency.pImageMemoryBarriers = &to_present;
-    vkCmdPipelineBarrier2(command_buffer, &to_present_dependency);
 }
 
 void Application::draw_dockspace() {
@@ -1758,24 +927,26 @@ void Application::draw_presentation_controls() {
     // two curves is only legible on the same frame -- comparing across a rebuild
     // compares two memories of an image.
     ImGui::SetNextItemWidth(k_menu_item_width);
-    ImGui::Combo("##tonemap", &tonemap_operator_, k_tonemap_names.data(),
+    ImGui::Combo("##tonemap", &render_settings_.tonemap_operator, k_tonemap_names.data(),
                  static_cast<int>(k_tonemap_names.size()));
-    if (tonemap_operator_ == static_cast<int>(TonemapOperator::none)) {
+    if (render_settings_.tonemap_operator == static_cast<int>(TonemapOperator::none)) {
         ImGui::TextDisabled("Clamped, as before M8");
     }
 
-    ImGui::SliderFloat("Exposure", &exposure_stops_, k_min_exposure_stops, k_max_exposure_stops,
-                       "%+.2f stops");
+    ImGui::SliderFloat("Exposure", &render_settings_.exposure_stops, k_min_exposure_stops,
+                       k_max_exposure_stops, "%+.2f stops");
 
     ImGui::SeparatorText("Anti-aliasing");
-    ImGui::Checkbox("FXAA", &fxaa_enabled_);
-    ImGui::BeginDisabled(!fxaa_enabled_);
+    ImGui::Checkbox("FXAA", &render_settings_.fxaa_enabled);
+    ImGui::BeginDisabled(!render_settings_.fxaa_enabled);
     // Lower catches more edges and softens more of the image with them; higher
     // leaves faint edges alone. The floor matters most in dark regions, where a
     // tiny absolute difference is a large relative one.
-    ImGui::SliderFloat("Edge threshold", &fxaa_edge_threshold_, 0.03F, 0.33F, "%.3f");
-    ImGui::SliderFloat("Dark floor", &fxaa_edge_threshold_min_, 0.005F, 0.1F, "%.4f");
-    ImGui::SliderFloat("Subpixel", &fxaa_subpixel_quality_, 0.0F, 1.0F, "%.2f");
+    ImGui::SliderFloat("Edge threshold", &render_settings_.fxaa_edge_threshold, 0.03F, 0.33F,
+                       "%.3f");
+    ImGui::SliderFloat("Dark floor", &render_settings_.fxaa_edge_threshold_min, 0.005F, 0.1F,
+                       "%.4f");
+    ImGui::SliderFloat("Subpixel", &render_settings_.fxaa_subpixel_quality, 0.0F, 1.0F, "%.2f");
     ImGui::EndDisabled();
 }
 
@@ -2236,26 +1407,30 @@ void Application::draw_lighting_menu() {
     ImGui::TextDisabled("Right-click the viewport to add one.");
 
     ImGui::SeparatorText("Ambient");
-    ImGui::DragFloat("Intensity##ambient", &ambient_intensity_, 0.002F, 0.0F, 1.0F, "%.3f");
+    ImGui::DragFloat("Intensity##ambient", &render_settings_.ambient_intensity, 0.002F, 0.0F, 1.0F,
+                     "%.3f");
     ImGui::TextDisabled("Flat term; no IBL yet");
 
     ImGui::SeparatorText("Shadow");
-    ImGui::Checkbox("Enabled##shadow", &shadows_enabled_);
-    ImGui::BeginDisabled(!shadows_enabled_);
+    ImGui::Checkbox("Enabled##shadow", &render_settings_.shadows_enabled);
+    ImGui::BeginDisabled(!render_settings_.shadows_enabled);
     // Acne and peter-panning are the two ends of one trade-off: too little bias
     // and the surface shadows itself in stripes, too much and the contact
     // shadow detaches from the object. The middle is found by dragging.
     // The constant term's range dwarfs the slope term's because the spec scales
     // it by the depth format's smallest resolvable difference -- about 2^-23
     // here. Hundreds is the working range, not single digits.
-    ImGui::DragFloat("Depth bias", &shadow_depth_bias_, 10.0F, 0.0F, 10000.0F, "%.0f");
-    ImGui::DragFloat("Slope bias", &shadow_slope_bias_, 0.05F, 0.0F, 8.0F, "%.2f");
-    ImGui::DragFloat("Normal bias", &shadow_normal_bias_texels_, 0.05F, 0.0F, 8.0F, "%.2f texels");
-    ImGui::SliderInt("PCF radius", &shadow_pcf_radius_, 0, 4);
+    ImGui::DragFloat("Depth bias", &render_settings_.shadow_depth_bias, 10.0F, 0.0F, 10000.0F,
+                     "%.0f");
+    ImGui::DragFloat("Slope bias", &render_settings_.shadow_slope_bias, 0.05F, 0.0F, 8.0F, "%.2f");
+    ImGui::DragFloat("Normal bias", &render_settings_.shadow_normal_bias_texels, 0.05F, 0.0F, 8.0F,
+                     "%.2f texels");
+    ImGui::SliderInt("PCF radius", &render_settings_.shadow_pcf_radius, 0, 4);
     ImGui::EndDisabled();
-    const int taps = ((2 * shadow_pcf_radius_) + 1) * ((2 * shadow_pcf_radius_) + 1);
-    ImGui::TextDisabled("%ux%u map, %d taps", shadow_map_.resolution(), shadow_map_.resolution(),
-                        taps);
+    const int taps = ((2 * render_settings_.shadow_pcf_radius) + 1) *
+                     ((2 * render_settings_.shadow_pcf_radius) + 1);
+    ImGui::TextDisabled("%ux%u map, %d taps", renderer_.shadow_resolution(),
+                        renderer_.shadow_resolution(), taps);
 }
 
 void Application::draw_properties_panel() {
@@ -2539,16 +1714,7 @@ bool Application::recreate_swapchain() {
         return false;
     }
     swapchain_.recreate(extent);
-    depth_buffer_.recreate(swapchain_.extent());
-    id_buffer_.recreate(swapchain_.extent());
-    hdr_target_.recreate(swapchain_.extent());
-    ldr_target_.recreate(swapchain_.extent());
-    // The old views are gone, so the descriptors naming them have to be
-    // rewritten. The shadow map is absent here on purpose: it does not follow
-    // the swapchain, so its view is still valid.
-    bindless_set_.write_object_id_image(id_buffer_.view());
-    bindless_set_.write_hdr_color_image(hdr_target_.view());
-    bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
+    renderer_.recreate(swapchain_.extent());
     // A pick names a texel in an image that no longer exists.
     pending_pick_.reset();
     // Same for a capture: the region it named was measured against the old
@@ -2741,16 +1907,21 @@ void Application::run() {
         // swapchain and is the first thing to touch it; the capture takes the
         // finished image before any editor overlay reaches it; the outline and
         // then ImGui draw on top.
-        write_frame_data(frame.slot);
-        record_shadow(frame.command_buffer, frame.slot);
-        record_scene(frame.command_buffer, frame.slot);
-        record_tonemap(frame.command_buffer);
-        record_fxaa(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index));
+        const Renderer::FrameView view = frame_view(frame.slot);
+        renderer_.write_frame_data(view);
+        renderer_.record_shadow(frame.command_buffer, view);
+        renderer_.record_scene(frame.command_buffer, view);
+        renderer_.record_tonemap(frame.command_buffer, view);
+        renderer_.record_fxaa(frame.command_buffer, acquired.image,
+                              swapchain_.image_view(acquired.index), view);
         if (!screenshot_include_ui_) {
             record_screenshot_copy(frame.command_buffer, acquired.image);
         }
-        record_outline(frame.command_buffer, swapchain_.image_view(acquired.index));
-        record_pick_copy(frame.command_buffer);
+        renderer_.record_outline(frame.command_buffer, swapchain_.image_view(acquired.index), view,
+                                 selected_.valid());
+        if (pending_pick_.has_value()) {
+            renderer_.record_pick_copy(frame.command_buffer, *pending_pick_);
+        }
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
                       swapchain_.extent());
         // The other capture point: after everything, so the file shows the
@@ -2758,7 +1929,7 @@ void Application::run() {
         if (screenshot_include_ui_) {
             record_screenshot_copy(frame.command_buffer, acquired.image);
         }
-        transition_to_present(frame.command_buffer, acquired.image);
+        Renderer::transition_to_present(frame.command_buffer, acquired.image);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
@@ -2776,7 +1947,7 @@ void Application::run() {
     }
 
     frame_pacer_.wait_all();
-    pipeline_cache_.save();
+    renderer_.save_pipeline_cache();
     SAGE_LOG_INFO("Main loop exited");
 }
 
