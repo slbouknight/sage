@@ -134,6 +134,18 @@ rather than only look at one.
   rewinds the registries. Done — see
   [ADR 0031](docs/adr/0031-deletion-and-undo.md).
 
+**Refactor, between M11 and v2.** Not a milestone — no feature — but recorded
+because it changes where new code goes. `application.cpp` had reached 2966
+lines, seven times the next largest file, and `src/app` was an `add_executable`,
+so nothing in it could be linked into the test binary. It is now a static
+library with a thin `sage_editor` over it, split into `Renderer` (targets,
+pipelines, passes), `editor_ui.cpp` (the panels, still `Application` members in
+a second translation unit), and three tested units — `EditHistory`,
+`scene_query`, `viewport_mapping`. 64 tests to 132. **Put new arithmetic in one
+of the tested units rather than on `Application`**, and add render passes to
+`Renderer`, which is where v2's G-buffer belongs. See
+[ADR 0032](docs/adr/0032-splitting-the-app-module.md).
+
 Past this point, pick one of the items below and finish it rather than starting
 several. In no committed order:
 
@@ -162,9 +174,14 @@ Work one item at a time. Flag scope creep instead of accommodating it.
 
 ## Conventions
 
-- One static lib per module, namespaced alias: `sage::core`, `sage::gpu`, ...
+- One static lib per module, namespaced alias: `sage::core`, `sage::gpu`,
+  `sage::app`. Executables are thin: `sage_editor` is `main.cpp` and nothing
+  else, so everything it does is reachable from `sage_tests`. Logic added to an
+  executable target is logic that cannot be tested.
 - Public headers at `src/<module>/include/sage/<module>/`. Always
   `#include <sage/core/log.hpp>`, never relative paths across modules.
+  `app/application.hpp` is deliberately private, in `src/`: the library's public
+  surface is the tested units, not the editor class.
 - `target_link_libraries` is `PRIVATE` by default. `PUBLIC` only when the dependency
   appears in a public header.
 - Warning flags live only in `cmake/SageCompileOptions.cmake`, on the

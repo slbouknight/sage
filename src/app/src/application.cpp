@@ -6,31 +6,24 @@
 #include <sage/gpu/light.hpp>
 #include <sage/gpu/screenshot.hpp>
 #include <sage/gpu/selection_buffer.hpp>
-#include <sage/gpu/shader_module.hpp>
 #include <sage/gpu/vertex.hpp>
 #include <sage/gpu/vk_check.hpp>
 
-#include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
-// The DockBuilder API is internal and has no public equivalent. Confined to
-// this file, and only for the one-time default layout; everything else uses
-// the public header.
+
+// After imgui.h: it uses ImGui's types without including it.
 #include <ImGuizmo.h>
-#include <imgui_internal.h>
 
 #include <algorithm>
 #include <array>
-#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <memory>
 #include <numbers>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -69,128 +62,10 @@ core::CameraInput to_camera_input(const gpu::Window::InputState& input) {
     return camera_input;
 }
 
-// Must match FrameData in shaders/mesh.slang *and* shaders/shadow.slang, which
-// declare it separately because slangc compiles each file alone. Written once
-// per frame and read by every draw, which is exactly why it is a buffer and not
-// a push constant.
-//
-// glm's mat4 has alignment 4, not 16, so the alignas is what puts camera_position
-// at 64 rather than wherever the compiler feels like. Note the SPIR-V ArrayStride for
-// the struct is 76 under scalar layout while sizeof here is 80: the two disagree, which is
-// harmless only because a single element is ever dereferenced. Never index a FrameData* as an
-// array.
-struct FrameData {
-    alignas(16) glm::mat4 view_projection{1.0F};
-    glm::vec3 camera_position{0.0F};
-    std::uint32_t light_count = 0;
-    std::array<gpu::Light, gpu::k_max_lights> lights{};
-    alignas(16) glm::mat4 light_view_projection{1.0F};
-    float shadow_normal_bias = 0.0F;
-    std::int32_t shadow_pcf_radius = 0;
-    float shadow_texel_size = 0.0F;
-    std::uint32_t shadow_enabled = 0;
-    float ambient_intensity = 0.0F;
-};
-static_assert(offsetof(FrameData, view_projection) == 0);
-static_assert(offsetof(FrameData, camera_position) == 64);
-static_assert(offsetof(FrameData, light_count) == 76);
-static_assert(offsetof(FrameData, lights) == 80);
-// Verified against the compiled SPIR-V, which decorates these members at
-// exactly these offsets in both mesh.slang and shadow.slang.
-static_assert(offsetof(FrameData, light_view_projection) == 464);
-static_assert(offsetof(FrameData, shadow_normal_bias) == 528);
-static_assert(offsetof(FrameData, shadow_pcf_radius) == 532);
-static_assert(offsetof(FrameData, shadow_texel_size) == 536);
-static_assert(offsetof(FrameData, shadow_enabled) == 540);
-static_assert(offsetof(FrameData, ambient_intensity) == 544);
-// 560, not 548: the alignas(16) on the two matrices gives the whole struct
-// 16-byte alignment, so its size rounds up. The trailing 12 bytes are padding
-// no shader reads.
-static_assert(sizeof(FrameData) == 560);
-// 80 is a multiple of the 16-byte alignment a device address requires, so slot
-// N's address is simply base + N * sizeof(FrameData) with no padding.
-static_assert(sizeof(FrameData) % 16 == 0);
-
 // Materials are 64 bytes, so this is 64 KiB of device memory for the whole
 // table. Cheap enough that overrunning it is a reason to raise the number
 // rather than a case MaterialRegistry has to degrade around.
 constexpr std::uint32_t k_max_materials = 1024;
-
-// Must match shaders/mesh.slang's PushConstants exactly. The static_asserts
-// below turn a layout mismatch into a build failure instead of a GPU fault.
-struct PushConstants {
-    VkDeviceAddress vertex_address = 0;
-    VkDeviceAddress frame_address = 0;
-    alignas(16) glm::mat4 model{1.0F};
-    std::uint32_t material_index = 0;
-    std::uint32_t object_id = 0;
-};
-static_assert(offsetof(PushConstants, vertex_address) == 0);
-static_assert(offsetof(PushConstants, frame_address) == 8);
-static_assert(offsetof(PushConstants, model) == 16);
-static_assert(offsetof(PushConstants, material_index) == 80);
-// Verified against the compiled SPIR-V, which decorates this member Offset 84.
-static_assert(offsetof(PushConstants, object_id) == 84);
-static_assert(sizeof(PushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match PushConstants in shaders/outline.slang. The padding is not
-// cosmetic: Slang aligns an int2 to 8 and a float3 to 16, which is what puts
-// these members where the static_asserts say they are.
-struct OutlinePushConstants {
-    glm::ivec2 viewport_origin{0, 0};
-    glm::ivec2 viewport_size{0, 0};
-    alignas(16) glm::vec3 color{1.0F, 0.55F, 0.12F};
-    std::int32_t thickness = 2;
-};
-static_assert(offsetof(OutlinePushConstants, viewport_origin) == 0);
-static_assert(offsetof(OutlinePushConstants, viewport_size) == 8);
-static_assert(offsetof(OutlinePushConstants, color) == 16);
-static_assert(offsetof(OutlinePushConstants, thickness) == 28);
-static_assert(sizeof(OutlinePushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match the k_operator_* constants in shaders/tonemap.slang.
-enum class TonemapOperator : std::int32_t {
-    none = 0,
-    reinhard = 1,
-    aces = 2,
-};
-
-// Parallel to the enum above, for the combo box. An array rather than a
-// function of the enum so the two orders cannot drift apart unnoticed.
-constexpr std::array<const char*, 3> k_tonemap_names{"None (clamp)", "Reinhard", "ACES (fitted)"};
-
-// Must match PushConstants in shaders/tonemap.slang. Verified against the
-// compiled SPIR-V, which decorates these members Offset 0 and Offset 4.
-struct TonemapPushConstants {
-    float exposure = 1.0F;
-    std::int32_t tonemap_operator = 0;
-};
-static_assert(offsetof(TonemapPushConstants, exposure) == 0);
-static_assert(offsetof(TonemapPushConstants, tonemap_operator) == 4);
-static_assert(sizeof(TonemapPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Must match PushConstants in shaders/fxaa.slang. Verified against the compiled
-// SPIR-V, which decorates these members at 0, 8, 12, 16 and 20 -- the float2
-// aligns to 8, which is what puts the first scalar at 8 rather than 4.
-struct FxaaPushConstants {
-    glm::vec2 inverse_extent{0.0F};
-    float edge_threshold = 0.0F;
-    float edge_threshold_min = 0.0F;
-    float subpixel_quality = 0.0F;
-    std::int32_t enabled = 0;
-};
-static_assert(offsetof(FxaaPushConstants, inverse_extent) == 0);
-static_assert(offsetof(FxaaPushConstants, edge_threshold) == 8);
-static_assert(offsetof(FxaaPushConstants, edge_threshold_min) == 12);
-static_assert(offsetof(FxaaPushConstants, subpixel_quality) == 16);
-static_assert(offsetof(FxaaPushConstants, enabled) == 20);
-static_assert(sizeof(FxaaPushConstants) <= gpu::GraphicsPipeline::k_push_constant_size);
-
-// Range of the exposure slider, in stops. Four either way covers "the scene is
-// lit for a sunny day" to "the scene is lit by one lantern" without the slider
-// becoming too coarse to make a small correction with.
-constexpr float k_min_exposure_stops = -4.0F;
-constexpr float k_max_exposure_stops = 4.0F;
 
 // Captures land here, relative to the working directory. Git-ignored: these are
 // output, and a portfolio screenshot belongs in a README by hand rather than
@@ -201,31 +76,16 @@ constexpr const char* k_screenshot_directory = "screenshots";
 // Every format is_capturable_format accepts is 8-bit RGBA or BGRA.
 constexpr VkDeviceSize k_swapchain_bytes_per_pixel = 4;
 
+// Used by the capture copy below. The render passes have their own copy in
+// renderer.cpp; a shared header for two lines of constexpr would cost more
+// than it saved.
+constexpr VkImageSubresourceRange k_color_range{
+    VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+
 // 720p left the 3D view around 716 px wide once the panels took their columns,
 // which is thin for an editor and thinner still for a capture of one.
 constexpr std::uint32_t k_initial_width = 1600;
 constexpr std::uint32_t k_initial_height = 900;
-
-constexpr VkClearColorValue k_clear_color{{0.0036F, 0.0036F, 0.0036F, 1.0F}};
-
-constexpr VkImageSubresourceRange k_color_range{
-    VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-
-constexpr VkImageSubresourceRange k_depth_range{
-    VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-
-// The cache belongs in the user's cache dir, not the build tree: it must
-// survive `--clean`, and it is machine-specific so it should never be
-// committed or copied between machines.
-std::filesystem::path pipeline_cache_path() {
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && *xdg != '\0') {
-        return std::filesystem::path(xdg) / "sage" / "pipeline_cache.bin";
-    }
-    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-        return std::filesystem::path(home) / ".cache" / "sage" / "pipeline_cache.bin";
-    }
-    return std::filesystem::path(".sage-pipeline-cache.bin");
-}
 
 // A timestamped path under k_screenshot_directory, disambiguated if one already
 // exists. The timestamp resolves to the second, so two captures in the same
@@ -252,27 +112,6 @@ std::filesystem::path next_screenshot_path() {
 // front, which is comfortable on any discrete GPU and fine on integrated.
 // Overrunning it drops primitives with a message rather than aborting.
 constexpr VkDeviceSize k_geometry_capacity = 64ULL * 1024 * 1024;
-
-// The one docked column, as a fraction of the window. It carries the scene
-// tree over the selection's properties; everything else is a menu, an overlay
-// or a dialog, and the rest of the window is the 3D view.
-constexpr float k_right_column_fraction = 0.22F;
-// Inset of the read-out from the 3D view's top-right corner, and how opaque
-// its backing is: enough to stay legible over a bright surface without hiding
-// what is behind it.
-constexpr float k_overlay_margin = 12.0F;
-constexpr float k_overlay_alpha = 0.55F;
-
-// Edits kept on the undo stack. Deep enough that no realistic session runs
-// off the end, shallow enough that the closures cannot accumulate unboundedly.
-constexpr std::size_t k_max_undo_depth = 128;
-
-// Menu content has no panel to stretch into, so widgets that would otherwise
-// fill the available width need one given to them.
-constexpr float k_menu_item_width = 220.0F;
-// The right column is split between the scene tree and the properties of
-// whatever is selected in it.
-constexpr float k_hierarchy_fraction = 0.5F;
 
 // Fraction of the bounding sphere's fitted distance to back off by, so the
 // model does not touch the edges of the view.
@@ -359,53 +198,6 @@ constexpr float k_fallback_placement_distance = 5.0F;
 // away that the object would be invisible. Treated as a miss.
 constexpr float k_max_placement_distance = 1000.0F;
 
-// The dockspace's central node in framebuffer pixels, or the whole image when
-// there is no layout yet. Free rather than a member so ImGuiID stays out of
-// application.hpp.
-VkRect2D central_node_rect(ImGuiID dockspace, VkExtent2D extent) {
-    const VkRect2D whole{{0, 0}, extent};
-
-    const ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace);
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    if (central == nullptr || central->Size.x <= 0.0F || central->Size.y <= 0.0F ||
-        viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
-        return whole;
-    }
-
-    // ImGui measures in the window's logical coordinates while the swapchain is
-    // in framebuffer pixels. The two are equal until display scaling is
-    // involved -- exactly the kind of difference that goes unnoticed on one
-    // machine and misplaces the whole viewport on another.
-    const float scale_x = static_cast<float>(extent.width) / viewport->Size.x;
-    const float scale_y = static_cast<float>(extent.height) / viewport->Size.y;
-
-    // Relative to the viewport rather than absolute: with multi-viewport off
-    // the main viewport sits at the origin, but subtracting costs nothing and
-    // is correct either way.
-    const float x = (central->Pos.x - viewport->Pos.x) * scale_x;
-    const float y = (central->Pos.y - viewport->Pos.y) * scale_y;
-
-    // Clamped because a scissor rect reaching outside the attachment is
-    // invalid, and rounding at the edges is enough to put it there.
-    const auto clamp_to = [](float value, std::uint32_t limit) {
-        return static_cast<std::uint32_t>(std::clamp(value, 0.0F, static_cast<float>(limit)));
-    };
-    const std::uint32_t left = clamp_to(x, extent.width);
-    const std::uint32_t top = clamp_to(y, extent.height);
-
-    VkRect2D rect{};
-    rect.offset = {static_cast<std::int32_t>(left), static_cast<std::int32_t>(top)};
-    rect.extent = {clamp_to(central->Size.x * scale_x, extent.width - left),
-                   clamp_to(central->Size.y * scale_y, extent.height - top)};
-
-    // A degenerate node -- collapsed, or mid-resize -- would divide by zero in
-    // the projection and make an invalid viewport.
-    if (rect.extent.width == 0 || rect.extent.height == 0) {
-        return whole;
-    }
-    return rect;
-}
-
 }  // namespace
 
 Application::Application(const std::filesystem::path& model_path)
@@ -428,83 +220,11 @@ Application::Application(const std::filesystem::path& model_path)
       texture_registry_(allocator_, device_, uploader_, bindless_set_, sampler_),
       material_registry_(allocator_, uploader_, bindless_set_, k_max_materials),
       selection_buffer_(allocator_, uploader_, bindless_set_),
-      frame_buffer_(allocator_, device_, sizeof(FrameData) * gpu::FramePacer::k_frames_in_flight,
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
-      pick_buffer_(allocator_, device_, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                   gpu::BufferAccess::host_read),
       swapchain_(device_, surface_.handle(), window_.framebuffer_extent()),
-      depth_buffer_(allocator_, device_, swapchain_.extent()),
-      id_buffer_(allocator_, device_, swapchain_.extent()),
-      hdr_target_(allocator_, device_, swapchain_.extent()),
-      ldr_target_(allocator_, device_, swapchain_.extent()),
-      shadow_map_(allocator_, device_),
-      pipeline_cache_(device_, pipeline_cache_path()),
-      shadow_pipeline_(device_,
-                       gpu::GraphicsPipelineDesc{
-                           .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "shadow.spv",
-                           // No colour at all; depth is the entire output.
-                           .depth_format = gpu::ShadowMap::format(),
-                           .depth_only = true,
-                           .depth_bias = true,
-                           .set_layout = bindless_set_.layout(),
-                           .cache = pipeline_cache_.handle(),
-                       }),
-      pipeline_(device_,
-                gpu::GraphicsPipelineDesc{
-                    .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "mesh.spv",
-                    // The HDR target, not the swapchain: this pass no longer
-                    // writes anything a display sees directly.
-                    .color_format = gpu::HdrTarget::format(),
-                    .id_format = gpu::IdBuffer::format(),
-                    .depth_format = depth_buffer_.format(),
-                    .set_layout = bindless_set_.layout(),
-                    .cache = pipeline_cache_.handle(),
-                }),
-      outline_pipeline_(device_,
-                        gpu::GraphicsPipelineDesc{
-                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "outline.spv",
-                            // Still the swapchain. The outline is an editor
-                            // affordance, not a lit surface: drawing it into
-                            // the HDR target would put it through the tonemap,
-                            // which would quietly change the colour asked for
-                            // into a darker, less saturated one.
-                            .color_format = swapchain_.format(),
-                            // No id attachment and no depth: this pass reads
-                            // ids, it does not write them, and a full-screen
-                            // triangle has nothing to be occluded by.
-                            .alpha_blend = true,
-                            .cull_backfaces = false,
-                            .set_layout = bindless_set_.layout(),
-                            .cache = pipeline_cache_.handle(),
-                        }),
-      tonemap_pipeline_(device_,
-                        gpu::GraphicsPipelineDesc{
-                            .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "tonemap.spv",
-                            // The LDR target, not the swapchain: FXAA sits
-                            // between them now.
-                            .color_format = gpu::LdrTarget::format(),
-                            .cull_backfaces = false,
-                            .set_layout = bindless_set_.layout(),
-                            .cache = pipeline_cache_.handle(),
-                        }),
-      fxaa_pipeline_(device_,
-                     gpu::GraphicsPipelineDesc{
-                         .spirv_path = std::filesystem::path(SAGE_SHADER_DIR) / "fxaa.spv",
-                         .color_format = swapchain_.format(),
-                         .cull_backfaces = false,
-                         .set_layout = bindless_set_.layout(),
-                         .cache = pipeline_cache_.handle(),
-                     }),
+      renderer_(device_, allocator_, bindless_set_, swapchain_),
       frame_pacer_(device_),
       imgui_(instance_, device_, window_, swapchain_.format(), swapchain_.image_count()) {
-    bindless_set_.write_object_id_image(id_buffer_.view());
-    bindless_set_.write_hdr_color_image(hdr_target_.view());
-    // Written once, unlike the two above: the shadow map does not follow the
-    // swapchain, so a resize never invalidates this view.
-    bindless_set_.write_shadow_map(shadow_map_.view(), shadow_map_.sampler());
-    bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
     gizmo_operation_ = static_cast<int>(ImGuizmo::TRANSLATE);
-    tonemap_operator_ = static_cast<int>(TonemapOperator::aces);
     if (!gpu::is_capturable_format(swapchain_.format())) {
         SAGE_LOG_WARN("Swapchain format {} cannot be captured; screenshots are disabled",
                       static_cast<int>(swapchain_.format()));
@@ -627,6 +347,40 @@ Application::~Application() {
     device_.wait_idle();
 }
 
+// Gathers everything the render passes read from outside themselves, once per
+// frame. The single place the editor's state is handed to the renderer -- which
+// is what keeps the passes from reaching back into Application for it.
+Renderer::FrameView Application::frame_view(std::uint32_t frame_slot) const {
+    const CameraMatrices matrices = camera_matrices();
+
+    // The shadow map is fitted to one directional light -- the first in the
+    // graph, matching the shader, which spends its one lookup on the first
+    // directional light it evaluates. With none in the scene there is nothing
+    // to fit and nothing to cast.
+    const gpu::SceneNode* key = scene_graph_.find(first_directional_light());
+
+    Renderer::FrameView view;
+    view.scene = &scene_graph_;
+    view.geometry = &geometry_registry_;
+    view.settings = &render_settings_;
+    view.view_projection = matrices.projection * matrices.view;
+    view.camera_position = camera_.position();
+    view.has_key_light = key != nullptr;
+    if (key != nullptr) {
+        view.key_light_direction =
+            glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F));
+    }
+    view.viewport = viewport_rect_;
+    // Hidden with the panels, and hidden for the frame a no-UI capture is
+    // taken on. That frame is also the one on screen, so pressing F2 without
+    // F11 blinks the icons for a single frame -- the alternative is rendering
+    // the scene twice.
+    view.show_editor_meshes =
+        !ui_hidden_ && !(pending_screenshot_.has_value() && !screenshot_include_ui_);
+    view.frame_slot = frame_slot;
+    return view;
+}
+
 Application::CameraMatrices Application::camera_matrices() const {
     const float aspect = static_cast<float>(viewport_rect_.extent.width) /
                          static_cast<float>(viewport_rect_.extent.height);
@@ -639,40 +393,6 @@ Application::CameraMatrices Application::camera_matrices() const {
     return matrices;
 }
 
-std::uint32_t Application::collect_lights(std::array<gpu::Light, gpu::k_max_lights>& lights) const {
-    std::uint32_t count = 0;
-
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.alive || !node.has_light) {
-            continue;
-        }
-        if (count >= gpu::k_max_lights) {
-            // Dropped rather than grown: the frame buffer's light array is a
-            // fixed size the shader also declares, so the limit is a layout
-            // fact rather than a policy this function can bend.
-            break;
-        }
-
-        gpu::Light& light = lights[count];
-        light.type = node.light.type;
-        light.color = node.light.color;
-        light.intensity = node.light.intensity;
-        light.range = node.light.range;
-        // Both derived from the transform, which is what makes the gizmo work
-        // on a light at all.
-        light.position = glm::vec3(node.world_transform[3]);
-        // -Y is the canonical direction, so an unrotated light points down and
-        // the rotate gizmo tilts it from there. Normalised because a scaled
-        // node would otherwise hand the shader a non-unit direction, which the
-        // BRDF has no way to notice and every dot product would be wrong by.
-        const glm::vec3 down = glm::mat3(node.world_transform) * glm::vec3(0.0F, -1.0F, 0.0F);
-        const float length = glm::length(down);
-        light.direction = length > 1e-6F ? down / length : glm::vec3(0.0F, -1.0F, 0.0F);
-        ++count;
-    }
-    return count;
-}
-
 gpu::NodeHandle Application::first_directional_light() const {
     for (std::size_t i = 0; i < scene_graph_.nodes().size(); ++i) {
         const gpu::SceneNode& node = scene_graph_.nodes()[i];
@@ -681,582 +401,6 @@ gpu::NodeHandle Application::first_directional_light() const {
         }
     }
     return gpu::NodeHandle{};
-}
-
-Application::Bounds Application::scene_bounds() const {
-    Bounds bounds{glm::vec3(std::numeric_limits<float>::max()),
-                  glm::vec3(std::numeric_limits<float>::lowest())};
-
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        // editor_only excluded as well as mesh-less. A light icon is not scene
-        // content, and counting it here would cost three separate things: the
-        // shadow frustum would stretch to cover a marker floating above the
-        // subject and spend its resolution on empty air, a new primitive would
-        // be sized against a scene the markers made bigger, and repositioning
-        // the default light would move the very icon that set the bounds it
-        // was positioned from.
-        if (!node.alive || !node.has_mesh || node.editor_only) {
-            continue;
-        }
-        const glm::vec3& local_min = node.mesh.bounds_min;
-        const glm::vec3& local_max = node.mesh.bounds_max;
-
-        // All eight corners, not just the two. Transforming min and max alone
-        // is only correct for an axis-aligned transform; under any rotation it
-        // yields a box that does not contain the mesh.
-        for (int corner = 0; corner < 8; ++corner) {
-            const glm::vec3 local{(corner & 1) != 0 ? local_max.x : local_min.x,
-                                  (corner & 2) != 0 ? local_max.y : local_min.y,
-                                  (corner & 4) != 0 ? local_max.z : local_min.z};
-            const glm::vec3 world = glm::vec3(node.world_transform * glm::vec4(local, 1.0F));
-            bounds.min = glm::min(bounds.min, world);
-            bounds.max = glm::max(bounds.max, world);
-        }
-    }
-    return bounds;
-}
-
-Application::LightFit Application::fit_light(const Bounds& bounds,
-                                             const glm::vec3& light_direction) const {
-    if (bounds.empty()) {
-        return {};
-    }
-
-    const glm::vec3 center = (bounds.min + bounds.max) * 0.5F;
-    // The bounding sphere, not the box. A box's extent depends on how it is
-    // turned; fitting the sphere means the frustum stays the same size as the
-    // light swings around, so the shadow's resolution does not change while
-    // the direction slider is dragged.
-    const float radius = glm::length(bounds.max - bounds.min) * 0.5F;
-    // A degenerate scene -- one point, or nothing -- would make a zero-extent
-    // projection and divide by zero.
-    const float extent = std::max(radius, 1e-3F);
-
-    const glm::vec3 direction = glm::normalize(light_direction);
-
-    // Any vector not parallel to the light will do as an up hint; world up
-    // fails exactly when the light points straight down, which is a common
-    // enough setting to handle rather than hope about.
-    const glm::vec3 up =
-        std::abs(direction.y) > 0.99F ? glm::vec3(0.0F, 0.0F, 1.0F) : glm::vec3(0.0F, 1.0F, 0.0F);
-
-    // Pulled back a full diameter beyond the sphere so that geometry behind
-    // the centre still falls inside the near plane and casts.
-    const glm::vec3 eye = center - direction * (extent * 2.0F);
-    const glm::mat4 view = glm::lookAt(eye, center, up);
-
-    // Depth range covers the pull-back plus the far side of the sphere. Kept
-    // tight rather than generous: every unit of depth range spent on empty
-    // space is precision taken from the part that has geometry in it.
-    const glm::mat4 projection =
-        core::ortho_vk(-extent, extent, -extent, extent, 0.0F, extent * 4.0F);
-
-    LightFit fit;
-    fit.view_projection = projection * view;
-    // The frustum spans 2 * extent across `resolution` texels.
-    fit.world_texel_size = (extent * 2.0F) / static_cast<float>(shadow_map_.resolution());
-    return fit;
-}
-
-void Application::write_frame_data(std::uint32_t frame_slot) const {
-    const CameraMatrices matrices = camera_matrices();
-
-    // One write per frame, into this frame's own slot. Writing a single shared
-    // slot would race the GPU, which may still be reading the previous frame's
-    // copy. begin_frame() has already waited out the work that used this slot.
-    FrameData frame_data;
-    frame_data.view_projection = matrices.projection * matrices.view;
-    frame_data.camera_position = camera_.position();
-
-    // Gathered from the graph rather than from members. The shader has always
-    // read lights as data; what changed is that the data now comes from nodes,
-    // so a light can be placed, parented and dragged like anything else.
-    frame_data.light_count = collect_lights(frame_data.lights);
-    frame_data.ambient_intensity = ambient_intensity_;
-
-    // Refitted every frame from live world transforms. A gizmo drag moves
-    // geometry, which moves the bounds, which moves the frustum -- so a shadow
-    // keeps up with the thing casting it.
-    // The shadow map is fitted to one directional light -- the first in the
-    // graph, matching the shader, which spends it on the first directional
-    // light it evaluates. With none in the scene there is nothing to fit and
-    // nothing to cast, so the pass still runs but the lookup is skipped.
-    const gpu::SceneNode* key = scene_graph_.find(first_directional_light());
-    const glm::vec3 key_direction =
-        key != nullptr ? glm::vec3(glm::mat3(key->world_transform) * glm::vec3(0.0F, -1.0F, 0.0F))
-                       : glm::vec3(0.0F, -1.0F, 0.0F);
-
-    const LightFit fit = fit_light(scene_bounds(), key_direction);
-    frame_data.light_view_projection = fit.view_projection;
-    // Texels converted to world units here, so the shader stays in world space
-    // and the slider keeps meaning the same thing at any scene scale.
-    frame_data.shadow_normal_bias = shadow_normal_bias_texels_ * fit.world_texel_size;
-    frame_data.shadow_pcf_radius = shadow_pcf_radius_;
-    frame_data.shadow_texel_size = 1.0F / static_cast<float>(shadow_map_.resolution());
-    frame_data.shadow_enabled = (shadows_enabled_ && key != nullptr) ? 1U : 0U;
-
-    frame_buffer_.write(&frame_data, sizeof(frame_data),
-                        VkDeviceSize{frame_slot} * sizeof(FrameData));
-}
-
-void Application::record_shadow(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
-    VkImageMemoryBarrier2 to_depth{};
-    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // The previous frame's last use was the fragment shader sampling this map,
-    // so that read has to finish before the pass below overwrites it. A
-    // write-after-read, hence no source access mask.
-    to_depth.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_depth.srcAccessMask = VK_ACCESS_2_NONE;
-    to_depth.dstStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.image = shadow_map_.image();
-    to_depth.subresourceRange = k_depth_range;
-
-    VkDependencyInfo begin_dependency{};
-    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    begin_dependency.imageMemoryBarrierCount = 1;
-    begin_dependency.pImageMemoryBarriers = &to_depth;
-    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
-
-    // STORE, unlike the main depth buffer's DONT_CARE: this attachment's whole
-    // purpose is to be read back afterwards.
-    VkRenderingAttachmentInfo depth_attachment{};
-    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_attachment.imageView = shadow_map_.view();
-    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depth_attachment.clearValue.depthStencil = {1.0F, 0};
-
-    const VkExtent2D extent = shadow_map_.extent();
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 0;
-    rendering.pDepthAttachment = &depth_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            shadow_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    VkViewport viewport{};
-    viewport.x = 0.0F;
-    viewport.y = 0.0F;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-    // Dynamic, so the two ends of the bias trade-off stay draggable. The
-    // constant term is in units of the depth format's smallest representable
-    // difference; the slope term scales with how steeply the surface is turned
-    // away from the light, which is where acne appears first.
-    vkCmdSetDepthBias(command_buffer, shadow_depth_bias_, 0.0F, shadow_slope_bias_);
-
-    const VkDeviceAddress frame_address =
-        frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
-
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        // editor_only skipped as well as mesh-less: a marker standing for a
-        // light must not cast a shadow of its own.
-        if (!node.alive || !node.has_mesh || node.editor_only) {
-            continue;
-        }
-        // The same struct the main pass pushes. This pipeline's shader declares
-        // only the first three members and ignores the rest.
-        PushConstants push{};
-        push.vertex_address = node.mesh.vertex_address;
-        push.frame_address = frame_address;
-        push.model = node.world_transform;
-        vkCmdPushConstants(command_buffer, shadow_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                           sizeof(push), &push);
-        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
-                             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
-    }
-
-    vkCmdEndRendering(command_buffer);
-
-    // Into the layout the descriptor written at startup names. DEPTH_READ_ONLY
-    // rather than SHADER_READ_ONLY because this is a depth image.
-    VkImageMemoryBarrier2 to_read{};
-    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_read.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_read.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
-    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.image = shadow_map_.image();
-    to_read.subresourceRange = k_depth_range;
-
-    VkDependencyInfo end_dependency{};
-    end_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    end_dependency.imageMemoryBarrierCount = 1;
-    end_dependency.pImageMemoryBarriers = &to_read;
-    vkCmdPipelineBarrier2(command_buffer, &end_dependency);
-}
-
-void Application::record_scene(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const {
-    VkImageMemoryBarrier2 to_color{};
-    to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // FRAGMENT_SHADER as the source stage, not COLOR_ATTACHMENT_OUTPUT: the
-    // previous frame's last use of this image was the tonemap sampling it, and
-    // that read has to finish before this frame overwrites it.
-    to_color.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.image = hdr_target_.image();
-    to_color.subresourceRange = k_color_range;
-
-    VkImageMemoryBarrier2 to_depth{};
-    to_depth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_depth.srcStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_depth.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_depth.dstStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    to_depth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    to_depth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_depth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    to_depth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_depth.image = depth_buffer_.image();
-    to_depth.subresourceRange = k_depth_range;
-
-    // Same shape as the colour barrier: the previous contents are never read,
-    // so UNDEFINED discards them and the clear below writes every texel.
-    VkImageMemoryBarrier2 to_id{};
-    to_id.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_id.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_id.srcAccessMask = VK_ACCESS_2_NONE;
-    to_id.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_id.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_id.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_id.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_id.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_id.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_id.image = id_buffer_.image();
-    to_id.subresourceRange = k_color_range;
-
-    const std::array<VkImageMemoryBarrier2, 3> begin_barriers{to_color, to_depth, to_id};
-
-    VkDependencyInfo begin_dependency{};
-    begin_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    begin_dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(begin_barriers.size());
-    begin_dependency.pImageMemoryBarriers = begin_barriers.data();
-    vkCmdPipelineBarrier2(command_buffer, &begin_dependency);
-
-    // loadOp CLEAR is what replaces M1's vkCmdClearColorImage.
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = hdr_target_.view();
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // The clear covers the whole image while the draws below are scissored to
-    // the viewport. That is deliberate: it leaves every texel the tonemap will
-    // read defined, so the resolve can be one full-screen triangle with no
-    // special case for the region behind the panels.
-    color_attachment.clearValue.color = k_clear_color;
-
-    VkRenderingAttachmentInfo depth_attachment{};
-    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_attachment.imageView = depth_buffer_.view();
-    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth_attachment.clearValue.depthStencil = {1.0F, 0};
-
-    // Cleared to k_null_id, so every pixel no draw covers reads back as
-    // "nothing here" rather than as whatever the last frame left behind.
-    VkRenderingAttachmentInfo id_attachment{};
-    id_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    id_attachment.imageView = id_buffer_.view();
-    id_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    id_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    id_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    id_attachment.clearValue.color.uint32[0] = gpu::IdBuffer::k_null_id;
-
-    const std::array<VkRenderingAttachmentInfo, 2> color_attachments{color_attachment,
-                                                                     id_attachment};
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = hdr_target_.extent();
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = static_cast<std::uint32_t>(color_attachments.size());
-    rendering.pColorAttachments = color_attachments.data();
-    rendering.pDepthAttachment = &depth_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.layout(), 0,
-                            1, &descriptor_set, 0, nullptr);
-
-    // The dockspace's central node, not the whole image: the panels are opaque,
-    // so drawing behind them costs fill rate and, worse, makes the projection
-    // describe a view wider than the one actually on screen.
-    VkViewport viewport{};
-    viewport.x = static_cast<float>(viewport_rect_.offset.x);
-    viewport.y = static_cast<float>(viewport_rect_.offset.y);
-    viewport.width = static_cast<float>(viewport_rect_.extent.width);
-    viewport.height = static_cast<float>(viewport_rect_.extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
-
-    // Already written by write_frame_data, before the shadow pass -- both
-    // passes read the same slot, and the shadow pass needs the light matrix
-    // that is in it.
-    const VkDeviceAddress frame_address =
-        frame_buffer_.device_address() + (VkDeviceSize{frame_slot} * sizeof(FrameData));
-
-    // Light icons are drawn with the scene so they pick and outline like any
-    // other mesh, but they are the tool rather than the render: hidden with the
-    // panels, and hidden for the frame a no-UI capture is taken on. That frame
-    // is also the one on screen, so pressing F2 without F11 blinks them for a
-    // single frame -- the alternative is rendering the scene twice.
-    const bool show_editor_meshes =
-        !ui_hidden_ && !(pending_screenshot_.has_value() && !screenshot_include_ui_);
-
-    for (std::uint32_t index = 0; index < scene_graph_.nodes().size(); ++index) {
-        const gpu::SceneNode& node = scene_graph_.nodes()[index];
-        if (!node.alive || !node.has_mesh) {
-            // Deleted, or a pure transform node: glTF hierarchy nodes, and the
-            // per-load root.
-            continue;
-        }
-        if (node.editor_only && !show_editor_meshes) {
-            continue;
-        }
-
-        PushConstants push{};
-        push.vertex_address = node.mesh.vertex_address;
-        push.frame_address = frame_address;
-        push.model = node.world_transform;
-        push.material_index = node.material_index;
-        // Offset by one so that k_null_id (0) stays reserved for empty space;
-        // resolve_pick subtracts it back off.
-        push.object_id = index + 1;
-        vkCmdPushConstants(command_buffer, pipeline_.layout(), VK_SHADER_STAGE_ALL, 0, sizeof(push),
-                           &push);
-        vkCmdBindIndexBuffer(command_buffer, geometry_registry_.buffer(), node.mesh.index_offset,
-                             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(command_buffer, node.mesh.index_count, 1, 0, 0, 0);
-    }
-
-    vkCmdEndRendering(command_buffer);
-}
-
-void Application::record_tonemap(VkCommandBuffer command_buffer) const {
-    // Two transitions, one dependency. The HDR target stops being an attachment
-    // and becomes a texture; the LDR target, which the FXAA pass sampled last
-    // frame, goes the other way.
-    VkImageMemoryBarrier2 hdr_to_read{};
-    hdr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    hdr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    hdr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    hdr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    hdr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    hdr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    hdr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    hdr_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hdr_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hdr_to_read.image = hdr_target_.image();
-    hdr_to_read.subresourceRange = k_color_range;
-
-    // Write-after-read: the previous frame's FXAA pass sampled this image, and
-    // that read has to finish before the tonemap overwrites it.
-    VkImageMemoryBarrier2 ldr_to_color{};
-    ldr_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    ldr_to_color.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    ldr_to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    ldr_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    ldr_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    ldr_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ldr_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ldr_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_color.image = ldr_target_.image();
-    ldr_to_color.subresourceRange = k_color_range;
-
-    const std::array<VkImageMemoryBarrier2, 2> barriers{hdr_to_read, ldr_to_color};
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size());
-    dependency.pImageMemoryBarriers = barriers.data();
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-
-    // DONT_CARE, not CLEAR: the triangle below covers every pixel of the image,
-    // so clearing first would be writing the whole target twice.
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = ldr_target_.view();
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    const VkExtent2D extent = ldr_target_.extent();
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, tonemap_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            tonemap_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    // The whole image, not viewport_rect_: the region behind the panels was
-    // cleared by the scene pass and still has to be resolved, or it would show
-    // whatever the presentation engine last left in this swapchain image.
-    VkViewport viewport{};
-    viewport.x = 0.0F;
-    viewport.y = 0.0F;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-    TonemapPushConstants push{};
-    // Stops are a doubling each, which is what the exp2 is: +1 stop is twice
-    // the light reaching the sensor.
-    push.exposure = std::exp2(exposure_stops_);
-    push.tonemap_operator = tonemap_operator_;
-    vkCmdPushConstants(command_buffer, tonemap_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                       sizeof(push), &push);
-
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    vkCmdEndRendering(command_buffer);
-}
-
-void Application::record_fxaa(VkCommandBuffer command_buffer, VkImage image,
-                              VkImageView image_view) const {
-    // The LDR target stops being an attachment and becomes a texture; the
-    // swapchain image, untouched so far this frame, becomes an attachment for
-    // the first time.
-    VkImageMemoryBarrier2 ldr_to_read{};
-    ldr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    ldr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    ldr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    ldr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    ldr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    ldr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ldr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ldr_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ldr_to_read.image = ldr_target_.image();
-    ldr_to_read.subresourceRange = k_color_range;
-
-    VkImageMemoryBarrier2 swapchain_to_color{};
-    swapchain_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    swapchain_to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    swapchain_to_color.srcAccessMask = VK_ACCESS_2_NONE;
-    swapchain_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    swapchain_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    swapchain_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    swapchain_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    swapchain_to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapchain_to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapchain_to_color.image = image;
-    swapchain_to_color.subresourceRange = k_color_range;
-
-    const std::array<VkImageMemoryBarrier2, 2> barriers{ldr_to_read, swapchain_to_color};
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size());
-    dependency.pImageMemoryBarriers = barriers.data();
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = image_view;
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    const VkExtent2D extent = swapchain_.extent();
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = {0, 0};
-    rendering.renderArea.extent = extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaa_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            fxaa_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    VkViewport viewport{};
-    viewport.x = 0.0F;
-    viewport.y = 0.0F;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-    FxaaPushConstants push{};
-    push.inverse_extent = glm::vec2(1.0F / static_cast<float>(extent.width),
-                                    1.0F / static_cast<float>(extent.height));
-    push.edge_threshold = fxaa_edge_threshold_;
-    push.edge_threshold_min = fxaa_edge_threshold_min_;
-    push.subpixel_quality = fxaa_subpixel_quality_;
-    push.enabled = fxaa_enabled_ ? 1 : 0;
-    vkCmdPushConstants(command_buffer, fxaa_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                       sizeof(push), &push);
-
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    vkCmdEndRendering(command_buffer);
 }
 
 void Application::handle_picking_input() {
@@ -1276,32 +420,7 @@ void Application::handle_picking_input() {
 }
 
 std::optional<VkOffset2D> Application::viewport_texel(float window_x, float window_y) const {
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F) {
-        return std::nullopt;
-    }
-
-    // ImGui reports logical coordinates; the attachments are framebuffer
-    // pixels. Same conversion as central_node_rect, for the same reason.
-    const VkExtent2D extent = swapchain_.extent();
-    const float x =
-        (window_x - viewport->Pos.x) * (static_cast<float>(extent.width) / viewport->Size.x);
-    const float y =
-        (window_y - viewport->Pos.y) * (static_cast<float>(extent.height) / viewport->Size.y);
-
-    const auto texel_x = static_cast<std::int32_t>(x);
-    const auto texel_y = static_cast<std::int32_t>(y);
-
-    // Outside the 3D view is not a miss, it is not a click in it at all --
-    // clicking the dockspace border should leave the selection alone, and
-    // should not offer to add anything either.
-    const VkRect2D& rect = viewport_rect_;
-    if (texel_x < rect.offset.x || texel_y < rect.offset.y ||
-        texel_x >= rect.offset.x + static_cast<std::int32_t>(rect.extent.width) ||
-        texel_y >= rect.offset.y + static_cast<std::int32_t>(rect.extent.height)) {
-        return std::nullopt;
-    }
-    return VkOffset2D{texel_x, texel_y};
+    return view_mapping().texel_at(glm::vec2{window_x, window_y});
 }
 
 void Application::handle_gizmo_keys() {
@@ -1337,151 +456,6 @@ void Application::service_selection() {
     selection_buffer_.update(selection_flags_);
 }
 
-void Application::record_outline(VkCommandBuffer command_buffer, VkImageView image_view) const {
-    // Unconditional, even with nothing selected: the barrier below is what
-    // leaves the id image in the layout record_pick_copy expects, so skipping
-    // the pass would make that layout depend on the selection.
-    VkImageMemoryBarrier2 to_read{};
-    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_read.image = id_buffer_.image();
-    to_read.subresourceRange = k_color_range;
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = 1;
-    dependency.pImageMemoryBarriers = &to_read;
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-
-    if (!selected_.valid()) {
-        return;
-    }
-
-    // LOAD, not CLEAR: the shaded scene is already here and the outline is
-    // drawn over it.
-    VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView = image_view;
-    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingInfo rendering{};
-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering.renderArea.offset = viewport_rect_.offset;
-    rendering.renderArea.extent = viewport_rect_.extent;
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color_attachment;
-
-    vkCmdBeginRendering(command_buffer, &rendering);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_pipeline_.handle());
-
-    const VkDescriptorSet descriptor_set = bindless_set_.handle();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            outline_pipeline_.layout(), 0, 1, &descriptor_set, 0, nullptr);
-
-    VkViewport viewport{};
-    viewport.x = static_cast<float>(viewport_rect_.offset.x);
-    viewport.y = static_cast<float>(viewport_rect_.offset.y);
-    viewport.width = static_cast<float>(viewport_rect_.extent.width);
-    viewport.height = static_cast<float>(viewport_rect_.extent.height);
-    viewport.minDepth = 0.0F;
-    viewport.maxDepth = 1.0F;
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(command_buffer, 0, 1, &viewport_rect_);
-
-    OutlinePushConstants push{};
-    push.viewport_origin = {viewport_rect_.offset.x, viewport_rect_.offset.y};
-    push.viewport_size = {static_cast<std::int32_t>(viewport_rect_.extent.width),
-                          static_cast<std::int32_t>(viewport_rect_.extent.height)};
-    vkCmdPushConstants(command_buffer, outline_pipeline_.layout(), VK_SHADER_STAGE_ALL, 0,
-                       sizeof(push), &push);
-
-    // Three vertices, no buffers: the vertex shader builds a full-screen
-    // triangle from SV_VertexID.
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    vkCmdEndRendering(command_buffer);
-}
-
-void Application::record_pick_copy(VkCommandBuffer command_buffer) const {
-    if (!pending_pick_.has_value()) {
-        return;
-    }
-
-    VkImageMemoryBarrier2 to_transfer_src{};
-    to_transfer_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // SHADER_READ_ONLY, not COLOR_ATTACHMENT: record_outline has already moved
-    // the image there. Ordering the two passes rather than making each one
-    // handle both cases keeps a single source layout per barrier.
-    to_transfer_src.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    to_transfer_src.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_transfer_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    to_transfer_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    to_transfer_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    to_transfer_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer_src.image = id_buffer_.image();
-    to_transfer_src.subresourceRange = k_color_range;
-
-    VkDependencyInfo to_transfer_dependency{};
-    to_transfer_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_transfer_dependency.imageMemoryBarrierCount = 1;
-    to_transfer_dependency.pImageMemoryBarriers = &to_transfer_src;
-    vkCmdPipelineBarrier2(command_buffer, &to_transfer_dependency);
-
-    // One texel. The whole point of an id attachment over a CPU-side raycast is
-    // that the answer is already rendered; reading more of it would be waste.
-    VkBufferImageCopy2 region{};
-    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
-    region.bufferOffset = 0;
-    region.bufferRowLength = 0;
-    region.bufferImageHeight = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageOffset = {pending_pick_->x, pending_pick_->y, 0};
-    region.imageExtent = {1, 1, 1};
-
-    VkCopyImageToBufferInfo2 copy{};
-    copy.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
-    copy.srcImage = id_buffer_.image();
-    copy.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    copy.dstBuffer = pick_buffer_.handle();
-    copy.regionCount = 1;
-    copy.pRegions = &region;
-    vkCmdCopyImageToBuffer2(command_buffer, &copy);
-
-    // Waiting on the submission alone does not make the copy visible to the
-    // host; the HOST stage has to be named as a destination for that.
-    VkBufferMemoryBarrier2 to_host{};
-    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
-    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_host.buffer = pick_buffer_.handle();
-    to_host.offset = 0;
-    to_host.size = VK_WHOLE_SIZE;
-
-    VkDependencyInfo to_host_dependency{};
-    to_host_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_host_dependency.bufferMemoryBarrierCount = 1;
-    to_host_dependency.pBufferMemoryBarriers = &to_host;
-    vkCmdPipelineBarrier2(command_buffer, &to_host_dependency);
-}
-
 void Application::resolve_pick() {
     if (!pending_pick_.has_value()) {
         return;
@@ -1494,8 +468,7 @@ void Application::resolve_pick() {
     // old -- would hand back whatever was under the cursor before the click.
     frame_pacer_.wait_all();
 
-    std::uint32_t id = gpu::IdBuffer::k_null_id;
-    pick_buffer_.read(&id, sizeof(id));
+    const std::uint32_t id = renderer_.read_picked_id();
 
     // Promoted to the root of whatever was hit. Clicking a mesh selects the
     // object it belongs to, not the individual submesh -- which is what makes
@@ -1646,276 +619,6 @@ void Application::resolve_screenshot() {
     screenshot_buffer_.reset();
 }
 
-void Application::transition_to_present(VkCommandBuffer command_buffer, VkImage image) {
-    VkImageMemoryBarrier2 to_present{};
-    to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    to_present.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_present.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_present.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-    to_present.dstAccessMask = VK_ACCESS_2_NONE;
-    to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_present.image = image;
-    to_present.subresourceRange = k_color_range;
-
-    VkDependencyInfo to_present_dependency{};
-    to_present_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    to_present_dependency.imageMemoryBarrierCount = 1;
-    to_present_dependency.pImageMemoryBarriers = &to_present;
-    vkCmdPipelineBarrier2(command_buffer, &to_present_dependency);
-}
-
-void Application::draw_dockspace() {
-    // With the UI hidden there is no dockspace at all, and the 3D view takes
-    // the whole image. Set explicitly rather than by letting the central node
-    // grow: a node whose windows were simply not submitted keeps whatever size
-    // the layout gave it, so the rect would be a frame behind at best.
-    if (ui_hidden_) {
-        viewport_rect_ = VkRect2D{{0, 0}, swapchain_.extent()};
-        const ImGuiViewport* whole = ImGui::GetMainViewport();
-        viewport_logical_pos_ = glm::vec2(whole->Pos.x, whole->Pos.y);
-        viewport_logical_size_ = glm::vec2(whole->Size.x, whole->Size.y);
-        return;
-    }
-
-    // PassthruCentralNode leaves the middle node transparent and, while it is
-    // empty, lets mouse input through it -- so the scene shows and the camera
-    // still responds. NoDockingOverCentralNode keeps it empty permanently, so a
-    // panel cannot be dragged over the 3D view by accident.
-    const ImGuiID dockspace = ImGui::DockSpaceOverViewport(
-        0, ImGui::GetMainViewport(),
-        ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_NoDockingOverCentralNode);
-
-    viewport_rect_ = central_node_rect(dockspace, swapchain_.extent());
-    update_viewport_logical_rect(dockspace);
-
-    if (dock_layout_built_) {
-        return;
-    }
-    dock_layout_built_ = true;
-
-    // Rebuilt from scratch every run. Layout persistence would be io.IniFilename,
-    // which ImGuiLayer deliberately leaves null, so there is nothing to preserve
-    // and the arrangement is the same on every start.
-    ImGui::DockBuilderRemoveNode(dockspace);
-    ImGui::DockBuilderAddNode(dockspace, ImGuiDockNodeFlags_DockSpace);
-    // Set before splitting: the ratios below are fractions of the node's size,
-    // and a node that has not been sized yet splits unpredictably.
-    ImGui::DockBuilderSetNodeSize(dockspace, ImGui::GetMainViewport()->Size);
-
-    // One column, on the right. The left one is gone: the read-out it held is
-    // now an overlay inside the 3D view and the browser it held is a dialog off
-    // the File menu, so a whole column of screen was being spent on two things
-    // that needed no permanent home.
-    ImGuiID right = 0;
-    ImGuiID centre = 0;
-    ImGui::DockBuilderSplitNode(dockspace, ImGuiDir_Right, k_right_column_fraction, &right,
-                                &centre);
-
-    ImGuiID right_top = 0;
-    ImGuiID right_bottom = 0;
-    ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, k_hierarchy_fraction, &right_top,
-                                &right_bottom);
-
-    ImGui::DockBuilderDockWindow("Hierarchy", right_top);
-    ImGui::DockBuilderDockWindow("Properties", right_bottom);
-    ImGui::DockBuilderFinish(dockspace);
-
-    // The split above changed the central node, so the rect taken before it is
-    // stale for this frame.
-    viewport_rect_ = central_node_rect(dockspace, swapchain_.extent());
-    update_viewport_logical_rect(dockspace);
-}
-
-void Application::update_viewport_logical_rect(unsigned int dockspace) {
-    const ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace);
-    const ImGuiViewport* whole = ImGui::GetMainViewport();
-    if (central == nullptr || central->Size.x <= 0.0F || central->Size.y <= 0.0F) {
-        viewport_logical_pos_ = glm::vec2(whole->Pos.x, whole->Pos.y);
-        viewport_logical_size_ = glm::vec2(whole->Size.x, whole->Size.y);
-        return;
-    }
-    viewport_logical_pos_ = glm::vec2(central->Pos.x, central->Pos.y);
-    viewport_logical_size_ = glm::vec2(central->Size.x, central->Size.y);
-}
-
-void Application::draw_stats_overlay() {
-    // Pinned inside the 3D view rather than to the window, so it tracks the
-    // central node as panels resize and follows the whole screen once they are
-    // hidden.
-    const ImVec2 corner{viewport_logical_pos_.x + viewport_logical_size_.x - k_overlay_margin,
-                        viewport_logical_pos_.y + k_overlay_margin};
-    ImGui::SetNextWindowPos(corner, ImGuiCond_Always, ImVec2(1.0F, 0.0F));
-    ImGui::SetNextWindowBgAlpha(k_overlay_alpha);
-
-    // NoInputs is the one that matters: without it the overlay would swallow
-    // clicks meant for whatever is behind it, and picking would go dead in one
-    // corner of the viewport for no visible reason.
-    const ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
-        ImGuiWindowFlags_NoInputs;
-
-    ImGui::Begin("##stats", nullptr, flags);
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::Text("%.1f fps  %.2f ms", static_cast<double>(io.Framerate),
-                1000.0 / static_cast<double>(io.Framerate));
-    ImGui::Separator();
-    ImGui::Text("%zu nodes", scene_graph_.live_size());
-    ImGui::Text("Geometry  %llu / %llu KiB",
-                static_cast<unsigned long long>(geometry_registry_.used() / 1024),
-                static_cast<unsigned long long>(geometry_registry_.capacity() / 1024));
-    ImGui::Text("Materials %u / %u", material_registry_.count(), material_registry_.capacity());
-    ImGui::Text("Textures  %u", texture_registry_.count());
-    ImGui::Separator();
-    const gpu::SceneNode* selected = scene_graph_.find(selected_);
-    ImGui::Text("Selected  %s", selected != nullptr ? selected->name.c_str() : "(none)");
-    const glm::vec3 position = camera_.position();
-    ImGui::Text("Camera    %.1f, %.1f, %.1f", static_cast<double>(position.x),
-                static_cast<double>(position.y), static_cast<double>(position.z));
-    ImGui::End();
-}
-
-void Application::draw_menu_bar() {
-    if (!ImGui::BeginMainMenuBar()) {
-        return;
-    }
-
-    if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open glTF...")) {
-            file_dialog_open_ = true;
-            file_dialog_scene_actions_ = true;
-            // Absent, so the file lands where it says it does. Only the context
-            // menu places a load.
-            file_dialog_placement_.reset();
-        }
-        if (ImGui::MenuItem("Clear scene")) {
-            // Queued: clear_scene waits for the device to go idle and destroys
-            // images a recording command buffer still names.
-            pending_clear_ = true;
-        }
-        ImGui::Separator();
-        ImGui::MenuItem("Include UI in captures", nullptr, &screenshot_include_ui_);
-        if (ImGui::MenuItem("Screenshot", "F2", false, !pending_screenshot_.has_value())) {
-            request_screenshot();
-        }
-        // What the next capture will actually contain, which the toggle above
-        // decides and is otherwise only discoverable by taking one.
-        if (screenshot_include_ui_) {
-            ImGui::TextDisabled("%ux%u, whole window", swapchain_.extent().width,
-                                swapchain_.extent().height);
-        } else {
-            ImGui::TextDisabled("%ux%u, no UI", viewport_rect_.extent.width,
-                                viewport_rect_.extent.height);
-        }
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("Edit")) {
-        // Labelled with what they would actually reverse, so the menu says
-        // "Undo Transform" rather than leaving you to remember what you did.
-        const std::string undo_label =
-            can_undo() ? "Undo " + undo_stack_[undo_cursor_ - 1].name : std::string("Undo");
-        const std::string redo_label =
-            can_redo() ? "Redo " + undo_stack_[undo_cursor_].name : std::string("Redo");
-        if (ImGui::MenuItem(undo_label.c_str(), "Ctrl+Z", false, can_undo())) {
-            undo();
-        }
-        if (ImGui::MenuItem(redo_label.c_str(), "Ctrl+Y", false, can_redo())) {
-            redo();
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Delete", "Del", false, scene_graph_.find(selected_) != nullptr)) {
-            delete_selected();
-        }
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("Render")) {
-        draw_presentation_controls();
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("Lighting")) {
-        draw_lighting_menu();
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("View")) {
-        ImGui::MenuItem("Hide panels", "F11", &ui_hidden_);
-        ImGui::EndMenu();
-    }
-
-    ImGui::EndMainMenuBar();
-}
-
-void Application::draw_file_dialog() {
-    if (file_dialog_open_ && !ImGui::IsPopupOpen("Load glTF")) {
-        ImGui::OpenPopup("Load glTF");
-    }
-
-    // Centred rather than at the cursor: the browser is a good deal larger than
-    // a menu, and anchoring it to a click near an edge would push it off-screen.
-    const ImVec2 centre = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
-    if (!ImGui::BeginPopupModal("Load glTF", &file_dialog_open_,
-                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        return;
-    }
-
-    if (const std::optional<FilePicker::Request> request =
-            file_picker_.draw_contents(file_dialog_scene_actions_);
-        request.has_value()) {
-        // Queued rather than loaded here: this is the middle of a frame, and a
-        // load blocks, waits for the device and destroys images the command
-        // buffer being recorded would still reference.
-        pending_load_ = PendingLoad{request->path, request->replace, file_dialog_placement_};
-        file_dialog_open_ = false;
-        ImGui::CloseCurrentPopup();
-    }
-    if (file_picker_.clear_requested()) {
-        pending_clear_ = true;
-        file_dialog_open_ = false;
-        ImGui::CloseCurrentPopup();
-    }
-    if (ImGui::Button("Cancel")) {
-        file_dialog_open_ = false;
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
-}
-
-void Application::draw_presentation_controls() {
-    ImGui::SeparatorText("Tonemap");
-
-    // Selectable at runtime rather than baked in, because the difference between
-    // two curves is only legible on the same frame -- comparing across a rebuild
-    // compares two memories of an image.
-    ImGui::SetNextItemWidth(k_menu_item_width);
-    ImGui::Combo("##tonemap", &tonemap_operator_, k_tonemap_names.data(),
-                 static_cast<int>(k_tonemap_names.size()));
-    if (tonemap_operator_ == static_cast<int>(TonemapOperator::none)) {
-        ImGui::TextDisabled("Clamped, as before M8");
-    }
-
-    ImGui::SliderFloat("Exposure", &exposure_stops_, k_min_exposure_stops, k_max_exposure_stops,
-                       "%+.2f stops");
-
-    ImGui::SeparatorText("Anti-aliasing");
-    ImGui::Checkbox("FXAA", &fxaa_enabled_);
-    ImGui::BeginDisabled(!fxaa_enabled_);
-    // Lower catches more edges and softens more of the image with them; higher
-    // leaves faint edges alone. The floor matters most in dark regions, where a
-    // tiny absolute difference is a large relative one.
-    ImGui::SliderFloat("Edge threshold", &fxaa_edge_threshold_, 0.03F, 0.33F, "%.3f");
-    ImGui::SliderFloat("Dark floor", &fxaa_edge_threshold_min_, 0.005F, 0.1F, "%.4f");
-    ImGui::SliderFloat("Subpixel", &fxaa_subpixel_quality_, 0.0F, 1.0F, "%.2f");
-    ImGui::EndDisabled();
-}
-
 bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& position) {
     const gpu::PrimitiveMesh mesh = gpu::make_primitive(kind);
 
@@ -1952,7 +655,7 @@ bool Application::add_primitive(gpu::PrimitiveKind kind, const glm::vec3& positi
     // Sized against what is already here. A fixed size cannot suit both a
     // chess piece and a street lamp -- the sample models alone span a factor
     // of 36 -- so an absolute default would be wrong for nearly every scene.
-    const Bounds bounds = scene_bounds();
+    const Bounds bounds = compute_scene_bounds(scene_graph_);
     const float radius = bounds.empty() ? 0.0F : glm::length(bounds.max - bounds.min) * 0.5F;
     const float reference = radius > 1e-4F ? radius : 1.0F;
     const float scale =
@@ -1990,7 +693,7 @@ bool Application::add_light(gpu::LightType type, const glm::vec3& position, bool
     // be invisible a couple of units away.
     authored.intensity = directional ? k_default_key_intensity : k_default_point_intensity;
 
-    const Bounds bounds = scene_bounds();
+    const Bounds bounds = compute_scene_bounds(scene_graph_);
     const float radius = bounds.empty() ? 1.0F : glm::length(bounds.max - bounds.min) * 0.5F;
     const float reference = radius > 1e-4F ? radius : 1.0F;
     authored.range = reference * k_point_range_fraction;
@@ -2099,7 +802,7 @@ void Application::reposition_default_light() {
         return;
     }
 
-    const Bounds bounds = scene_bounds();
+    const Bounds bounds = compute_scene_bounds(scene_graph_);
     if (bounds.empty()) {
         return;
     }
@@ -2133,7 +836,7 @@ void Application::reposition_default_light() {
 // the whole reason undo here is cheap.
 void Application::push_add_command(std::string name, gpu::NodeHandle added,
                                    gpu::NodeHandle previous_selection) {
-    push_command(
+    history_.push(
         std::move(name),
         [this, added, previous_selection]() {
             scene_graph_.remove_subtree(added);
@@ -2164,7 +867,7 @@ void Application::commit_transform_edit() {
     }
     const glm::mat4 after = current->local_transform;
 
-    push_command(
+    history_.push(
         "Transform",
         [this, node, before]() {
             scene_graph_.set_local_transform(node, before);
@@ -2180,7 +883,7 @@ void Application::commit_transform_edit() {
 
 void Application::push_light_command(std::string name, gpu::NodeHandle node,
                                      const gpu::SceneLight& before, const gpu::SceneLight& after) {
-    push_command(
+    history_.push(
         std::move(name),
         [this, node, before]() {
             scene_graph_.set_light(node, before);
@@ -2207,43 +910,8 @@ void Application::commit_light_edit() {
     push_light_command("Light", node, before, current->light);
 }
 
-void Application::push_command(std::string name, std::function<void()> undo_action,
-                               std::function<void()> redo_action) {
-    // Anything already undone is dropped: the history is a line, not a tree,
-    // and a new edit made after stepping back replaces what was ahead.
-    undo_stack_.resize(undo_cursor_);
-    undo_stack_.push_back(Command{std::move(name), std::move(undo_action), std::move(redo_action)});
-
-    // Bounded so a long session cannot grow it without limit. Dropping from the
-    // front costs an O(n) shift on a vector, which happens once per edit past
-    // the cap and is nothing next to the edit itself.
-    if (undo_stack_.size() > k_max_undo_depth) {
-        undo_stack_.erase(undo_stack_.begin());
-    }
-    undo_cursor_ = undo_stack_.size();
-}
-
-void Application::undo() {
-    if (!can_undo()) {
-        return;
-    }
-    --undo_cursor_;
-    undo_stack_[undo_cursor_].undo();
-    SAGE_LOG_INFO("Undo: {}", undo_stack_[undo_cursor_].name);
-}
-
-void Application::redo() {
-    if (!can_redo()) {
-        return;
-    }
-    undo_stack_[undo_cursor_].redo();
-    SAGE_LOG_INFO("Redo: {}", undo_stack_[undo_cursor_].name);
-    ++undo_cursor_;
-}
-
 void Application::clear_history() {
-    undo_stack_.clear();
-    undo_cursor_ = 0;
+    history_.clear();
     transform_edit_.reset();
     light_edit_.reset();
 }
@@ -2266,7 +934,7 @@ void Application::delete_selected() {
     //
     // That is also why undoing this is just un-tombstoning: the mesh never
     // left, so there is nothing to upload again.
-    push_command(
+    history_.push(
         "Delete",
         [this, target]() {
             scene_graph_.restore_subtree(target);
@@ -2308,412 +976,39 @@ void Application::service_pending_primitive() {
 }
 
 glm::vec3 Application::placement_point(float window_x, float window_y) const {
-    const CameraMatrices matrices = camera_matrices();
     const glm::vec3 origin = camera_.position();
+    // Where the ray misses, or the view is not yet laid out: a fixed distance
+    // straight ahead, which is at least visible and in front of the camera.
+    const glm::vec3 fallback = origin + (camera_.forward() * k_fallback_placement_distance);
 
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const VkExtent2D extent = swapchain_.extent();
-    if (viewport->Size.x <= 0.0F || viewport->Size.y <= 0.0F || viewport_rect_.extent.width == 0 ||
-        viewport_rect_.extent.height == 0) {
-        return origin + (camera_.forward() * k_fallback_placement_distance);
+    const std::optional<glm::vec2> ndc = view_mapping().ndc_at(glm::vec2{window_x, window_y});
+    if (!ndc.has_value()) {
+        return fallback;
     }
-
-    // ImGui reports logical coordinates; viewport_rect_ is framebuffer pixels.
-    // Same conversion as central_node_rect, for the same reason.
-    const float pixel_x = window_x * (static_cast<float>(extent.width) / viewport->Size.x);
-    const float pixel_y = window_y * (static_cast<float>(extent.height) / viewport->Size.y);
-
-    // Normalised within the 3D view, then to NDC. No Y negation: the
-    // projection is already Vulkan's, whose NDC Y runs down the screen exactly
-    // as framebuffer rows do.
-    const float ndc_x = (2.0F * (pixel_x - static_cast<float>(viewport_rect_.offset.x)) /
-                         static_cast<float>(viewport_rect_.extent.width)) -
-                        1.0F;
-    const float ndc_y = (2.0F * (pixel_y - static_cast<float>(viewport_rect_.offset.y)) /
-                         static_cast<float>(viewport_rect_.extent.height)) -
-                        1.0F;
-
-    // Unprojecting the far plane alone is enough for a direction: the near
-    // point is the camera position, which is already known exactly.
-    const glm::mat4 inverse_view_projection = glm::inverse(matrices.projection * matrices.view);
-    const glm::vec4 far_point = inverse_view_projection * glm::vec4(ndc_x, ndc_y, 1.0F, 1.0F);
-    if (std::abs(far_point.w) < 1e-6F) {
-        return origin + (camera_.forward() * k_fallback_placement_distance);
-    }
-    const glm::vec3 direction = glm::normalize(glm::vec3(far_point) / far_point.w - origin);
-
-    // Intersect the ground plane. A ray running along it, or pointing away
-    // from it, has no useful answer -- which is most of the time when the
-    // camera is below the horizon -- so fall back to a fixed distance ahead.
-    if (std::abs(direction.y) > 1e-4F) {
-        const float distance = -origin.y / direction.y;
-        if (distance > 0.0F && distance < k_max_placement_distance) {
-            return origin + (direction * distance);
-        }
-    }
-    return origin + (direction * k_fallback_placement_distance);
-}
-
-void Application::draw_context_menu() {
-    if (ImGui::BeginPopup("viewport_context")) {
-        ImGui::TextDisabled("Add at %.2f, %.2f, %.2f", static_cast<double>(context_menu_point_.x),
-                            static_cast<double>(context_menu_point_.y),
-                            static_cast<double>(context_menu_point_.z));
-        ImGui::Separator();
-        if (ImGui::MenuItem("Mesh (glTF)...")) {
-            // Deferred: a popup cannot be opened from inside one that is about
-            // to close, so this only records the intent. draw_file_dialog,
-            // which runs outside any menu, opens it.
-            file_dialog_open_ = true;
-            // No replace or clear from here, and the load lands at the click.
-            file_dialog_scene_actions_ = false;
-            file_dialog_placement_ = context_menu_point_;
-        }
-        if (ImGui::BeginMenu("Primitive")) {
-            constexpr std::array<gpu::PrimitiveKind, 5> k_kinds{
-                gpu::PrimitiveKind::plane, gpu::PrimitiveKind::cube, gpu::PrimitiveKind::sphere,
-                gpu::PrimitiveKind::cone, gpu::PrimitiveKind::cylinder};
-            for (const gpu::PrimitiveKind kind : k_kinds) {
-                if (ImGui::MenuItem(gpu::primitive_name(kind))) {
-                    // Queued, not built here: the upload blocks on a transfer
-                    // submission, and this is the middle of a frame.
-                    pending_primitive_ = PendingPrimitive{kind, context_menu_point_};
-                }
-            }
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Light")) {
-            if (ImGui::MenuItem("Directional")) {
-                pending_light_ = PendingLight{gpu::LightType::directional, context_menu_point_};
-            }
-            if (ImGui::MenuItem("Point")) {
-                pending_light_ = PendingLight{gpu::LightType::point, context_menu_point_};
-            }
-            ImGui::EndMenu();
-        }
-        ImGui::EndPopup();
-    }
-}
-
-void Application::draw_lighting_menu() {
-    // Lights live in the scene graph now, so this panel holds only what is
-    // global. Editing one light happens in Properties, with that light
-    // selected -- the same place every other node is edited.
-    std::uint32_t directional = 0;
-    std::uint32_t point = 0;
-    for (const gpu::SceneNode& node : scene_graph_.nodes()) {
-        if (!node.alive || !node.has_light) {
-            continue;
-        }
-        (node.light.type == gpu::LightType::directional ? directional : point) += 1;
-    }
-    ImGui::SeparatorText("Scene lights");
-    ImGui::Text("%u directional, %u point", directional, point);
-    if (directional + point > gpu::k_max_lights) {
-        ImGui::TextDisabled("Over the %u the shader reads; the rest are ignored.",
-                            gpu::k_max_lights);
-    }
-    if (directional == 0) {
-        ImGui::TextDisabled("No directional light: nothing casts a shadow.");
-    }
-    ImGui::TextDisabled("Right-click the viewport to add one.");
-
-    ImGui::SeparatorText("Ambient");
-    ImGui::DragFloat("Intensity##ambient", &ambient_intensity_, 0.002F, 0.0F, 1.0F, "%.3f");
-    ImGui::TextDisabled("Flat term; no IBL yet");
-
-    ImGui::SeparatorText("Shadow");
-    ImGui::Checkbox("Enabled##shadow", &shadows_enabled_);
-    ImGui::BeginDisabled(!shadows_enabled_);
-    // Acne and peter-panning are the two ends of one trade-off: too little bias
-    // and the surface shadows itself in stripes, too much and the contact
-    // shadow detaches from the object. The middle is found by dragging.
-    // The constant term's range dwarfs the slope term's because the spec scales
-    // it by the depth format's smallest resolvable difference -- about 2^-23
-    // here. Hundreds is the working range, not single digits.
-    ImGui::DragFloat("Depth bias", &shadow_depth_bias_, 10.0F, 0.0F, 10000.0F, "%.0f");
-    ImGui::DragFloat("Slope bias", &shadow_slope_bias_, 0.05F, 0.0F, 8.0F, "%.2f");
-    ImGui::DragFloat("Normal bias", &shadow_normal_bias_texels_, 0.05F, 0.0F, 8.0F, "%.2f texels");
-    ImGui::SliderInt("PCF radius", &shadow_pcf_radius_, 0, 4);
-    ImGui::EndDisabled();
-    const int taps = ((2 * shadow_pcf_radius_) + 1) * ((2 * shadow_pcf_radius_) + 1);
-    ImGui::TextDisabled("%ux%u map, %d taps", shadow_map_.resolution(), shadow_map_.resolution(),
-                        taps);
-}
-
-void Application::draw_properties_panel() {
-    ImGui::Begin("Properties");
-
-    const gpu::SceneNode* node = scene_graph_.find(selected_);
-    if (node == nullptr) {
-        ImGui::TextDisabled("Nothing selected.");
-        ImGui::TextDisabled("Click an object, or a row in the Hierarchy.");
-        ImGui::End();
-        return;
-    }
-
-    ImGui::Text("%s", node->name.c_str());
-    ImGui::Separator();
-
-    // Decomposed with ImGuizmo's own helper rather than glm's, so the numbers
-    // shown here and the numbers a drag produces come from the same code. Two
-    // decompositions that disagree on, say, euler order would make the panel
-    // jitter while dragging.
-    glm::mat4 local = node->local_transform;
-    glm::vec3 translation{0.0F};
-    glm::vec3 rotation{0.0F};
-    glm::vec3 scale{1.0F};
-    ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(local), glm::value_ptr(translation),
-                                          glm::value_ptr(rotation), glm::value_ptr(scale));
-
-    bool edited = false;
-    bool activated = false;
-    bool released = false;
-
-    edited |= ImGui::DragFloat3("Position", glm::value_ptr(translation), 0.01F);
-    activated |= ImGui::IsItemActivated();
-    released |= ImGui::IsItemDeactivatedAfterEdit();
-    edited |= ImGui::DragFloat3("Rotation", glm::value_ptr(rotation), 0.5F);
-    activated |= ImGui::IsItemActivated();
-    released |= ImGui::IsItemDeactivatedAfterEdit();
-    edited |= ImGui::DragFloat3("Scale", glm::value_ptr(scale), 0.01F);
-    activated |= ImGui::IsItemActivated();
-    released |= ImGui::IsItemDeactivatedAfterEdit();
-
-    // Recorded before the edit is written below, so the stored value is the one
-    // the drag began from.
-    if (activated && !transform_edit_.has_value()) {
-        transform_edit_ = std::make_pair(selected_, node->local_transform);
-    }
-
-    if (edited) {
-        // A zero on any axis makes the matrix singular, which the next
-        // decomposition cannot undo -- the node would be stuck flat.
-        scale = glm::max(scale, glm::vec3(1e-4F));
-        ImGuizmo::RecomposeMatrixFromComponents(glm::value_ptr(translation),
-                                                glm::value_ptr(rotation), glm::value_ptr(scale),
-                                                glm::value_ptr(local));
-        scene_graph_.set_local_transform(selected_, local);
-        scene_graph_.update_transforms();
-    }
-    if (released) {
-        commit_transform_edit();
-    }
-
-    ImGui::Separator();
-    if (node->has_light) {
-        ImGui::SeparatorText("Light");
-        gpu::SceneLight light = node->light;
-
-        int type = static_cast<int>(light.type);
-        const bool type_changed = ImGui::Combo("Type", &type, "Directional\0Point\0");
-        bool light_edited = type_changed;
-        light.type = static_cast<gpu::LightType>(type);
-
-        bool light_activated = false;
-        bool light_released = false;
-        light_edited |= ImGui::ColorEdit3("Colour", glm::value_ptr(light.color));
-        light_activated |= ImGui::IsItemActivated();
-        light_released |= ImGui::IsItemDeactivatedAfterEdit();
-        light_edited |= ImGui::DragFloat("Intensity", &light.intensity, 0.1F, 0.0F, 500.0F);
-        light_activated |= ImGui::IsItemActivated();
-        light_released |= ImGui::IsItemDeactivatedAfterEdit();
-        if (light.type == gpu::LightType::point) {
-            light_edited |= ImGui::DragFloat("Range", &light.range, 0.05F, 0.01F, 500.0F);
-            light_activated |= ImGui::IsItemActivated();
-            light_released |= ImGui::IsItemDeactivatedAfterEdit();
-        } else {
-            // A directional light has no position, only a bearing, and the
-            // rotate gizmo is how that is set.
-            ImGui::TextDisabled("Rotate to aim; position is only the icon's.");
-        }
-        // The type combo commits in one go, so it is its own command rather
-        // than the start of a drag.
-        if (type_changed) {
-            push_light_command("Change light type", selected_, node->light, light);
-        }
-        if (light_activated && !light_edit_.has_value()) {
-            light_edit_ = std::make_pair(selected_, node->light);
-        }
-        if (light_edited) {
-            scene_graph_.set_light(selected_, light);
-        }
-        if (light_released) {
-            commit_light_edit();
-        }
-        ImGui::Separator();
-    }
-
-    ImGui::Text("Mesh: %s", node->has_mesh ? "yes" : "no");
-    if (node->has_mesh) {
-        ImGui::Text("Indices: %u", node->mesh.index_count);
-        ImGui::Text("Material: %u", node->material_index);
-    }
-
-    ImGui::Separator();
-    // Radio buttons rather than a combo: three options that change with one
-    // click, and the keyboard shortcuts below mirror them.
-    int operation = gizmo_operation_;
-    ImGui::TextUnformatted("Gizmo");
-    ImGui::RadioButton("Move (W)", &operation, static_cast<int>(ImGuizmo::TRANSLATE));
-    ImGui::SameLine();
-    ImGui::RadioButton("Rotate (E)", &operation, static_cast<int>(ImGuizmo::ROTATE));
-    ImGui::SameLine();
-    ImGui::RadioButton("Scale (R)", &operation, static_cast<int>(ImGuizmo::SCALE));
-    gizmo_operation_ = operation;
-
-    // Scale is always along the object's own axes; offering a world-space
-    // scale would just be a lie about what the gizmo does.
-    if (gizmo_operation_ != static_cast<int>(ImGuizmo::SCALE)) {
-        ImGui::Checkbox("Local space", &gizmo_local_space_);
-    }
-
-    ImGui::End();
-}
-
-bool Application::draw_gizmo() {
-    const gpu::SceneNode* node = scene_graph_.find(selected_);
-    if (node == nullptr) {
-        return false;
-    }
-
-    ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
-    ImGuizmo::SetOrthographic(false);
-
-    // ImGui's logical coordinates, not framebuffer pixels: the gizmo is drawn
-    // through ImGui's draw list, which works in the same space the mouse does.
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const VkExtent2D extent = swapchain_.extent();
-    const float to_logical_x = viewport->Size.x / static_cast<float>(extent.width);
-    const float to_logical_y = viewport->Size.y / static_cast<float>(extent.height);
-    ImGuizmo::SetRect(viewport->Pos.x + static_cast<float>(viewport_rect_.offset.x) * to_logical_x,
-                      viewport->Pos.y + static_cast<float>(viewport_rect_.offset.y) * to_logical_y,
-                      static_cast<float>(viewport_rect_.extent.width) * to_logical_x,
-                      static_cast<float>(viewport_rect_.extent.height) * to_logical_y);
 
     const CameraMatrices matrices = camera_matrices();
-
-    // The gizmo manipulates a world transform, which is what makes dragging a
-    // child behave the way the screen suggests rather than in its parent's
-    // rotated frame.
-    glm::mat4 world = node->world_transform;
-
-    const bool changed = ImGuizmo::Manipulate(
-        glm::value_ptr(matrices.view), glm::value_ptr(matrices.projection_gl),
-        static_cast<ImGuizmo::OPERATION>(gizmo_operation_),
-        gizmo_local_space_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD, glm::value_ptr(world));
-
-    // A drag runs over many frames and writes a transform on each. Recording
-    // where it started and pushing once on release is what makes Ctrl+Z undo
-    // the drag rather than one frame of it.
-    if (ImGuizmo::IsUsing() && !transform_edit_.has_value()) {
-        transform_edit_ = std::make_pair(selected_, node->local_transform);
-    }
-    if (!ImGuizmo::IsUsing()) {
-        commit_transform_edit();
+    const std::optional<glm::vec3> direction =
+        ray_direction(glm::inverse(matrices.projection * matrices.view), origin, *ndc);
+    if (!direction.has_value()) {
+        return fallback;
     }
 
-    if (changed) {
-        // Back out of world space into the parent's. The parent's world
-        // transform is already final this frame -- parents precede children --
-        // so no re-composition is needed before inverting it.
-        glm::mat4 parent_world{1.0F};
-        if (const gpu::SceneNode* parent = scene_graph_.find(node->parent); parent != nullptr) {
-            parent_world = parent->world_transform;
-        }
-        scene_graph_.set_local_transform(selected_, glm::inverse(parent_world) * world);
-        scene_graph_.update_transforms();
-    }
-
-    return ImGuizmo::IsUsing();
+    const std::optional<glm::vec3> hit =
+        ground_plane_hit(origin, *direction, k_max_placement_distance);
+    return hit.value_or(origin + (*direction * k_fallback_placement_distance));
 }
 
-void Application::draw_hierarchy_panel() {
-    ImGui::Begin("Hierarchy");
-
-    // Inside Begin, because GetStateStorage() returns the *current* window's,
-    // and this one holds every tree node's open flag keyed by node index.
-    if (hierarchy_state_stale_) {
-        ImGui::GetStateStorage()->Clear();
-        hierarchy_state_stale_ = false;
-    }
-
-    const std::span<const gpu::SceneNode> nodes = scene_graph_.nodes();
-
-    if (nodes.empty()) {
-        ImGui::TextDisabled("Empty scene -- load a glTF file.");
-        ImGui::End();
-        return;
-    }
-
-    // SceneNode stores only its parent, and a tree widget needs the inverse.
-    // Rebuilt per frame rather than kept in the graph: a second structure there
-    // would need maintaining on every add and every removal, and would exist
-    // for this panel alone. One linear pass over a few hundred nodes is free.
-    ChildTable children(nodes.size());
-    std::vector<std::uint32_t> roots;
-    for (std::uint32_t i = 0; i < nodes.size(); ++i) {
-        if (!nodes[i].alive) {
-            continue;
-        }
-        if (nodes[i].parent.valid()) {
-            children[nodes[i].parent.index()].push_back(i);
-        } else {
-            roots.push_back(i);
-        }
-    }
-
-    for (const std::uint32_t root : roots) {
-        draw_hierarchy_node(root, children);
-    }
-
-    ImGui::End();
-}
-
-void Application::draw_hierarchy_node(std::uint32_t index, const ChildTable& children) {
-    const gpu::SceneNode& node = scene_graph_.nodes()[index];
-
-    // No DefaultOpen: a loaded file arrives collapsed to a single row named
-    // after it, and is expanded on demand. A chess set is 50 nodes and a real
-    // scene is more, which is a wall of names rather than an overview.
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    // Compared by handle rather than index: a stale handle from before a scene
-    // reload must not light up whatever now occupies that slot.
-    if (selected_.valid() && scene_graph_.handle_at(index) == selected_) {
-        flags |= ImGuiTreeNodeFlags_Selected;
-    }
-    if (children[index].empty()) {
-        // A leaf gets no arrow, and NoTreePushOnOpen means it must not be
-        // popped -- which is why the TreePop below is guarded on having
-        // children rather than on `open` alone. Popping an unpushed tree node
-        // corrupts ImGui's id stack and asserts somewhere unrelated later.
-        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-    }
-
-    // PushID scopes the label-derived id, so two nodes sharing a name stay
-    // distinct without having to build unique label strings.
-    ImGui::PushID(static_cast<int>(index));
-    const bool open = ImGui::TreeNodeEx(node.name.c_str(), flags);
-
-    // Not promoted to the root, unlike a viewport click: the panel exists to
-    // reach a specific node, so clicking a child selects that child and
-    // outlines its own subtree.
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        select(scene_graph_.handle_at(index));
-    }
-
-    if (node.has_mesh) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(mesh)");
-    }
-
-    if (open && !children[index].empty()) {
-        for (const std::uint32_t child : children[index]) {
-            draw_hierarchy_node(child, children);
-        }
-        ImGui::TreePop();
-    }
-    ImGui::PopID();
+// The 3D view's placement, gathered from ImGui and the swapchain. Built per
+// call rather than cached: the ImGui read is trivial, and a cached copy would
+// be one more thing to invalidate on resize.
+ViewportMapping Application::view_mapping() const {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ViewportMapping mapping;
+    mapping.logical_pos = glm::vec2{viewport->Pos.x, viewport->Pos.y};
+    mapping.logical_size = glm::vec2{viewport->Size.x, viewport->Size.y};
+    mapping.framebuffer = swapchain_.extent();
+    mapping.rect = viewport_rect_;
+    return mapping;
 }
 
 bool Application::recreate_swapchain() {
@@ -2722,16 +1017,7 @@ bool Application::recreate_swapchain() {
         return false;
     }
     swapchain_.recreate(extent);
-    depth_buffer_.recreate(swapchain_.extent());
-    id_buffer_.recreate(swapchain_.extent());
-    hdr_target_.recreate(swapchain_.extent());
-    ldr_target_.recreate(swapchain_.extent());
-    // The old views are gone, so the descriptors naming them have to be
-    // rewritten. The shadow map is absent here on purpose: it does not follow
-    // the swapchain, so its view is still valid.
-    bindless_set_.write_object_id_image(id_buffer_.view());
-    bindless_set_.write_hdr_color_image(hdr_target_.view());
-    bindless_set_.write_ldr_color_image(ldr_target_.view(), ldr_target_.sampler());
+    renderer_.recreate(swapchain_.extent());
     // A pick names a texel in an image that no longer exists.
     pending_pick_.reset();
     // Same for a capture: the region it named was measured against the old
@@ -2880,9 +1166,9 @@ void Application::run() {
             // for, and supporting one does not cost the other.
             if (ImGui::IsKeyPressed(ImGuiKey_Y) ||
                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z))) {
-                redo();
+                history_.redo();
             } else if (ImGui::IsKeyPressed(ImGuiKey_Z)) {
-                undo();
+                history_.undo();
             }
         }
         // Before picking: a drag that ends over a different object must not
@@ -2924,16 +1210,21 @@ void Application::run() {
         // swapchain and is the first thing to touch it; the capture takes the
         // finished image before any editor overlay reaches it; the outline and
         // then ImGui draw on top.
-        write_frame_data(frame.slot);
-        record_shadow(frame.command_buffer, frame.slot);
-        record_scene(frame.command_buffer, frame.slot);
-        record_tonemap(frame.command_buffer);
-        record_fxaa(frame.command_buffer, acquired.image, swapchain_.image_view(acquired.index));
+        const Renderer::FrameView view = frame_view(frame.slot);
+        renderer_.write_frame_data(view);
+        renderer_.record_shadow(frame.command_buffer, view);
+        renderer_.record_scene(frame.command_buffer, view);
+        renderer_.record_tonemap(frame.command_buffer, view);
+        renderer_.record_fxaa(frame.command_buffer, acquired.image,
+                              swapchain_.image_view(acquired.index), view);
         if (!screenshot_include_ui_) {
             record_screenshot_copy(frame.command_buffer, acquired.image);
         }
-        record_outline(frame.command_buffer, swapchain_.image_view(acquired.index));
-        record_pick_copy(frame.command_buffer);
+        renderer_.record_outline(frame.command_buffer, swapchain_.image_view(acquired.index), view,
+                                 selected_.valid());
+        if (pending_pick_.has_value()) {
+            renderer_.record_pick_copy(frame.command_buffer, *pending_pick_);
+        }
         imgui_.render(frame.command_buffer, swapchain_.image_view(acquired.index),
                       swapchain_.extent());
         // The other capture point: after everything, so the file shows the
@@ -2941,7 +1232,7 @@ void Application::run() {
         if (screenshot_include_ui_) {
             record_screenshot_copy(frame.command_buffer, acquired.image);
         }
-        transition_to_present(frame.command_buffer, acquired.image);
+        Renderer::transition_to_present(frame.command_buffer, acquired.image);
 
         frame_pacer_.submit(device_.graphics_queue(), frame,
                             swapchain_.render_finished(acquired.index));
@@ -2959,7 +1250,7 @@ void Application::run() {
     }
 
     frame_pacer_.wait_all();
-    pipeline_cache_.save();
+    renderer_.save_pipeline_cache();
     SAGE_LOG_INFO("Main loop exited");
 }
 

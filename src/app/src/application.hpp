@@ -1,5 +1,10 @@
 #pragma once
 
+#include <sage/app/edit_history.hpp>
+#include <sage/app/render_settings.hpp>
+#include <sage/app/renderer.hpp>
+#include <sage/app/scene_query.hpp>
+#include <sage/app/viewport_mapping.hpp>
 #include <sage/core/camera.hpp>
 #include <sage/gpu/allocator.hpp>
 #include <sage/gpu/bindless_set.hpp>
@@ -57,29 +62,6 @@ private:
     // Returns false when the window is minimized and the frame should be
     // skipped entirely.
     bool recreate_swapchain();
-    // Composes this frame's camera, lights and shadow matrix into the frame
-    // buffer's slot. Separate from record_scene, and ahead of both passes,
-    // because the shadow pass reads the same slot and needs the light matrix
-    // that is in it.
-    void write_frame_data(std::uint32_t frame_slot) const;
-    // Draws the scene from the directional light into shadow_map_, depth only.
-    // Runs before record_scene, which samples the result.
-    void record_shadow(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const;
-    // Shades into hdr_target_, not the swapchain: values above 1.0 have to
-    // survive as far as the tonemap, and an 8-bit attachment would clamp them
-    // where they were written.
-    void record_scene(VkCommandBuffer command_buffer, std::uint32_t frame_slot) const;
-    // Resolves hdr_target_ to ldr_target_ through the tonemap curve, encoding
-    // to sRGB on the way out because the destination is UNORM and does not do
-    // it in fixed function.
-    void record_tonemap(VkCommandBuffer command_buffer) const;
-    // Anti-aliases ldr_target_ into the swapchain. Also where the swapchain
-    // image first enters COLOR_ATTACHMENT_OPTIMAL, since nothing before this
-    // point touches it.
-    void record_fxaa(VkCommandBuffer command_buffer, VkImage image, VkImageView image_view) const;
-    // Split out of record_scene because the UI draws into the same swapchain
-    // image and must get there before it is handed to the presentation engine.
-    static void transition_to_present(VkCommandBuffer command_buffer, VkImage image);
     // Lays a dockspace over the viewport and, on the first frame, docks the
     // panels into it. Panels place themselves by name from then on, which is
     // what stops a new one landing on top of an existing one.
@@ -125,6 +107,9 @@ private:
     // Derived from the camera and the current viewport rect, so the gizmo and
     // the scene pass cannot disagree about where a point lands on screen.
     [[nodiscard]] CameraMatrices camera_matrices() const;
+    // Gathers everything the render passes read from outside themselves. The
+    // single place the editor's state crosses into the renderer.
+    [[nodiscard]] Renderer::FrameView frame_view(std::uint32_t frame_slot) const;
 
     // Turns a click in the 3D view into a pending object-id readback. No-op
     // when a panel has the pointer or the cursor is outside the viewport.
@@ -133,15 +118,12 @@ private:
     // or nothing when it falls outside the 3D view. Shared by picking and by
     // the context menu, which need the identical test.
     [[nodiscard]] std::optional<VkOffset2D> viewport_texel(float window_x, float window_y) const;
+    // The 3D view's placement, read from ImGui and the swapchain. The one
+    // place that reaches for ImGui's viewport; everything downstream works on
+    // the plain values.
+    [[nodiscard]] ViewportMapping view_mapping() const;
     // W/E/R switch the manipulator, as in Unreal and Blender.
     void handle_gizmo_keys();
-    // Copies the picked texel out of the id attachment. Recorded after the
-    // scene, so the value read is the one this frame just drew.
-    void record_pick_copy(VkCommandBuffer command_buffer) const;
-    // Draws the selection outline over the scene, reading the id attachment
-    // this frame just wrote. Runs before record_pick_copy, which is what fixes
-    // each pass's expected source layout to a single value.
-    void record_outline(VkCommandBuffer command_buffer, VkImageView image_view) const;
     // Reads the copied texel back and resolves it to a node. Must run only
     // after the submission carrying record_pick_copy has completed.
     void resolve_pick();
@@ -206,21 +188,8 @@ private:
     // queued: nothing is freed, so no in-flight command buffer is invalidated.
     void delete_selected();
 
-    // One reversible edit.
-    //
-    // Closures rather than a variant of command types: every operation here is
-    // a handful of captured values and two calls into the scene graph, and a
-    // class hierarchy for that would be more machinery than the thing it
-    // describes. They capture by value and `this`, which outlives the stack.
-    struct Command {
-        std::string name;
-        std::function<void()> undo;
-        std::function<void()> redo;
-    };
-    // Pushes a command, discarding anything that had been undone past the
-    // cursor -- the usual rule: a new edit after an undo forks the history and
-    // the abandoned branch goes.
-    // Records an addition, which undo tombstones and redo restores.
+    // Records an addition, which undo tombstones and redo restores. The
+    // closures capture by value and `this`, which outlives them.
     void push_add_command(std::string name, gpu::NodeHandle added,
                           gpu::NodeHandle previous_selection);
     // Closes a transform drag, pushing one command for the whole gesture.
@@ -229,19 +198,11 @@ private:
     void commit_light_edit();
     void push_light_command(std::string name, gpu::NodeHandle node, const gpu::SceneLight& before,
                             const gpu::SceneLight& after);
-    void push_command(std::string name, std::function<void()> undo, std::function<void()> redo);
-    void undo();
-    void redo();
-    [[nodiscard]] bool can_undo() const { return undo_cursor_ > 0; }
-    [[nodiscard]] bool can_redo() const { return undo_cursor_ < undo_stack_.size(); }
-    // Drops the history. Called when the registries rewind, which is the one
-    // thing here that genuinely cannot be reversed.
+    // Drops the history and any edit mid-gesture. Called when the registries
+    // rewind, which is the one thing here that genuinely cannot be reversed.
     void clear_history();
 
-    std::vector<Command> undo_stack_;
-    // How many commands are currently applied. Undo steps it back, redo
-    // forward; everything at or past it has been undone.
-    std::size_t undo_cursor_ = 0;
+    EditHistory history_;
 
     // A transform edit in progress, and the value it started from. Both the
     // gizmo and the Properties drags run across many frames, so the command is
@@ -263,39 +224,15 @@ private:
     // from inside the picker's own draw call would mean blocking uploads and a
     // wait_idle in the middle of a frame whose command buffer is already begun.
     void service_pending_load();
-    // Children per node, indexed by node index. Rebuilt each frame rather than
-    // stored; see draw_hierarchy_panel for why.
-    using ChildTable = std::vector<std::vector<std::uint32_t>>;
-    void draw_hierarchy_node(std::uint32_t index, const ChildTable& children);
+    // One row of the hierarchy tree, and its descendants. The table comes from
+    // scene_query's build_child_table, rebuilt each frame.
+    void draw_hierarchy_node(std::uint32_t index, const ChildTable& table);
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
-    struct Bounds {
-        glm::vec3 min{0.0F};
-        glm::vec3 max{0.0F};
-        [[nodiscard]] bool empty() const { return min.x > max.x; }
-    };
-    // World-space AABB over every mesh currently in the graph, recomputed from
-    // live world transforms rather than remembered from load time -- otherwise
-    // moving a node with the gizmo would leave the shadow frustum behind.
-    [[nodiscard]] Bounds scene_bounds() const;
+    // Bounds, LightFit and the functions over them live in scene_query.hpp:
+    // they are arithmetic over the graph, and were only members because
+    // everything here was.
 
-    struct LightFit {
-        glm::mat4 view_projection{1.0F};
-        // How much world space one shadow-map texel covers. The unit the
-        // normal-offset bias is expressed in, so that it means the same thing
-        // whatever the scene's scale.
-        float world_texel_size = 0.0F;
-    };
-    // An orthographic light-space matrix fitted to `bounds`. A directional
-    // light has no position, so the frustum is placed by the scene rather than
-    // by the light: it is centred on the bounds and pulled back far enough
-    // along the light direction to enclose them.
-    [[nodiscard]] LightFit fit_light(const Bounds& bounds, const glm::vec3& light_direction) const;
-
-    // Fills the frame's light array from the graph, returning how many were
-    // written. Lights past the shader's fixed capacity are dropped.
-    [[nodiscard]] std::uint32_t collect_lights(
-        std::array<gpu::Light, gpu::k_max_lights>& lights) const;
     // The light the shadow map is fitted to: the first directional one in the
     // graph, which is also the one the shader shadows. Invalid when there is
     // none, in which case nothing casts.
@@ -357,48 +294,10 @@ private:
     int gizmo_operation_ = 0;
     bool gizmo_local_space_ = false;
 
-    // Replaces the 0.03 that was compiled into the shader. Without ambient
-    // occlusion or IBL this is the only thing keeping unlit faces off pure
-    // black, so it is the difference between "dramatic" and "half the model is
-    // missing" -- which is a judgement call, hence a slider.
-    float ambient_intensity_ = 0.03F;
-
-    bool shadows_enabled_ = true;
-    // Hardware depth bias, applied while rasterising the shadow map. The spec's
-    // offset is `m * slopeFactor + r * constantFactor`, and the two halves are
-    // in wildly different units: m is the depth slope, but r is the smallest
-    // resolvable depth difference, which for a D32_SFLOAT map is around 2^-23.
-    // So a slope factor of 2 is meaningful while a constant factor of 2 is
-    // worth about 1e-7 -- nothing. Measured on this hardware: 1.5 was
-    // indistinguishable from 0, and visible change started in the hundreds.
-    // Hence the scale difference between these two defaults.
-    float shadow_depth_bias_ = 500.0F;
-    float shadow_slope_bias_ = 2.0F;
-    // Applied at lookup time instead, along the surface normal, and measured in
-    // shadow-map texels rather than world units. Texels because the frustum is
-    // refitted to the scene every frame: a bias of "0.02 world units" is
-    // nothing on a cathedral and four percent of a chess set, so an absolute
-    // value cannot have one sensible default. A texel is the unit the error
-    // actually scales with.
-    float shadow_normal_bias_texels_ = 1.5F;
-    int shadow_pcf_radius_ = 2;
-
-    // Which curve the tonemap applies. Stored as int to match the push
-    // constant; the values are TonemapOperator in application.cpp, which must
-    // agree with shaders/tonemap.slang.
-    int tonemap_operator_ = 0;
-    // Exposure in stops, which is the unit it is reasoned about in. Converted
-    // to the linear multiplier the shader wants at push time.
-    float exposure_stops_ = 0.0F;
-
-    // The FXAA pass runs unconditionally and passes the image through when this
-    // is off, rather than being skipped. Skipping it would mean the tonemap
-    // writing to a different target depending on a checkbox, and two barrier
-    // paths to keep correct; a branch in the shader costs a comparison.
-    bool fxaa_enabled_ = true;
-    float fxaa_edge_threshold_ = 0.125F;
-    float fxaa_edge_threshold_min_ = 0.0312F;
-    float fxaa_subpixel_quality_ = 0.75F;
+    // Everything a person can turn about how the frame is shaded and
+    // presented. One struct rather than fifteen members because it is the
+    // seam: the panels write it, the render passes read it.
+    RenderSettings render_settings_;
 
     // Hides every panel and gives the 3D view the whole window. Two things need
     // it: a capture at full window resolution rather than whatever the central
@@ -457,25 +356,10 @@ private:
     gpu::TextureRegistry texture_registry_;
     gpu::MaterialRegistry material_registry_;
     gpu::SelectionBuffer selection_buffer_;
-    gpu::Buffer frame_buffer_;
-    // One texel of object id, copied out of id_buffer_ on a pick. Host-cached
-    // rather than write-combined: this one is read, not written.
-    gpu::Buffer pick_buffer_;
     gpu::SceneGraph scene_graph_;
     gpu::Swapchain swapchain_;
-    gpu::DepthBuffer depth_buffer_;
-    gpu::IdBuffer id_buffer_;
-    gpu::HdrTarget hdr_target_;
-    gpu::LdrTarget ldr_target_;
-    // Not recreated on resize: its resolution is a quality setting, not a
-    // consequence of the window.
-    gpu::ShadowMap shadow_map_;
-    gpu::PipelineCache pipeline_cache_;
-    gpu::GraphicsPipeline shadow_pipeline_;
-    gpu::GraphicsPipeline pipeline_;
-    gpu::GraphicsPipeline outline_pipeline_;
-    gpu::GraphicsPipeline tonemap_pipeline_;
-    gpu::GraphicsPipeline fxaa_pipeline_;
+    // Every target and pipeline, and the passes over them.
+    Renderer renderer_;
     gpu::FramePacer frame_pacer_;
     // Last, so it is destroyed first: its teardown frees Vulkan objects and
     // touches the device, both of which must still be alive.

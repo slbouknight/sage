@@ -69,3 +69,7 @@ right nodes. The stack itself is verified by exercising a full
 add/transform/delete/undo-to-empty/redo-to-end sequence and reading the live
 count, cursor and a transformed value at each step; it lives on `Application`,
 which needs a device, so it is not reachable from a unit test.
+
+*Amended by [ADR 0032](0032-splitting-the-app-module.md):* that last point no
+longer holds. `src/app` was an executable rather than a library, which is what
+put the stack out of a test's reach; it is now `EditHistory`, with 15 tests.
