@@ -224,10 +224,9 @@ private:
     // from inside the picker's own draw call would mean blocking uploads and a
     // wait_idle in the middle of a frame whose command buffer is already begun.
     void service_pending_load();
-    // Children per node, indexed by node index. Rebuilt each frame rather than
-    // stored; see draw_hierarchy_panel for why.
-    using ChildTable = std::vector<std::vector<std::uint32_t>>;
-    void draw_hierarchy_node(std::uint32_t index, const ChildTable& children);
+    // One row of the hierarchy tree, and its descendants. The table comes from
+    // scene_query's build_child_table, rebuilt each frame.
+    void draw_hierarchy_node(std::uint32_t index, const ChildTable& table);
     void frame_camera_on(const glm::vec3& bounds_min, const glm::vec3& bounds_max);
 
     // Bounds, LightFit and the functions over them live in scene_query.hpp:

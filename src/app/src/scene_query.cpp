@@ -82,6 +82,25 @@ LightFit fit_directional_light(const Bounds& bounds, const glm::vec3& light_dire
     return fit;
 }
 
+ChildTable build_child_table(const gpu::SceneGraph& graph) {
+    const std::span<const gpu::SceneNode> nodes = graph.nodes();
+
+    ChildTable table;
+    table.children.resize(nodes.size());
+
+    for (std::uint32_t i = 0; i < nodes.size(); ++i) {
+        if (!nodes[i].alive) {
+            continue;
+        }
+        if (nodes[i].parent.valid()) {
+            table.children[nodes[i].parent.index()].push_back(i);
+        } else {
+            table.roots.push_back(i);
+        }
+    }
+    return table;
+}
+
 std::uint32_t collect_lights(const gpu::SceneGraph& graph, std::span<gpu::Light> out) {
     std::uint32_t count = 0;
 

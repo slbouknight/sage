@@ -3,12 +3,14 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <numbers>
 #include <vector>
 
 using Catch::Approx;
 using sage::app::Bounds;
+using sage::app::build_child_table;
 using sage::app::collect_lights;
 using sage::app::compute_scene_bounds;
 using sage::app::fit_directional_light;
@@ -376,4 +378,122 @@ TEST_CASE("an empty output span collects nothing without writing", "[scene_query
     graph.update_transforms();
 
     CHECK(collect_lights(graph, std::span<Light>{}) == 0);
+}
+
+// ------------------------------------------------------------ child table ---
+
+TEST_CASE("an empty graph has an empty child table", "[scene_query]") {
+    const SceneGraph graph;
+    const auto table = build_child_table(graph);
+
+    CHECK(table.children.empty());
+    CHECK(table.roots.empty());
+}
+
+TEST_CASE("unparented nodes are all roots", "[scene_query]") {
+    SceneGraph graph;
+    add_cube(graph, glm::mat4{1.0F}, "a");
+    add_cube(graph, glm::mat4{1.0F}, "b");
+
+    const auto table = build_child_table(graph);
+    CHECK(table.roots == std::vector<std::uint32_t>{0, 1});
+    CHECK(table.children[0].empty());
+    CHECK(table.children[1].empty());
+}
+
+TEST_CASE("children are listed under their parent, not as roots", "[scene_query]") {
+    SceneGraph graph;
+    const NodeHandle parent = graph.add_node(NodeHandle{}, glm::mat4{1.0F}, "parent");
+    graph.add_node(parent, glm::mat4{1.0F}, "first");
+    graph.add_node(parent, glm::mat4{1.0F}, "second");
+
+    const auto table = build_child_table(graph);
+    CHECK(table.roots == std::vector<std::uint32_t>{0});
+    // Index order, which is also the order they were added -- the hierarchy
+    // panel should not reshuffle rows between frames.
+    CHECK(table.children[0] == std::vector<std::uint32_t>{1, 2});
+}
+
+TEST_CASE("the table spans several levels", "[scene_query]") {
+    SceneGraph graph;
+    const NodeHandle root = graph.add_node(NodeHandle{}, glm::mat4{1.0F}, "root");
+    const NodeHandle mid = graph.add_node(root, glm::mat4{1.0F}, "mid");
+    graph.add_node(mid, glm::mat4{1.0F}, "leaf");
+
+    const auto table = build_child_table(graph);
+    CHECK(table.roots == std::vector<std::uint32_t>{0});
+    CHECK(table.children[0] == std::vector<std::uint32_t>{1});
+    CHECK(table.children[1] == std::vector<std::uint32_t>{2});
+    CHECK(table.children[2].empty());
+}
+
+TEST_CASE("the table is sized to every slot, tombstones included", "[scene_query]") {
+    SceneGraph graph;
+    add_cube(graph, glm::mat4{1.0F}, "a");
+    const NodeHandle gone = add_cube(graph, glm::mat4{1.0F}, "b");
+    graph.remove_subtree(gone);
+
+    // Indexed by node index, so it must cover slots rather than live nodes --
+    // otherwise children[i] would be out of range for any i past a tombstone.
+    const auto table = build_child_table(graph);
+    CHECK(table.children.size() == graph.size());
+    CHECK(table.children.size() == 2);
+}
+
+TEST_CASE("a deleted node is neither a root nor a child", "[scene_query]") {
+    SceneGraph graph;
+    add_cube(graph, glm::mat4{1.0F}, "kept");
+    const NodeHandle gone = add_cube(graph, glm::mat4{1.0F}, "gone");
+
+    graph.remove_subtree(gone);
+    const auto table = build_child_table(graph);
+    CHECK(table.roots == std::vector<std::uint32_t>{0});
+
+    // And undo puts the row back.
+    graph.restore_subtree(gone);
+    CHECK(build_child_table(graph).roots == std::vector<std::uint32_t>{0, 1});
+}
+
+TEST_CASE("deleting a parent takes its children out of the table too", "[scene_query]") {
+    SceneGraph graph;
+    const NodeHandle parent = graph.add_node(NodeHandle{}, glm::mat4{1.0F}, "parent");
+    graph.add_node(parent, glm::mat4{1.0F}, "child");
+
+    // remove_subtree tombstones the whole subtree, which is what stops a live
+    // child being filed under a dead parent -- where the tree walk, starting
+    // from roots, would never reach it and the row would silently vanish.
+    graph.remove_subtree(parent);
+
+    const auto table = build_child_table(graph);
+    CHECK(table.roots.empty());
+    CHECK(table.children[0].empty());
+}
+
+TEST_CASE("every live node is reachable from some root", "[scene_query]") {
+    SceneGraph graph;
+    const NodeHandle a = graph.add_node(NodeHandle{}, glm::mat4{1.0F}, "a");
+    const NodeHandle b = graph.add_node(a, glm::mat4{1.0F}, "b");
+    graph.add_node(b, glm::mat4{1.0F}, "c");
+    graph.add_node(NodeHandle{}, glm::mat4{1.0F}, "d");
+    const NodeHandle gone = graph.add_node(NodeHandle{}, glm::mat4{1.0F}, "gone");
+    graph.remove_subtree(gone);
+
+    // The property the hierarchy panel depends on: walking from roots visits
+    // every live node exactly once. A node the walk cannot reach is a row the
+    // user cannot see or select.
+    std::vector<std::uint32_t> visited;
+    const auto table = build_child_table(graph);
+    const auto walk = [&](auto&& self, std::uint32_t index) -> void {
+        visited.push_back(index);
+        for (const std::uint32_t child : table.children[index]) {
+            self(self, child);
+        }
+    };
+    for (const std::uint32_t root : table.roots) {
+        walk(walk, root);
+    }
+
+    std::sort(visited.begin(), visited.end());
+    CHECK(visited == std::vector<std::uint32_t>{0, 1, 2, 3});
+    CHECK(visited.size() == graph.live_size());
 }

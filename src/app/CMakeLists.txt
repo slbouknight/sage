@@ -9,6 +9,7 @@ add_library(sage_app STATIC
     src/application.cpp
     src/renderer.cpp
     src/edit_history.cpp
+    src/editor_ui.cpp
     src/scene_query.cpp
     src/viewport_mapping.cpp
     src/file_picker.cpp

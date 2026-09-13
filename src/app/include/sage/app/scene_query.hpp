@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace sage::app {
 
@@ -56,6 +57,26 @@ struct LightFit {
 // world_texel_size. Empty bounds give a default-constructed fit.
 [[nodiscard]] LightFit fit_directional_light(const Bounds& bounds, const glm::vec3& light_direction,
                                              std::uint32_t shadow_resolution);
+
+// The inverse of SceneNode::parent: which nodes hang off which.
+//
+// SceneNode stores only its parent, and a tree widget needs the other
+// direction. Rebuilt per frame rather than kept in the graph, where a second
+// structure would need maintaining on every add and every removal and would
+// exist for one panel alone -- one linear pass over a few hundred nodes is
+// free.
+struct ChildTable {
+    // children[i] holds the indices of live node i's live children, in index
+    // order. Sized to graph.size(), so a tombstoned node has an empty entry
+    // rather than no entry.
+    std::vector<std::vector<std::uint32_t>> children;
+    // Live nodes with no parent, in index order. Where a tree walk starts.
+    std::vector<std::uint32_t> roots;
+};
+
+// Builds the child table for `graph`. Deleted nodes are omitted entirely:
+// neither listed as a root nor attached to a parent.
+[[nodiscard]] ChildTable build_child_table(const gpu::SceneGraph& graph);
 
 // Fills `out` from the graph's live light nodes, returning how many were
 // written. Stops at the span's size: the frame buffer's light array is a fixed

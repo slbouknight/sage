@@ -122,6 +122,9 @@ constexpr VkImageSubresourceRange k_color_range{
 constexpr VkImageSubresourceRange k_depth_range{
     VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
 
+// The cache belongs in the user's cache dir, not the build tree: it must
+// survive `--clean`, and it is machine-specific so it should never be
+// committed or copied between machines.
 std::filesystem::path pipeline_cache_path() {
     if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && *xdg != '\0') {
         return std::filesystem::path(xdg) / "sage" / "pipeline_cache.bin";
